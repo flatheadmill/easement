@@ -20,6 +20,35 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
+
+fn init_tracing() -> WorkerGuard {
+    let home = std::env::var("HOME").expect("HOME not set");
+    let log_dir = std::path::Path::new(&home)
+        .join(".local").join("state").join("puzzle");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("easement.log"))
+        .expect("failed to open easement.log");
+
+    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("easement=debug"));
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(false)
+        .init();
+
+    guard
+}
 
 // -- Payload --
 
@@ -88,15 +117,30 @@ fn format_user_message(content: &str) -> String {
 
 // -- Transcript discovery --
 //
-// When claude resumes from a file path, it forks into a new session and writes
-// the transcript under ~/.claude/projects/<cwd-slug>/<uuid>.jsonl. We don't
-// know the path until the CLI creates it. The notify crate watches for file
-// creation in the projects directory. When a file matching the session ID
-// appears, we have the transcript path.
+// Two paths: for session-id resumes the transcript file already exists
+// under ~/.claude/projects/<cwd-slug>/<session-id>.jsonl. We search
+// the projects directory for it. For forks (resume from file path) the
+// CLI creates a new file — we watch for creation with notify.
+
+fn find_transcript(projects_dir: &PathBuf, target_name: &str) -> Option<PathBuf> {
+    let walker = walkdir::WalkDir::new(projects_dir)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok());
+
+    for entry in walker {
+        if let Some(name) = entry.file_name().to_str() {
+            if name == target_name {
+                return Some(entry.into_path());
+            }
+        }
+    }
+    None
+}
 
 async fn watch_for_transcript(
     projects_dir: PathBuf,
-    session_id: String,
+    target_name: String,
     tx: mpsc::Sender<PathBuf>,
 ) {
     let (notify_tx, mut notify_rx) = mpsc::channel::<PathBuf>(16);
@@ -112,8 +156,8 @@ async fn watch_for_transcript(
     })
     .expect("failed to create filesystem watcher");
 
-    // Watch the projects directory recursively — the transcript may land in a
-    // subdirectory we haven't seen yet.
+    // Register the watch first — any creation events from this point
+    // forward will be captured.
     if watcher
         .watch(&projects_dir, RecursiveMode::Recursive)
         .is_err()
@@ -121,11 +165,20 @@ async fn watch_for_transcript(
         return;
     }
 
-    let target = format!("{}.jsonl", session_id);
+    // Now scan. If the file was created before the watcher registered,
+    // this catches it. If it was created after, the watcher has it.
+    if let Some(existing) = find_transcript(&projects_dir, &target_name) {
+        tracing::info!(path = %existing.display(), "found transcript on scan after watch");
+        let _ = tx.send(existing).await;
+        return;
+    }
+
+    tracing::info!(target = %target_name, "transcript not found on scan, waiting for creation");
+
     let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         while let Some(path) = notify_rx.recv().await {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name == target {
+                if name == target_name {
                     return Some(path);
                 }
             }
@@ -136,12 +189,15 @@ async fn watch_for_transcript(
 
     match result {
         Ok(Some(path)) => {
+            tracing::info!(path = %path.display(), "watcher found transcript");
             let _ = tx.send(path).await;
         }
         Ok(None) => {
+            tracing::error!("transcript watcher ended without finding transcript");
             emit_error("transcript watcher ended without finding transcript");
         }
         Err(_) => {
+            tracing::error!(target_name, "timeout waiting for transcript after 15 seconds");
             emit_error("timeout waiting for transcript after 15 seconds");
         }
     }
@@ -151,11 +207,13 @@ async fn watch_for_transcript(
 //
 // Once we know the transcript path, tail it. Read from the current position,
 // emit each line as a transcript envelope. Watch for modifications with notify
-// and read new content when it arrives.
+// and read new content when it arrives. Returns the number of lines emitted so
+// the caller can do a final deterministic read after claude exits.
 
-async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) {
+async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
     use tokio::fs::File;
     let mut stop = stop;
+    let mut lines_emitted: usize = 0;
 
     // Wait for the file to exist.
     loop {
@@ -169,7 +227,7 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) {
         Ok(f) => f,
         Err(e) => {
             emit_error(&format!("cannot open transcript: {}", e));
-            return;
+            return 0;
         }
     };
 
@@ -186,6 +244,7 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) {
                 if !trimmed.is_empty() {
                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
                         emit("transcript", data);
+                        lines_emitted += 1;
                     }
                 }
             }
@@ -209,12 +268,12 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) {
         }
     }) {
         Ok(w) => w,
-        Err(_) => return,
+        Err(_) => return lines_emitted,
     };
 
     if let Some(parent) = path.parent() {
         if watcher.watch(parent, RecursiveMode::NonRecursive).is_err() {
-            return;
+            return lines_emitted;
         }
     }
 
@@ -230,6 +289,7 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) {
                             if !trimmed.is_empty() {
                                 if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
                                     emit("transcript", data);
+                                    lines_emitted += 1;
                                 }
                             }
                         }
@@ -238,23 +298,7 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) {
                 }
             }
             _ = stop.recv() => {
-                // Final read to flush anything remaining.
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                                    emit("transcript", data);
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                return;
+                return lines_emitted;
             }
         }
     }
@@ -262,6 +306,8 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) {
 
 #[tokio::main]
 async fn main() {
+    let _guard = init_tracing();
+
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => {
@@ -287,6 +333,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    tracing::info!(
+        slug = %payload.slug,
+        yolo = payload.yolo,
+        has_session_id = payload.session_id.is_some(),
+        has_transcript = payload.transcript.is_some(),
+        "payload received"
+    );
 
     // Set up the working directory.
     let pane_dir = PathBuf::from(&home).join("pane").join(&payload.slug);
@@ -326,6 +380,8 @@ async fn main() {
         emit_error("payload must have session_id or transcript");
         std::process::exit(1);
     }
+
+    tracing::info!(resume_arg = %resume_arg, "spawning claude");
 
     // Build the command.
     let mut cmd = Command::new("claude");
@@ -389,6 +445,7 @@ async fn main() {
                     std::process::exit(1);
                 }
 
+                tracing::info!(session_id = %session_id, "captured session id from first event");
                 emit_meta(serde_json::json!({ "session_id": session_id }));
                 emit("stdout", data);
             } else {
@@ -407,39 +464,68 @@ async fn main() {
         let _ = std::fs::remove_file(tmp);
     }
 
-    // Start watching for the transcript file.
+    // Find or watch for the transcript file. For session-id resumes,
+    // Claude writes to the original session file — use the payload's
+    // session ID. For forks (transcript payload), a new file is created
+    // under the stdout session ID.
     let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
     let (transcript_tx, mut transcript_rx) = mpsc::channel::<PathBuf>(1);
-    let watch_session_id = session_id.clone();
+    let target_name = if let Some(ref sid) = payload.session_id {
+        tracing::info!(payload_sid = %sid, stdout_sid = %session_id, "using payload session id for transcript");
+        format!("{}.jsonl", sid)
+    } else {
+        tracing::info!(stdout_sid = %session_id, "using stdout session id for transcript (fork)");
+        format!("{}.jsonl", session_id)
+    };
 
+    // Start the watcher first, then scan. If the file was created before
+    // the watcher registered, the scan catches it. If it's created after,
+    // the watcher catches it.
+    let watch_target = target_name.clone();
+    let watch_projects_dir = projects_dir.clone();
     tokio::spawn(async move {
-        watch_for_transcript(projects_dir, watch_session_id, transcript_tx).await;
+        watch_for_transcript(watch_projects_dir, watch_target, transcript_tx).await;
     });
 
     // Start the tailer once we discover the transcript path. The stop channel
-    // lets us tell the tailer to flush and exit when claude is done.
+    // tells the tailer to stop watching. After claude exits we join the handle
+    // to get the line count, then do a final deterministic read of the file.
     let (tailer_stop_tx, tailer_stop_rx) = mpsc::channel::<()>(1);
     let mut tailer_stop_rx = Some(tailer_stop_rx);
     let mut tailer_started = false;
+    let mut tailer_handle: Option<tokio::task::JoinHandle<usize>> = None;
+    let mut transcript_path: Option<PathBuf> = None;
 
     // Spawn a task to read claude's stdout and emit envelopes.
     let (stdout_done_tx, mut stdout_done_rx) = mpsc::channel::<()>(1);
 
     tokio::spawn(async move {
         let mut line = String::new();
+        let mut stdout_lines: usize = 0;
         loop {
             line.clear();
             match stdout_reader.read_line(&mut line).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    tracing::debug!(total_lines = stdout_lines, "claude stdout EOF");
+                    break;
+                }
                 Ok(_) => {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            let event_type = data.get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            tracing::debug!(event_type, "stdout event");
+                            stdout_lines += 1;
                             emit("stdout", data);
                         }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stdout read error");
+                    break;
+                }
             }
         }
         let _ = stdout_done_tx.send(()).await;
@@ -452,17 +538,27 @@ async fn main() {
 
     tokio::spawn(async move {
         let mut line = String::new();
+        let mut stdin_lines: usize = 0;
         loop {
             line.clear();
             match reader.read_line(&mut line).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    tracing::debug!(total_lines = stdin_lines, "puzzle stdin EOF, closing claude stdin");
+                    break;
+                }
                 Ok(_) => {
+                    stdin_lines += 1;
+                    tracing::debug!(stdin_lines, "stdin passthrough");
                     if child_stdin.write_all(line.as_bytes()).await.is_err() {
+                        tracing::warn!("stdin write to claude failed");
                         break;
                     }
                     let _ = child_stdin.flush().await;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stdin read error");
+                    break;
+                }
             }
         }
         // child_stdin drops here, closing claude's stdin.
@@ -475,10 +571,11 @@ async fn main() {
                 emit_meta(serde_json::json!({
                     "transcript_path": path.to_string_lossy()
                 }));
+                transcript_path = Some(path.clone());
                 let stop_rx = tailer_stop_rx.take().unwrap();
-                tokio::spawn(async move {
-                    tail_transcript(path, stop_rx).await;
-                });
+                tailer_handle = Some(tokio::spawn(async move {
+                    tail_transcript(path, stop_rx).await
+                }));
                 tailer_started = true;
             }
             Some(()) = stdout_done_rx.recv() => {
@@ -487,18 +584,52 @@ async fn main() {
             status = child.wait() => {
                 match status {
                     Ok(s) => {
+                        let code = s.code().unwrap_or(-1);
+                        tracing::info!(exit_code = code, "claude exited");
                         emit_meta(serde_json::json!({
-                            "exit_code": s.code().unwrap_or(-1)
+                            "exit_code": code
                         }));
                     }
                     Err(e) => {
+                        tracing::error!(error = %e, "error waiting for claude");
                         emit_error(&format!("error waiting for claude: {}", e));
                     }
                 }
-                // Tell the tailer to flush and stop.
+
+                // Stop the tailer and get the number of lines it already
+                // emitted. The transcript is fully flushed on disk now that
+                // claude has exited, so we read the remainder directly.
                 let _ = tailer_stop_tx.send(()).await;
-                // Give the tailer a moment to flush.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let lines_emitted = match tailer_handle {
+                    Some(handle) => handle.await.unwrap_or(0),
+                    None => 0,
+                };
+
+                tracing::info!(lines_emitted, "tailer stopped, reading remainder");
+
+                if let Some(ref path) = transcript_path {
+                    if let Ok(file) = std::fs::File::open(path) {
+                        use std::io::BufRead;
+                        let mut remainder: usize = 0;
+                        for line in std::io::BufReader::new(file)
+                            .lines()
+                            .skip(lines_emitted)
+                            .flatten()
+                        {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                                    emit("transcript", data);
+                                    remainder += 1;
+                                }
+                            }
+                        }
+                        tracing::info!(remainder, "final transcript lines emitted");
+                    }
+                } else {
+                    tracing::warn!("no transcript path discovered");
+                }
+
                 break;
             }
         }
