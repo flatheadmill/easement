@@ -78,6 +78,7 @@ async fn request_approval(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
+    let original_input = input.clone();
     let request = ApprovalRequest {
         tool_name,
         input,
@@ -103,7 +104,7 @@ async fn request_approval(
         serde_json::from_str(&response_line).map_err(|e| e.to_string())?;
 
     if response.behavior == "allow" {
-        Ok(json!({ "behavior": "allow" }))
+        Ok(json!({ "behavior": "allow", "updatedInput": original_input }))
     } else {
         Ok(json!({
             "behavior": "deny",
