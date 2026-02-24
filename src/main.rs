@@ -12,7 +12,7 @@
 // {"stream":"meta","data":{...}} for session info, {"stream":"error",...}
 // for failures.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -304,6 +304,77 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
     }
 }
 
+// -- Trust injection --
+//
+// The Claude CLI requires hasTrustDialogAccepted in ~/.claude.json for
+// each working directory. Puzzle handles this locally; Easement handles
+// it on remote machines where Puzzle can't reach the config.
+
+fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
+    // Acquire mkdir-based lock matching the CLI's proper-lockfile protocol.
+    let lock_path = config_path.with_extension("json.lock");
+    if std::fs::create_dir(&lock_path).is_err() {
+        return Err("lock contention".to_string());
+    }
+
+    let result = (|| -> Result<(), String> {
+        let mut config: serde_json::Value = match std::fs::read_to_string(config_path) {
+            Ok(content) => serde_json::from_str(&content).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::Value::Object(serde_json::Map::new())
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+
+        // Check if trust is already set.
+        let already = config
+            .get("projects")
+            .and_then(|p| p.get(directory))
+            .and_then(|e| e.get("hasTrustDialogAccepted"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
+
+        if already {
+            return Ok(());
+        }
+
+        let obj = config.as_object_mut().ok_or("config not an object")?;
+        let projects = obj
+            .entry("projects")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let project = projects
+            .as_object_mut()
+            .ok_or("projects not an object")?
+            .entry(directory)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        project
+            .as_object_mut()
+            .ok_or("project entry not an object")?
+            .insert(
+                "hasTrustDialogAccepted".to_string(),
+                serde_json::Value::Bool(true),
+            );
+
+        let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+        std::fs::write(config_path, &content).map_err(|e| e.to_string())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                config_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+
+        tracing::info!(directory, "trust injected");
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_dir(&lock_path);
+    result
+}
+
 #[tokio::main]
 async fn main() {
     let _guard = init_tracing();
@@ -351,6 +422,15 @@ async fn main() {
     if std::env::set_current_dir(&pane_dir).is_err() {
         emit_error(&format!("cannot cd to {}", pane_dir.display()));
         std::process::exit(1);
+    }
+
+    // Ensure trust for the pane directory so the CLI skips its approval
+    // dialog. Same protocol as Puzzle's config.rs — locked read-modify-write
+    // of ~/.claude.json with mkdir-based locking.
+    let config_path = PathBuf::from(&home).join(".claude.json");
+    let pane_dir_str = pane_dir.to_str().unwrap_or("");
+    if let Err(e) = ensure_trust(&config_path, pane_dir_str) {
+        tracing::warn!("failed to ensure trust: {}", e);
     }
 
     // Determine the resume target.
@@ -403,11 +483,15 @@ async fn main() {
         // by bare name, assuming it is in the executable path.
         let mcp_config_path = std::env::temp_dir()
             .join(format!("easement-wicket-{}.json", payload.slug));
+        let wicket_socket = pane_dir.join("wicket.sock");
         let mcp_config = serde_json::json!({
             "mcpServers": {
                 "wicket": {
                     "command": "wicket",
-                    "args": []
+                    "args": [],
+                    "env": {
+                        "WICKET_SOCKET": wicket_socket.to_string_lossy()
+                    }
                 }
             }
         });
