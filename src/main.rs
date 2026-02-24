@@ -416,6 +416,9 @@ async fn main() {
             std::process::exit(1);
         }
         tracing::info!(path = %mcp_config_path.display(), "wrote wicket mcp config");
+        // The CLI namespaces MCP tools as mcp__<server>__<tool>. The config
+        // names the server "wicket" and the tool is "wicket_approve", so the
+        // fully qualified name is mcp__wicket__wicket_approve.
         cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
             .arg("--mcp-config").arg(&mcp_config_path);
     }
