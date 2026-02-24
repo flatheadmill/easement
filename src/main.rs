@@ -1,3 +1,20 @@
+// Wicket: an MCP server that relays Claude's permission-prompt-tool requests
+// to Puzzle through a Unix domain socket. Claude spawns Wicket as an MCP stdio
+// server. When Claude needs tool approval, it calls wicket_approve over MCP.
+// Wicket connects to Puzzle's socket at /tmp/wicket.sock, sends the request as
+// a JSON line, blocks until Puzzle responds with allow or deny, then constructs
+// the MCP tool result and returns it to Claude.
+//
+// Wicket implements the MCP JSON-RPC protocol directly — initialize, tools/list,
+// tools/call — with serde, no MCP library. The tool result is the approval
+// response serialized as a text content block, which is how MCP tool results
+// are structured.
+//
+// The socket protocol with Puzzle is minimal: one JSON line in (ApprovalRequest),
+// one JSON line out (behavior + optional message). Puzzle adds no updatedInput —
+// Wicket clones the original input before sending and echoes it back on allow,
+// because the CLI's Zod schema requires updatedInput in allow responses.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
@@ -78,6 +95,9 @@ async fn request_approval(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
+    // Clone before the request consumes input — we need to echo it back
+    // as updatedInput on allow. Puzzle's response is just behavior/message;
+    // Wicket is responsible for the updatedInput the Zod schema requires.
     let original_input = input.clone();
     let request = ApprovalRequest {
         tool_name,
