@@ -60,6 +60,7 @@ struct Payload {
     message: String,
     session_id: Option<String>,
     transcript: Option<Vec<serde_json::Value>>,
+    wicket_socket: Option<String>,
 }
 
 // -- Output envelopes --
@@ -483,7 +484,13 @@ async fn main() {
         // by bare name, assuming it is in the executable path.
         let mcp_config_path = std::env::temp_dir()
             .join(format!("easement-wicket-{}.json", payload.slug));
-        let wicket_socket = pane_dir.join("wicket.sock");
+        // The socket path comes from the payload when Puzzle is tunneling
+        // via SSH -R (the remote socket lives in /tmp). Otherwise fall back
+        // to the pane directory for local execution.
+        let wicket_socket = payload.wicket_socket
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| pane_dir.join("wicket.sock"));
         let mcp_config = serde_json::json!({
             "mcpServers": {
                 "wicket": {
