@@ -1,299 +1,408 @@
-// Wicket: an MCP server that relays Claude's permission-prompt-tool requests
-// to Puzzle through a Unix domain socket. Claude spawns Wicket as an MCP stdio
-// server. When Claude needs tool approval, it calls wicket_approve over MCP.
-// Wicket connects to Puzzle's socket at /tmp/wicket.sock, sends the request as
-// a JSON line, blocks until Puzzle responds with allow or deny, then constructs
-// the MCP tool result and returns it to Claude.
+// Wicket: the coordinator between clients (Puzzle, Shotgun) and Easement.
 //
-// Wicket implements the MCP JSON-RPC protocol directly — initialize, tools/list,
-// tools/call — with serde, no MCP library. The tool result is the approval
-// response serialized as a text content block, which is how MCP tool results
-// are structured.
+// The client spawns Wicket with optional --remote <host> and --yolo flags.
+// Wicket reads a payload from stdin, spawns Easement (locally or over SSH),
+// binds the approval socket when needed, and multiplexes everything into a
+// single NDJSON envelope stream. The client sends envelopes back: claude
+// envelopes route to Easement, approval envelopes route to the held socket
+// connection.
 //
-// The socket protocol with Puzzle is minimal: one JSON line in (ApprovalRequest),
-// one JSON line out (behavior + optional message). Puzzle adds no updatedInput —
-// Wicket clones the original input before sending and echoes it back on allow,
-// because the CLI's Zod schema requires updatedInput in allow responses.
+// Approval requests reach Wicket through the domain socket. On the remote
+// side, Easement starts an HTTP MCP server on port 6502 that bridges to
+// the forwarded socket. No relay binary is needed on the remote machine —
+// only easement and claude.
+
+use std::env;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::env;
-use std::io::{self, BufRead, Write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::UnixListener;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
 
-const DEFAULT_SOCKET_PATH: &str = "/tmp/wicket.sock";
+// ---- Output ----
 
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
+#[derive(Debug, Serialize)]
+struct Envelope {
+    stream: &'static str,
+    data: Value,
+}
+
+fn emit(stream: &'static str, data: Value) {
+    if let Ok(line) = serde_json::to_string(&Envelope { stream, data }) {
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        let _ = lock.write_all(line.as_bytes());
+        let _ = lock.write_all(b"\n");
+        let _ = lock.flush();
+    }
+}
+
+fn emit_error(message: &str) {
+    emit("error", json!({ "message": message }));
+}
+
+// ---- Logging ----
+
+fn init_tracing() -> WorkerGuard {
+    let home = env::var("HOME").expect("HOME not set");
+    let log_dir = std::path::Path::new(&home)
+        .join(".local").join("state").join("puzzle");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("wicket.log"))
+        .expect("failed to open wicket.log");
+
+    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("wicket=debug"));
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(false)
+        .init();
+
+    guard
+}
+
+// ---- Payload ----
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Payload {
+    slug: String,
     #[serde(default)]
-    params: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
+    yolo: bool,
     message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCallParams {
-    name: String,
-    arguments: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct ApprovalRequest {
-    tool_name: String,
-    input: Value,
+    session_id: Option<String>,
+    transcript: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_use_id: Option<String>,
+    wicket_socket: Option<String>,
 }
+
+// ---- Inbound envelope from client ----
 
 #[derive(Debug, Deserialize)]
-struct ApprovalResponse {
-    behavior: String,
-    #[serde(default)]
-    message: Option<String>,
+struct InboundEnvelope {
+    stream: String,
+    data: Value,
 }
 
-fn socket_path() -> String {
-    env::var("WICKET_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string())
-}
+// ---- Coordinator ----
 
-async fn request_approval(
-    tool_name: String,
-    input: Value,
-    tool_use_id: Option<String>,
-) -> Result<Value, String> {
-    let path = socket_path();
-
-    let stream = match UnixStream::connect(&path).await {
-        Ok(s) => s,
-        Err(e) => {
-            return Ok(json!({
-                "behavior": "deny",
-                "message": format!("No approval interface connected ({})", e)
-            }));
+async fn run_coordinator(remote: Option<String>, yolo: bool) {
+    let home = match env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            emit_error("HOME not set");
+            std::process::exit(1);
         }
     };
 
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    // Read the payload from stdin.
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut payload_line = String::new();
 
-    // Clone before the request consumes input — we need to echo it back
-    // as updatedInput on allow. Puzzle's response is just behavior/message;
-    // Wicket is responsible for the updatedInput the Zod schema requires.
-    let original_input = input.clone();
-    let request = ApprovalRequest {
-        tool_name,
-        input,
-        tool_use_id,
-    };
-
-    let mut request_json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-    request_json.push('\n');
-
-    writer
-        .write_all(request_json.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    writer.flush().await.map_err(|e| e.to_string())?;
-
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let response: ApprovalResponse =
-        serde_json::from_str(&response_line).map_err(|e| e.to_string())?;
-
-    if response.behavior == "allow" {
-        Ok(json!({ "behavior": "allow", "updatedInput": original_input }))
-    } else {
-        Ok(json!({
-            "behavior": "deny",
-            "message": response.message.unwrap_or_else(|| "User denied permission".to_string())
-        }))
+    if reader.read_line(&mut payload_line).await.is_err() {
+        emit_error("failed to read payload from stdin");
+        std::process::exit(1);
     }
-}
 
-fn handle_initialize(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        id,
-        result: Some(json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
-            "serverInfo": {
-                "name": "wicket",
-                "version": "0.1.0"
-            }
-        })),
-        error: None,
-    }
-}
-
-fn handle_tools_list(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        id,
-        result: Some(json!({
-            "tools": [{
-                "name": "wicket_approve",
-                "description": "Request human approval for a tool call",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tool_name": {
-                            "type": "string",
-                            "description": "Name of the tool requesting approval"
-                        },
-                        "input": {
-                            "type": "object",
-                            "description": "Input arguments for the tool"
-                        },
-                        "tool_use_id": {
-                            "type": "string",
-                            "description": "Optional tool use ID"
-                        }
-                    },
-                    "required": ["tool_name", "input"]
-                }
-            }]
-        })),
-        error: None,
-    }
-}
-
-async fn handle_tools_call(id: Value, params: Value) -> JsonRpcResponse {
-    let tool_params: ToolCallParams = match serde_json::from_value(params) {
+    let mut payload: Payload = match serde_json::from_str(payload_line.trim()) {
         Ok(p) => p,
         Err(e) => {
-            return JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32602,
-                    message: format!("Invalid params: {}", e),
-                }),
-            };
+            emit_error(&format!("invalid payload: {}", e));
+            std::process::exit(1);
         }
     };
 
-    if tool_params.name != "wicket_approve" {
-        return JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id,
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32601,
-                message: format!("Unknown tool: {}", tool_params.name),
-            }),
-        };
+    if yolo {
+        payload.yolo = true;
     }
 
-    let tool_name = tool_params.arguments["tool_name"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    let input = tool_params.arguments["input"].clone();
-    let tool_use_id = tool_params.arguments["tool_use_id"]
-        .as_str()
-        .map(|s| s.to_string());
+    tracing::info!(
+        slug = %payload.slug,
+        yolo = payload.yolo,
+        remote = ?remote,
+        has_session_id = payload.session_id.is_some(),
+        has_transcript = payload.transcript.is_some(),
+        "coordinator starting"
+    );
 
-    match request_approval(tool_name, input, tool_use_id).await {
-        Ok(response) => {
-            let response_text = serde_json::to_string(&response).unwrap();
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(json!({
-                    "content": [{
-                        "type": "text",
-                        "text": response_text
-                    }]
-                })),
-                error: None,
+    // Bind the approval socket unless yolo.
+    let socket_path = PathBuf::from(&home)
+        .join("pane").join(&payload.slug).join("wicket.sock");
+    let approval_listener: Option<UnixListener> = if !yolo {
+        let _ = std::fs::remove_file(&socket_path);
+        match UnixListener::bind(&socket_path) {
+            Ok(l) => {
+                tracing::info!(path = %socket_path.display(), "approval socket bound");
+                Some(l)
+            }
+            Err(e) => {
+                emit_error(&format!("failed to bind approval socket: {}", e));
+                std::process::exit(1);
             }
         }
-        Err(e) => JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id,
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32000,
-                message: e,
-            }),
-        },
+    } else {
+        None
+    };
+
+    // Build the Easement command.
+    let mut cmd = match &remote {
+        None => Command::new("easement"),
+        Some(host) => {
+            let mut c = Command::new("ssh");
+            if !yolo {
+                let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+                let remote_socket = format!(
+                    "/tmp/puzzle-{}-{}.sock", payload.slug, short_id
+                );
+                payload.wicket_socket = Some(remote_socket.clone());
+                c.arg("-R").arg(format!(
+                    "{}:{}", remote_socket, socket_path.display()
+                ));
+            }
+            c.arg(host).arg("easement");
+            c
+        }
+    };
+
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            emit_error(&format!("failed to spawn easement: {}", e));
+            std::process::exit(1);
+        }
+    };
+
+    let mut easement_stdin = child.stdin.take()
+        .expect("stdin was set to piped");
+    let easement_stdout = child.stdout.take()
+        .expect("stdout was set to piped");
+
+    // Send the payload to Easement.
+    let mut payload_json = serde_json::to_string(&payload)
+        .expect("payload serialization cannot fail");
+    payload_json.push('\n');
+    if easement_stdin.write_all(payload_json.as_bytes()).await.is_err() {
+        emit_error("failed to write payload to easement");
+        std::process::exit(1);
+    }
+    let _ = easement_stdin.flush().await;
+
+    tracing::info!("easement spawned, payload forwarded");
+
+    // Held approval socket writer — one approval at a time.
+    let mut approval_writer: Option<tokio::net::unix::OwnedWriteHalf> = None;
+
+    // Easement stdout → channel.
+    let (stdout_tx, mut stdout_rx) = mpsc::channel::<String>(256);
+
+    tokio::spawn(async move {
+        let mut stdout_reader = BufReader::new(easement_stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout_reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() {
+                        if stdout_tx.send(trimmed).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Client stdin → channel.
+    let (client_tx, mut client_rx) = mpsc::channel::<InboundEnvelope>(256);
+
+    tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<InboundEnvelope>(trimmed) {
+                        Ok(env) => {
+                            if client_tx.send(env).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("bad inbound envelope: {}", e);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            // Easement stdout — pass through to client unchanged.
+            Some(line) = stdout_rx.recv() => {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                let _ = lock.write_all(line.as_bytes());
+                let _ = lock.write_all(b"\n");
+                let _ = lock.flush();
+            }
+
+            // Client inbound envelopes — demux by stream.
+            Some(envelope) = client_rx.recv() => {
+                match envelope.stream.as_str() {
+                    "claude" => {
+                        let mut data_line = serde_json::to_string(&envelope.data)
+                            .expect("data serialization cannot fail");
+                        data_line.push('\n');
+                        if easement_stdin.write_all(data_line.as_bytes()).await.is_err() {
+                            tracing::warn!("failed to write to easement stdin");
+                        }
+                        let _ = easement_stdin.flush().await;
+                    }
+                    "approval" => {
+                        if let Some(mut writer) = approval_writer.take() {
+                            let mut response = serde_json::to_string(&envelope.data)
+                                .expect("approval data serialization cannot fail");
+                            response.push('\n');
+                            let _ = writer.write_all(response.as_bytes()).await;
+                            let _ = writer.flush().await;
+                            let _ = writer.shutdown().await;
+                            tracing::info!("approval response sent");
+                        } else {
+                            tracing::warn!("approval envelope with no pending connection");
+                        }
+                    }
+                    other => {
+                        tracing::warn!("unknown inbound stream: {}", other);
+                    }
+                }
+            }
+
+            // Approval socket — accept a connection from Easement's HTTP MCP server.
+            result = async {
+                match &approval_listener {
+                    Some(l) => l.accept().await.map(|(s, _)| s),
+                    None => std::future::pending().await,
+                }
+            }, if approval_writer.is_none() => {
+                match result {
+                    Ok(stream) => {
+                        let (read_half, write_half) = stream.into_split();
+                        let mut buf_reader = BufReader::new(read_half);
+                        let mut line = String::new();
+                        match buf_reader.read_line(&mut line).await {
+                            Ok(0) => {
+                                tracing::warn!("socket closed before sending request");
+                            }
+                            Ok(_) => {
+                                if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
+                                    tracing::info!("approval request received");
+                                    emit("approval", request);
+                                    approval_writer = Some(write_half);
+                                } else {
+                                    tracing::warn!("bad approval request: {}", line.trim());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("failed to read approval request: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("approval accept error: {}", e);
+                    }
+                }
+            }
+
+            // Easement exited.
+            status = child.wait() => {
+                match status {
+                    Ok(s) => {
+                        let code = s.code().unwrap_or(-1);
+                        tracing::info!(exit_code = code, "easement exited");
+                        emit("meta", json!({ "exit_code": code }));
+                    }
+                    Err(e) => {
+                        tracing::error!("error waiting for easement: {}", e);
+                        emit_error(&format!("error waiting for easement: {}", e));
+                    }
+                }
+                break;
+            }
+
+            else => {
+                tracing::info!("all channels closed, shutting down");
+                break;
+            }
+        }
+    }
+
+    if !yolo {
+        let _ = std::fs::remove_file(&socket_path);
     }
 }
+
+// ---- Entry point ----
 
 #[tokio::main]
 async fn main() {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let _guard = init_tracing();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
-        if line.is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Failed to parse request: {}", e);
-                continue;
+    let args: Vec<String> = env::args().collect();
+    let mut remote: Option<String> = None;
+    let mut yolo = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--remote" => {
+                i += 1;
+                if i < args.len() {
+                    remote = Some(args[i].clone());
+                } else {
+                    emit_error("--remote requires a host argument");
+                    std::process::exit(1);
+                }
             }
-        };
-
-        // Notifications have no id and expect no response
-        if request.id.is_none() {
-            continue;
+            "--yolo" => {
+                yolo = true;
+            }
+            other => {
+                emit_error(&format!("unknown argument: {}", other));
+                std::process::exit(1);
+            }
         }
-
-        let id = request.id.unwrap();
-
-        let response = match request.method.as_str() {
-            "initialize" => handle_initialize(id),
-            "tools/list" => handle_tools_list(id),
-            "tools/call" => handle_tools_call(id, request.params).await,
-            _ => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32601,
-                    message: format!("Method not found: {}", request.method),
-                }),
-            },
-        };
-
-        let response_json = serde_json::to_string(&response).unwrap();
-        writeln!(stdout, "{}", response_json).unwrap();
-        stdout.flush().unwrap();
+        i += 1;
     }
+
+    tracing::info!(remote = ?remote, yolo, "wicket starting");
+    run_coordinator(remote, yolo).await;
 }
