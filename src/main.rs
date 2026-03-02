@@ -11,13 +11,26 @@
 // events, {"stream":"transcript","data":{...}} for JSONL entries,
 // {"stream":"meta","data":{...}} for session info, {"stream":"error",...}
 // for failures.
+//
+// When not in yolo mode, Easement starts an HTTP MCP server on port 6502
+// before spawning Claude. The server handles approval requests by bridging
+// to the Wicket domain socket. Claude connects to http://localhost:6502/mcp
+// directly — no relay binary needed on the machine.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -376,6 +389,229 @@ fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
     result
 }
 
+// -- HTTP MCP server --
+//
+// A minimal HTTP server on port 6502 that speaks MCP JSON-RPC. Claude
+// connects to http://localhost:6502/mcp for approval requests. The server
+// bridges each tools/call to the Wicket domain socket — one connection per
+// request, one JSON line in, one JSON line out.
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcRequest {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    id: Option<serde_json::Value>,
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    id: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcError {
+    code: i32,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallParams {
+    name: String,
+    arguments: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalRequest {
+    tool_name: String,
+    input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_use_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalResponse {
+    behavior: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+async fn request_approval_via_socket(
+    socket_path: &Path,
+    tool_name: String,
+    input: serde_json::Value,
+    tool_use_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let stream = match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(serde_json::json!({
+                "behavior": "deny",
+                "message": format!("No approval interface connected ({})", e)
+            }));
+        }
+    };
+
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
+
+    let original_input = input.clone();
+    let request = ApprovalRequest { tool_name, input, tool_use_id };
+
+    let mut request_json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    request_json.push('\n');
+
+    writer.write_all(request_json.as_bytes()).await.map_err(|e| e.to_string())?;
+    writer.flush().await.map_err(|e| e.to_string())?;
+
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).await.map_err(|e| e.to_string())?;
+
+    let response: ApprovalResponse =
+        serde_json::from_str(&response_line).map_err(|e| e.to_string())?;
+
+    if response.behavior == "allow" {
+        Ok(serde_json::json!({ "behavior": "allow", "updatedInput": original_input }))
+    } else {
+        Ok(serde_json::json!({
+            "behavior": "deny",
+            "message": response.message.unwrap_or_else(|| "User denied permission".to_string())
+        }))
+    }
+}
+
+fn jsonrpc_response(id: serde_json::Value, result: serde_json::Value) -> JsonRpcResponse {
+    JsonRpcResponse { jsonrpc: "2.0".to_string(), id, result: Some(result), error: None }
+}
+
+fn jsonrpc_error(id: serde_json::Value, code: i32, message: String) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(), id, result: None,
+        error: Some(JsonRpcError { code, message }),
+    }
+}
+
+async fn handle_mcp_request(
+    body: &str,
+    socket_path: &Path,
+) -> JsonRpcResponse {
+    let request: JsonRpcRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return jsonrpc_error(
+                serde_json::Value::Null, -32700,
+                format!("Parse error: {}", e),
+            );
+        }
+    };
+
+    let id = request.id.unwrap_or(serde_json::Value::Null);
+
+    match request.method.as_str() {
+        "initialize" => jsonrpc_response(id, serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "wicket", "version": "0.1.0" }
+        })),
+        "tools/list" => jsonrpc_response(id, serde_json::json!({
+            "tools": [{
+                "name": "wicket_approve",
+                "description": "Request human approval for a tool call",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": { "type": "string", "description": "Name of the tool requesting approval" },
+                        "input": { "type": "object", "description": "Input arguments for the tool" },
+                        "tool_use_id": { "type": "string", "description": "Optional tool use ID" }
+                    },
+                    "required": ["tool_name", "input"]
+                }
+            }]
+        })),
+        "tools/call" => {
+            let params: ToolCallParams = match serde_json::from_value(request.params) {
+                Ok(p) => p,
+                Err(e) => return jsonrpc_error(id, -32602, format!("Invalid params: {}", e)),
+            };
+            if params.name != "wicket_approve" {
+                return jsonrpc_error(id, -32601, format!("Unknown tool: {}", params.name));
+            }
+            let tool_name = params.arguments["tool_name"].as_str().unwrap_or("unknown").to_string();
+            let input = params.arguments["input"].clone();
+            let tool_use_id = params.arguments["tool_use_id"].as_str().map(|s| s.to_string());
+
+            match request_approval_via_socket(socket_path, tool_name, input, tool_use_id).await {
+                Ok(response) => {
+                    let text = serde_json::to_string(&response).unwrap();
+                    jsonrpc_response(id, serde_json::json!({
+                        "content": [{ "type": "text", "text": text }]
+                    }))
+                }
+                Err(e) => jsonrpc_error(id, -32000, e),
+            }
+        }
+        "notifications/initialized" => {
+            // Notification — no response needed, but we return one since
+            // the HTTP handler always sends a response.
+            jsonrpc_response(id, serde_json::json!({}))
+        }
+        other => jsonrpc_error(id, -32601, format!("Method not found: {}", other)),
+    }
+}
+
+async fn run_mcp_http_server(socket_path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 6502));
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("mcp http server listening on {}", addr);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let socket = socket_path.clone();
+
+        tokio::spawn(async move {
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                let socket = socket.clone();
+                async move {
+                    if req.method() != hyper::Method::POST {
+                        return Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(StatusCode::METHOD_NOT_ALLOWED)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap()
+                        );
+                    }
+
+                    let body = req.collect().await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    let body_str = String::from_utf8_lossy(&body);
+
+                    let response = handle_mcp_request(&body_str, &socket).await;
+                    let json = serde_json::to_string(&response).unwrap();
+
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from(json)))
+                        .unwrap())
+                }
+            });
+
+            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                tracing::warn!("http connection error: {}", e);
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let _guard = init_tracing();
@@ -393,9 +629,14 @@ async fn main() {
     let mut reader = BufReader::new(stdin);
     let mut payload_line = String::new();
 
-    if reader.read_line(&mut payload_line).await.is_err() {
-        emit_error("failed to read payload from stdin");
-        std::process::exit(1);
+    let payload_bytes = reader.read_line(&mut payload_line).await;
+    match payload_bytes {
+        Ok(0) => std::process::exit(0),
+        Ok(_) => {}
+        Err(_) => {
+            emit_error("failed to read payload from stdin");
+            std::process::exit(1);
+        }
     }
 
     let payload: Payload = match serde_json::from_str(payload_line.trim()) {
@@ -478,38 +719,40 @@ async fn main() {
     if payload.yolo {
         cmd.arg("--dangerously-skip-permissions");
     } else {
-        // Write a temporary MCP config for Wicket. The config lives in the
-        // same temp directory as transcript files — it is generated by
-        // Easement, not distributed with the binary. Wicket is referenced
-        // by bare name, assuming it is in the executable path.
-        let mcp_config_path = std::env::temp_dir()
-            .join(format!("easement-wicket-{}.json", payload.slug));
-        // The socket path comes from the payload when Puzzle is tunneling
-        // via SSH -R (the remote socket lives in /tmp). Otherwise fall back
-        // to the pane directory for local execution.
+        // The approval socket path comes from the payload when Wicket is
+        // tunneling via SSH -R (the remote socket lives in /tmp). Otherwise
+        // fall back to the pane directory for local execution.
         let wicket_socket = payload.wicket_socket
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| pane_dir.join("wicket.sock"));
+
+        // Start an HTTP MCP server on port 6502 that bridges approval
+        // requests to the domain socket. Claude connects to this directly
+        // — no relay binary needed.
+        let socket_for_server = wicket_socket.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_mcp_http_server(socket_for_server).await {
+                tracing::error!("mcp http server error: {}", e);
+            }
+        });
+
+        // Write the MCP config pointing Claude to the HTTP endpoint.
+        let mcp_config_path = std::env::temp_dir()
+            .join(format!("easement-wicket-{}.json", payload.slug));
         let mcp_config = serde_json::json!({
             "mcpServers": {
                 "wicket": {
-                    "command": "wicket",
-                    "args": [],
-                    "env": {
-                        "WICKET_SOCKET": wicket_socket.to_string_lossy()
-                    }
+                    "type": "http",
+                    "url": "http://localhost:6502/mcp"
                 }
             }
         });
         if let Err(e) = std::fs::write(&mcp_config_path, mcp_config.to_string()) {
-            emit_error(&format!("cannot write wicket mcp config: {}", e));
+            emit_error(&format!("cannot write mcp config: {}", e));
             std::process::exit(1);
         }
-        tracing::info!(path = %mcp_config_path.display(), "wrote wicket mcp config");
-        // The CLI namespaces MCP tools as mcp__<server>__<tool>. The config
-        // names the server "wicket" and the tool is "wicket_approve", so the
-        // fully qualified name is mcp__wicket__wicket_approve.
+        tracing::info!(path = %mcp_config_path.display(), "wrote http mcp config");
         cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
             .arg("--mcp-config").arg(&mcp_config_path);
     }
