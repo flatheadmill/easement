@@ -1,11 +1,13 @@
 // Wicket: the coordinator between clients (Puzzle, Shotgun) and Easement.
 //
-// The client spawns Wicket with optional --remote <host> and --yolo flags.
-// Wicket reads a payload from stdin, spawns Easement (locally or over SSH),
-// binds the approval socket when needed, and multiplexes everything into a
-// single NDJSON envelope stream. The client sends envelopes back: claude
-// envelopes route to Easement, approval envelopes route to the held socket
-// connection.
+// The client spawns Wicket with optional --remote <host>, --yolo, and
+// --input lpjson flags. Wicket reads a payload from stdin, spawns Easement
+// (locally or over SSH), binds the approval socket when needed, and
+// multiplexes everything into a single envelope stream. The client-facing
+// edge is NDJSON by default or LPJSON (4-byte LE length-prefixed JSON)
+// when --input lpjson is set. The Easement-facing edge is always NDJSON.
+// The client sends envelopes back: claude envelopes route to Easement,
+// approval envelopes route to the held socket connection.
 //
 // Approval requests reach Wicket through the domain socket. On the remote
 // side, Easement starts an HTTP MCP server on port 6502 that bridges to
@@ -16,15 +18,30 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
+
+// ---- Framing ----
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Framing {
+    Ndjson,
+    Lpjson,
+}
+
+static FRAMING: OnceLock<Framing> = OnceLock::new();
+
+fn framing() -> Framing {
+    FRAMING.get().copied().unwrap_or(Framing::Ndjson)
+}
 
 // ---- Output ----
 
@@ -34,18 +51,47 @@ struct Envelope {
     data: Value,
 }
 
+fn write_client(lock: &mut io::StdoutLock, bytes: &[u8]) {
+    match framing() {
+        Framing::Ndjson => {
+            let _ = lock.write_all(bytes);
+            let _ = lock.write_all(b"\n");
+        }
+        Framing::Lpjson => {
+            let _ = lock.write_all(&(bytes.len() as u32).to_le_bytes());
+            let _ = lock.write_all(bytes);
+        }
+    }
+    let _ = lock.flush();
+}
+
 fn emit(stream: &'static str, data: Value) {
-    if let Ok(line) = serde_json::to_string(&Envelope { stream, data }) {
+    if let Ok(json) = serde_json::to_string(&Envelope { stream, data }) {
         let stdout = io::stdout();
         let mut lock = stdout.lock();
-        let _ = lock.write_all(line.as_bytes());
-        let _ = lock.write_all(b"\n");
-        let _ = lock.flush();
+        write_client(&mut lock, json.as_bytes());
     }
 }
 
 fn emit_error(message: &str) {
     emit("error", json!({ "message": message }));
+}
+
+// ---- LPJSON reader ----
+
+async fn read_lpjson<R: AsyncReadExt + Unpin>(reader: &mut R) -> Option<String> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    match reader.read_exact(&mut buf).await {
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+    String::from_utf8(buf).ok()
 }
 
 // ---- Logging ----
@@ -113,14 +159,26 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
     // Read the payload from stdin.
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
-    let mut payload_line = String::new();
 
-    if reader.read_line(&mut payload_line).await.is_err() {
-        emit_error("failed to read payload from stdin");
-        std::process::exit(1);
-    }
+    let payload_str = match framing() {
+        Framing::Ndjson => {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.is_err() {
+                emit_error("failed to read payload from stdin");
+                std::process::exit(1);
+            }
+            line
+        }
+        Framing::Lpjson => match read_lpjson(&mut reader).await {
+            Some(s) => s,
+            None => {
+                emit_error("failed to read payload from stdin");
+                std::process::exit(1);
+            }
+        },
+    };
 
-    let mut payload: Payload = match serde_json::from_str(payload_line.trim()) {
+    let mut payload: Payload = match serde_json::from_str(payload_str.trim()) {
         Ok(p) => p,
         Err(e) => {
             emit_error(&format!("invalid payload: {}", e));
@@ -192,8 +250,9 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
         }
     };
 
-    let mut easement_stdin = child.stdin.take()
-        .expect("stdin was set to piped");
+    let mut easement_stdin: Option<tokio::process::ChildStdin> = Some(
+        child.stdin.take().expect("stdin was set to piped"),
+    );
     let easement_stdout = child.stdout.take()
         .expect("stdout was set to piped");
 
@@ -201,11 +260,13 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
     let mut payload_json = serde_json::to_string(&payload)
         .expect("payload serialization cannot fail");
     payload_json.push('\n');
-    if easement_stdin.write_all(payload_json.as_bytes()).await.is_err() {
-        emit_error("failed to write payload to easement");
-        std::process::exit(1);
+    if let Some(ref mut stdin) = easement_stdin {
+        if stdin.write_all(payload_json.as_bytes()).await.is_err() {
+            emit_error("failed to write payload to easement");
+            std::process::exit(1);
+        }
+        let _ = stdin.flush().await;
     }
-    let _ = easement_stdin.flush().await;
 
     tracing::info!("easement spawned, payload forwarded");
 
@@ -237,56 +298,75 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
 
     // Client stdin → channel.
     let (client_tx, mut client_rx) = mpsc::channel::<InboundEnvelope>(256);
+    let client_framing = framing();
 
     tokio::spawn(async move {
-        let mut line = String::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    match serde_json::from_str::<InboundEnvelope>(trimmed) {
-                        Ok(env) => {
-                            if client_tx.send(env).await.is_err() {
-                                break;
+            let msg = match client_framing {
+                Framing::Ndjson => {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim().to_string();
+                            if trimmed.is_empty() {
+                                continue;
                             }
+                            trimmed
                         }
-                        Err(e) => {
-                            tracing::warn!("bad inbound envelope: {}", e);
-                        }
+                        Err(_) => break,
                     }
                 }
-                Err(_) => break,
+                Framing::Lpjson => match read_lpjson(&mut reader).await {
+                    Some(s) => s,
+                    None => break,
+                },
+            };
+            match serde_json::from_str::<InboundEnvelope>(&msg) {
+                Ok(env) => {
+                    if client_tx.send(env).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("bad inbound envelope: {}", e);
+                }
             }
         }
+        // Client stdin closed — send a synthetic exit so the select loop
+        // closes Easement's stdin, same as an explicit exit envelope.
+        let _ = client_tx.send(InboundEnvelope {
+            stream: "exit".to_string(),
+            data: Value::Object(Default::default()),
+        }).await;
     });
 
     loop {
         tokio::select! {
-            // Easement stdout — pass through to client unchanged.
+            // Easement stdout — pass through to client, re-framed if needed.
             Some(line) = stdout_rx.recv() => {
                 let stdout = io::stdout();
                 let mut lock = stdout.lock();
-                let _ = lock.write_all(line.as_bytes());
-                let _ = lock.write_all(b"\n");
-                let _ = lock.flush();
+                write_client(&mut lock, line.as_bytes());
             }
 
             // Client inbound envelopes — demux by stream.
             Some(envelope) = client_rx.recv() => {
                 match envelope.stream.as_str() {
                     "claude" => {
-                        let mut data_line = serde_json::to_string(&envelope.data)
-                            .expect("data serialization cannot fail");
-                        data_line.push('\n');
-                        if easement_stdin.write_all(data_line.as_bytes()).await.is_err() {
-                            tracing::warn!("failed to write to easement stdin");
+                        if let Some(ref mut stdin) = easement_stdin {
+                            let mut data_line = serde_json::to_string(&envelope.data)
+                                .expect("data serialization cannot fail");
+                            data_line.push('\n');
+                            if stdin.write_all(data_line.as_bytes()).await.is_err() {
+                                tracing::warn!("failed to write to easement stdin");
+                            }
+                            let _ = stdin.flush().await;
                         }
-                        let _ = easement_stdin.flush().await;
+                    }
+                    "exit" => {
+                        tracing::info!("exit envelope received, closing easement stdin");
+                        easement_stdin.take();
                     }
                     "approval" => {
                         if let Some(mut writer) = approval_writer.take() {
@@ -395,6 +475,23 @@ async fn main() {
             "--yolo" => {
                 yolo = true;
             }
+            "--input" => {
+                i += 1;
+                if i < args.len() {
+                    match args[i].as_str() {
+                        "lpjson" => {
+                            let _ = FRAMING.set(Framing::Lpjson);
+                        }
+                        other => {
+                            emit_error(&format!("unknown input format: {}", other));
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    emit_error("--input requires a format argument");
+                    std::process::exit(1);
+                }
+            }
             other => {
                 emit_error(&format!("unknown argument: {}", other));
                 std::process::exit(1);
@@ -403,6 +500,7 @@ async fn main() {
         i += 1;
     }
 
-    tracing::info!(remote = ?remote, yolo, "wicket starting");
+    let _ = FRAMING.get_or_init(|| Framing::Ndjson);
+    tracing::info!(remote = ?remote, yolo, framing = ?framing(), "wicket starting");
     run_coordinator(remote, yolo).await;
 }
