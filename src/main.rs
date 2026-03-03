@@ -771,7 +771,7 @@ async fn main() {
         }
     };
 
-    let mut child_stdin = child.stdin.take().expect("stdin was piped");
+    let mut child_stdin: Option<tokio::process::ChildStdin> = Some(child.stdin.take().expect("stdin was piped"));
     let child_stdout = child.stdout.take().expect("stdout was piped");
     let child_stderr = child.stderr.take().expect("stderr was piped");
 
@@ -796,11 +796,13 @@ async fn main() {
 
     // Send the kickoff message.
     let kickoff = format_user_message(&payload.message);
-    if child_stdin.write_all(kickoff.as_bytes()).await.is_err() {
-        emit_error("failed to send kickoff message");
-        std::process::exit(1);
+    if let Some(ref mut stdin) = child_stdin {
+        if stdin.write_all(kickoff.as_bytes()).await.is_err() {
+            emit_error("failed to send kickoff message");
+            std::process::exit(1);
+        }
+        let _ = stdin.flush().await;
     }
-    let _ = child_stdin.flush().await;
 
     // Read the first stdout event to capture the session ID.
     let mut stdout_reader = BufReader::new(child_stdout);
@@ -912,40 +914,15 @@ async fn main() {
         let _ = stdout_done_tx.send(()).await;
     });
 
-    // Pass stdin through to claude. Everything after the payload line is the
-    // message stream from Puzzle. When Puzzle closes its end, cat exits,
-    // child_stdin drops, claude sees EOF.
-    let mut _stdin_done = false;
+    // Stdin passthrough state. These stay in the main loop rather than a
+    // spawned task so that when child.wait() fires and the loop breaks,
+    // the stdin reading stops naturally. A spawned task would block
+    // runtime shutdown waiting on a synchronous stdin read from Wicket's
+    // pipe, deadlocking if Wicket is waiting for us to exit.
+    let mut stdin_line = String::new();
 
-    tokio::spawn(async move {
-        let mut line = String::new();
-        let mut stdin_lines: usize = 0;
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => {
-                    tracing::debug!(total_lines = stdin_lines, "puzzle stdin EOF, closing claude stdin");
-                    break;
-                }
-                Ok(_) => {
-                    stdin_lines += 1;
-                    tracing::debug!(stdin_lines, "stdin passthrough");
-                    if child_stdin.write_all(line.as_bytes()).await.is_err() {
-                        tracing::warn!("stdin write to claude failed");
-                        break;
-                    }
-                    let _ = child_stdin.flush().await;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "stdin read error");
-                    break;
-                }
-            }
-        }
-        // child_stdin drops here, closing claude's stdin.
-    });
-
-    // Main loop: wait for transcript discovery, stdout completion, or child exit.
+    // Main loop: wait for transcript discovery, stdout completion, stdin
+    // passthrough, or child exit.
     loop {
         tokio::select! {
             Some(path) = transcript_rx.recv(), if !tailer_started => {
@@ -960,7 +937,30 @@ async fn main() {
                 tailer_started = true;
             }
             Some(()) = stdout_done_rx.recv() => {
-                _stdin_done = true;
+                // Claude's stdout closed. Nothing to do — child.wait()
+                // will fire next.
+            }
+            result = reader.read_line(&mut stdin_line), if child_stdin.is_some() => {
+                match result {
+                    Ok(0) => {
+                        tracing::debug!("puzzle stdin EOF, closing claude stdin");
+                        child_stdin.take();
+                    }
+                    Ok(_) => {
+                        if let Some(ref mut stdin) = child_stdin {
+                            tracing::debug!("stdin passthrough");
+                            if stdin.write_all(stdin_line.as_bytes()).await.is_err() {
+                                tracing::warn!("stdin write to claude failed");
+                            } else {
+                                let _ = stdin.flush().await;
+                            }
+                        }
+                        stdin_line.clear();
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "stdin read error");
+                    }
+                }
             }
             status = child.wait() => {
                 match status {
