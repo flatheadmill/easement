@@ -1,105 +1,157 @@
-// Wicket: the coordinator between clients (Puzzle, Shotgun) and Easement.
+// Wicket: long-lived coordinator between clients (Puzzle, Shotgun) and
+// Easement. The client spawns Wicket once and holds it for the life of the
+// window. Wicket owns the transcript, session tracking, JSONL parsing,
+// deduplication, normalization, and the drain gate. Clients receive clean
+// normalized entries and lifecycle events.
 //
-// The client spawns Wicket with optional --remote <host>, --yolo, and
-// --input lpjson flags. Wicket reads a payload from stdin, spawns Easement
-// (locally or over SSH), binds the approval socket when needed, and
-// multiplexes everything into a single envelope stream. The client-facing
-// edge is NDJSON by default or LPJSON (4-byte LE length-prefixed JSON)
-// when --input lpjson is set. The Easement-facing edge is always NDJSON.
-// The client sends envelopes back: claude envelopes route to Easement,
-// approval envelopes route to the held socket connection.
+// Easement stays ephemeral — spawned per round, dies when the round
+// completes. The persistence is in Wicket, not in the pipe to Claude.
 //
-// Approval requests reach Wicket through the domain socket. On the remote
-// side, Easement starts an HTTP MCP server on port 6502 that bridges to
-// the forwarded socket. No relay binary is needed on the remote machine —
-// only easement and claude.
+// The client-facing edge is NDJSON by default or LPJSON with --input lpjson.
+// The Easement-facing edge is always NDJSON.
+
+mod framing;
+mod normalize;
+mod parser;
+mod protocol;
+mod transcript;
 
 use std::env;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-// ---- Framing ----
+use crate::framing::write_client;
+use crate::protocol::{
+    ApprovalDecision, ClaudeMessage, ConnectPayload, InboundEnvelope, LifecycleEvent,
+    NormalizedEntry,
+};
+use crate::transcript::{Sessions, Transcript};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Framing {
-    Ndjson,
-    Lpjson,
+// -- Stdout event types from Easement --
+//
+// These model what Claude emits on stdout, wrapped in Easement's
+// {"stream":"stdout","data":{...}} envelopes. The drain gate depends on
+// result events and replayed user messages.
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum StdoutEvent {
+    Result {
+        subtype: Option<String>,
+        #[serde(default)]
+        is_error: bool,
+        duration_ms: Option<u64>,
+        num_turns: Option<u64>,
+        result: Option<String>,
+        session_id: Option<String>,
+    },
+    System {
+        subtype: Option<String>,
+        session_id: Option<String>,
+    },
+    Assistant {
+        message: Value,
+        session_id: Option<String>,
+        uuid: Option<String>,
+    },
+    User {
+        message: Value,
+        session_id: Option<String>,
+        #[serde(default)]
+        #[serde(rename = "isReplay")]
+        is_replay: bool,
+    },
+    RateLimitEvent {
+        rate_limit_info: Value,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
-static FRAMING: OnceLock<Framing> = OnceLock::new();
+// -- Easement envelope from stdout --
 
-fn framing() -> Framing {
-    FRAMING.get().copied().unwrap_or(Framing::Ndjson)
+#[derive(Debug, serde::Deserialize)]
+struct EasementEnvelope {
+    stream: String,
+    data: Value,
 }
 
-// ---- Output ----
+// -- Output helpers --
 
 #[derive(Debug, Serialize)]
-struct Envelope {
+struct OutEnvelope {
     stream: &'static str,
     data: Value,
 }
 
-fn write_client(lock: &mut io::StdoutLock, bytes: &[u8]) {
-    match framing() {
-        Framing::Ndjson => {
-            let _ = lock.write_all(bytes);
-            let _ = lock.write_all(b"\n");
-        }
-        Framing::Lpjson => {
-            let _ = lock.write_all(&(bytes.len() as u32).to_le_bytes());
-            let _ = lock.write_all(bytes);
-        }
-    }
-    let _ = lock.flush();
-}
-
 fn emit(stream: &'static str, data: Value) {
-    if let Ok(json) = serde_json::to_string(&Envelope { stream, data }) {
+    if let Ok(json) = serde_json::to_string(&OutEnvelope { stream, data }) {
         let stdout = io::stdout();
         let mut lock = stdout.lock();
         write_client(&mut lock, json.as_bytes());
     }
 }
 
+fn emit_entry(entry: &NormalizedEntry) {
+    if let Ok(data) = serde_json::to_value(entry) {
+        emit("entry", data);
+    }
+}
+
+fn emit_lifecycle(event: LifecycleEvent) {
+    if let Ok(data) = serde_json::to_value(&event) {
+        emit("lifecycle", data);
+    }
+}
+
+fn emit_approval(data: Value) {
+    emit("approval", data);
+}
+
+fn emit_meta(data: Value) {
+    emit("meta", data);
+}
+
 fn emit_error(message: &str) {
     emit("error", json!({ "message": message }));
 }
 
-// ---- LPJSON reader ----
+// -- Easement payload (what Wicket sends to Easement's stdin) --
 
-async fn read_lpjson<R: AsyncReadExt + Unpin>(reader: &mut R) -> Option<String> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(_) => return None,
-    }
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    match reader.read_exact(&mut buf).await {
-        Ok(_) => {}
-        Err(_) => return None,
-    }
-    String::from_utf8(buf).ok()
+#[derive(Debug, Serialize)]
+struct EasementPayload {
+    slug: String,
+    #[serde(default)]
+    yolo: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wicket_socket: Option<String>,
 }
 
-// ---- Logging ----
+// -- Logging --
 
 fn init_tracing() -> WorkerGuard {
     let home = env::var("HOME").expect("HOME not set");
     let log_dir = std::path::Path::new(&home)
-        .join(".local").join("state").join("puzzle");
+        .join(".local")
+        .join("state")
+        .join("puzzle");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let log_file = std::fs::OpenOptions::new()
@@ -123,31 +175,87 @@ fn init_tracing() -> WorkerGuard {
     guard
 }
 
-// ---- Payload ----
+// -- Drain gate --
+//
+// Tracks sent messages vs replayed messages to detect when the round's
+// new content begins. The gate opens at a result boundary when
+// sent == replayed, meaning all history has been replayed and the
+// response to the current prompt has completed.
 
-#[derive(Debug, Deserialize, Serialize)]
-struct Payload {
-    slug: String,
-    #[serde(default)]
-    yolo: bool,
-    message: String,
+struct DrainGate {
+    sent: u64,
+    replayed: u64,
+    drained: bool,
     session_id: Option<String>,
-    transcript: Option<Vec<Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    wicket_socket: Option<String>,
 }
 
-// ---- Inbound envelope from client ----
+impl DrainGate {
+    fn new() -> Self {
+        Self {
+            sent: 1, // kickoff message counts as sent
+            replayed: 0,
+            drained: false,
+            session_id: None,
+        }
+    }
 
-#[derive(Debug, Deserialize)]
-struct InboundEnvelope {
-    stream: String,
-    data: Value,
+    /// Process a stdout event. Returns true if the round just completed.
+    fn handle(&mut self, event: &StdoutEvent) -> bool {
+        // Capture session ID from the first event that carries one.
+        if self.session_id.is_none() {
+            let event_sid = match event {
+                StdoutEvent::System { session_id, .. } => session_id.as_ref(),
+                StdoutEvent::Result { session_id, .. } => session_id.as_ref(),
+                StdoutEvent::Assistant { session_id, .. } => session_id.as_ref(),
+                StdoutEvent::User { session_id, .. } => session_id.as_ref(),
+                _ => None,
+            };
+            if let Some(id) = event_sid {
+                tracing::info!(session_id = %id, "captured session id");
+                self.session_id = Some(id.clone());
+            }
+        }
+
+        match event {
+            StdoutEvent::User {
+                is_replay: true, ..
+            } => {
+                self.replayed += 1;
+                tracing::debug!(
+                    sent = self.sent,
+                    replayed = self.replayed,
+                    "user replay, drain gate: {}/{}",
+                    self.replayed,
+                    self.sent
+                );
+            }
+            StdoutEvent::Result { .. } => {
+                tracing::info!(
+                    sent = self.sent,
+                    replayed = self.replayed,
+                    drained = (self.sent == self.replayed),
+                    "result event, drain gate: {}/{}",
+                    self.replayed,
+                    self.sent
+                );
+                if self.sent == self.replayed {
+                    self.drained = true;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
 }
 
-// ---- Coordinator ----
+// -- Coordinator --
 
-async fn run_coordinator(remote: Option<String>, yolo: bool) {
+async fn run_coordinator() {
     let home = match env::var("HOME") {
         Ok(h) => h,
         Err(_) => {
@@ -156,154 +264,62 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
         }
     };
 
-    // Read the payload from stdin.
+    // Read the connect payload from stdin. The BufReader wraps stdin once
+    // and is moved into the client reader task after the connect handshake.
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
 
-    let payload_str = match framing() {
-        Framing::Ndjson => {
-            let mut line = String::new();
-            if reader.read_line(&mut line).await.is_err() {
-                emit_error("failed to read payload from stdin");
-                std::process::exit(1);
-            }
-            line
+    let connect_str = match framing::read_client_message(&mut reader).await {
+        Some(s) => s,
+        None => {
+            emit_error("failed to read connect payload");
+            std::process::exit(1);
         }
-        Framing::Lpjson => match read_lpjson(&mut reader).await {
-            Some(s) => s,
-            None => {
-                emit_error("failed to read payload from stdin");
-                std::process::exit(1);
-            }
-        },
     };
 
-    let mut payload: Payload = match serde_json::from_str(payload_str.trim()) {
+    let connect: ConnectPayload = match serde_json::from_str(&connect_str) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(&format!("invalid payload: {}", e));
+            emit_error(&format!("invalid connect payload: {}", e));
             std::process::exit(1);
         }
     };
 
-    if yolo {
-        payload.yolo = true;
+    tracing::info!(slug = %connect.slug, "connected");
+
+    // Initialize transcript and sessions.
+    let mut transcript = Transcript::new(&connect.slug);
+    let mut sessions = Sessions::new(&connect.slug);
+
+    // Override session if the connect payload provides one.
+    if let Some(sid) = connect.session_id {
+        sessions.set_local(sid);
     }
 
-    tracing::info!(
-        slug = %payload.slug,
-        yolo = payload.yolo,
-        remote = ?remote,
-        has_session_id = payload.session_id.is_some(),
-        has_transcript = payload.transcript.is_some(),
-        "coordinator starting"
-    );
-
-    // Bind the approval socket unless yolo.
-    let socket_path = PathBuf::from(&home)
-        .join("pane").join(&payload.slug).join("wicket.sock");
-    let approval_listener: Option<UnixListener> = if !yolo {
-        let _ = std::fs::remove_file(&socket_path);
-        match UnixListener::bind(&socket_path) {
-            Ok(l) => {
-                tracing::info!(path = %socket_path.display(), "approval socket bound");
-                Some(l)
-            }
-            Err(e) => {
-                emit_error(&format!("failed to bind approval socket: {}", e));
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-
-    // Build the Easement command.
-    let mut cmd = match &remote {
-        None => Command::new("easement"),
-        Some(host) => {
-            let mut c = Command::new("ssh");
-            if !yolo {
-                let short_id = &uuid::Uuid::new_v4().to_string()[..8];
-                let remote_socket = format!(
-                    "/tmp/puzzle-{}-{}.sock", payload.slug, short_id
-                );
-                payload.wicket_socket = Some(remote_socket.clone());
-                c.arg("-R").arg(format!(
-                    "{}:{}", remote_socket, socket_path.display()
-                ));
-            }
-            c.arg(host).arg("easement");
-            c
-        }
-    };
-
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            emit_error(&format!("failed to spawn easement: {}", e));
-            std::process::exit(1);
-        }
-    };
-
-    let mut easement_stdin: Option<tokio::process::ChildStdin> = Some(
-        child.stdin.take().expect("stdin was set to piped"),
-    );
-    let easement_stdout = child.stdout.take()
-        .expect("stdout was set to piped");
-
-    // Send the payload to Easement.
-    let mut payload_json = serde_json::to_string(&payload)
-        .expect("payload serialization cannot fail");
-    payload_json.push('\n');
-    if let Some(ref mut stdin) = easement_stdin {
-        if stdin.write_all(payload_json.as_bytes()).await.is_err() {
-            emit_error("failed to write payload to easement");
-            std::process::exit(1);
-        }
-        let _ = stdin.flush().await;
+    // Stream conversation history to the client.
+    let history = transcript.load_history();
+    for entry in &history {
+        emit_entry(entry);
     }
+    tracing::info!(entries = history.len(), "history streamed");
 
-    tracing::info!("easement spawned, payload forwarded");
-
-    // Held approval socket writer — one approval at a time.
+    // Held state for in-flight rounds.
+    let mut easement_stdin: Option<tokio::process::ChildStdin> = None;
+    let mut easement_child: Option<tokio::process::Child> = None;
+    let mut drain_gate: Option<DrainGate> = None;
     let mut approval_writer: Option<tokio::net::unix::OwnedWriteHalf> = None;
+    let mut approval_listener: Option<UnixListener> = None;
+    let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
 
-    // Easement stdout → channel.
-    let (stdout_tx, mut stdout_rx) = mpsc::channel::<String>(256);
-
-    tokio::spawn(async move {
-        let mut stdout_reader = BufReader::new(easement_stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stdout_reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    let trimmed = line.trim().to_string();
-                    if !trimmed.is_empty() {
-                        if stdout_tx.send(trimmed).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Client stdin → channel.
+    // Channels from spawned tasks.
     let (client_tx, mut client_rx) = mpsc::channel::<InboundEnvelope>(256);
-    let client_framing = framing();
 
+    // Spawn client stdin reader.
+    let client_framing = framing::framing();
     tokio::spawn(async move {
         loop {
             let msg = match client_framing {
-                Framing::Ndjson => {
+                framing::Framing::Ndjson => {
                     let mut line = String::new();
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
@@ -317,7 +333,7 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
                         Err(_) => break,
                     }
                 }
-                Framing::Lpjson => match read_lpjson(&mut reader).await {
+                framing::Framing::Lpjson => match framing::read_lpjson(&mut reader).await {
                     Some(s) => s,
                     None => break,
                 },
@@ -333,53 +349,318 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
                 }
             }
         }
-        // Client stdin closed — send a synthetic exit so the select loop
-        // closes Easement's stdin, same as an explicit exit envelope.
-        let _ = client_tx.send(InboundEnvelope {
-            stream: "exit".to_string(),
-            data: Value::Object(Default::default()),
-        }).await;
+        // Client stdin closed — synthetic exit.
+        let _ = client_tx
+            .send(InboundEnvelope {
+                stream: "exit".to_string(),
+                data: Value::Object(Default::default()),
+            })
+            .await;
     });
 
+    // Socket path for approval bridge.
+    let socket_path = PathBuf::from(&home)
+        .join("pane")
+        .join(&connect.slug)
+        .join("wicket.sock");
+
+    // Main event loop.
     loop {
         tokio::select! {
-            // Easement stdout — pass through to client, re-framed if needed.
-            Some(line) = stdout_rx.recv() => {
-                let stdout = io::stdout();
-                let mut lock = stdout.lock();
-                write_client(&mut lock, line.as_bytes());
+            // Easement stdout — process events.
+            Some(line) = async {
+                match &mut stdout_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Try to parse as an Easement envelope.
+                if let Ok(envelope) = serde_json::from_str::<EasementEnvelope>(&line) {
+                    match envelope.stream.as_str() {
+                        "stdout" => {
+                            if let Ok(event) = serde_json::from_value::<StdoutEvent>(envelope.data) {
+                                // Capture boundary UUID from first assistant message.
+                                if let StdoutEvent::Assistant { ref uuid, .. } = event {
+                                    if let Some(uuid) = uuid {
+                                        let new_entries = transcript.set_boundary(uuid.clone());
+                                        for entry in &new_entries {
+                                            emit_entry(entry);
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref mut gate) = drain_gate {
+                                    let round_done = gate.handle(&event);
+
+                                    if round_done {
+                                        // Only persist the session ID on a
+                                        // successful round — a failed resume
+                                        // produces a throwaway session ID that
+                                        // must not overwrite the real one.
+                                        if let Some(sid) = gate.session_id() {
+                                            let sid = sid.to_string();
+                                            tracing::info!(session_id = %sid, "round completed, recording session");
+                                            sessions.set_local(sid);
+                                        }
+
+                                        tracing::info!("round completed");
+                                        emit_lifecycle(LifecycleEvent::RoundCompleted);
+
+                                        // Close Easement stdin to let it exit.
+                                        easement_stdin.take();
+                                        drain_gate = None;
+                                    }
+                                }
+                            }
+                        }
+                        "transcript" => {
+                            let new_entries = transcript.handle_entry(envelope.data);
+                            for entry in &new_entries {
+                                emit_entry(entry);
+                            }
+                        }
+                        "approval" => {
+                            tracing::info!("approval request received");
+                            emit_approval(envelope.data);
+                        }
+                        "meta" => {
+                            if let Some(sid) = envelope.data.get("session_id").and_then(|v| v.as_str()) {
+                                tracing::info!(session_id = %sid, "meta: session id (not persisted until round completes)");
+                            }
+                            emit_meta(envelope.data);
+                        }
+                        "error" => {
+                            let msg = envelope.data.get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown error");
+                            tracing::error!("easement error: {}", msg);
+                            emit_error(msg);
+                        }
+                        _ => {
+                            tracing::warn!("unknown easement stream: {}", envelope.stream);
+                        }
+                    }
+                }
             }
 
-            // Client inbound envelopes — demux by stream.
+            // Client inbound envelopes.
             Some(envelope) = client_rx.recv() => {
                 match envelope.stream.as_str() {
                     "claude" => {
+                        // If a round is in flight, this is an interjection.
                         if let Some(ref mut stdin) = easement_stdin {
-                            let mut data_line = serde_json::to_string(&envelope.data)
-                                .expect("data serialization cannot fail");
-                            data_line.push('\n');
-                            if stdin.write_all(data_line.as_bytes()).await.is_err() {
-                                tracing::warn!("failed to write to easement stdin");
+                            // Pass through as a user message to Easement.
+                            if let Some(msg) = envelope.data.get("message").and_then(|v| v.as_str()) {
+                                let user_msg = serde_json::json!({
+                                    "type": "user",
+                                    "message": {
+                                        "role": "user",
+                                        "content": msg
+                                    },
+                                    "uuid": uuid::Uuid::new_v4().to_string()
+                                });
+                                let mut line = serde_json::to_string(&user_msg).unwrap();
+                                line.push('\n');
+                                let claude_env = serde_json::json!({
+                                    "stream": "claude",
+                                    "data": user_msg
+                                });
+                                let mut env_line = serde_json::to_string(&claude_env).unwrap();
+                                env_line.push('\n');
+                                let _ = stdin.write_all(env_line.as_bytes()).await;
+                                let _ = stdin.flush().await;
+
+                                if let Some(ref mut gate) = drain_gate {
+                                    gate.sent += 1;
+                                }
+                                tracing::info!("interjection forwarded");
                             }
-                            let _ = stdin.flush().await;
+                        } else {
+                            // No round in flight — start a new round.
+                            let msg: ClaudeMessage = match serde_json::from_value(envelope.data) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::warn!("bad claude message: {}", e);
+                                    emit_error(&format!("bad claude message: {}", e));
+                                    continue;
+                                }
+                            };
+
+                            let is_remote = msg.remote.is_some();
+                            let is_yolo = msg.yolo;
+
+                            // Pick the session ID for this target.
+                            let active_session = if is_remote {
+                                sessions.remote().map(|s| s.to_string())
+                            } else {
+                                sessions.local().map(|s| s.to_string())
+                            };
+
+                            // Build the Easement payload.
+                            let payload = EasementPayload {
+                                slug: connect.slug.clone(),
+                                yolo: is_yolo,
+                                message: msg.message,
+                                session_id: active_session.clone(),
+                                transcript: if active_session.is_none() {
+                                    Some(transcript.entries().to_vec())
+                                } else {
+                                    None
+                                },
+                                wicket_socket: None, // set below for SSH
+                            };
+
+                            transcript.begin_round();
+
+                            // Bind the approval socket unless yolo.
+                            if !is_yolo {
+                                let _ = std::fs::remove_file(&socket_path);
+                                match UnixListener::bind(&socket_path) {
+                                    Ok(l) => {
+                                        tracing::info!(path = %socket_path.display(), "approval socket bound");
+                                        approval_listener = Some(l);
+                                    }
+                                    Err(e) => {
+                                        emit_error(&format!("failed to bind approval socket: {}", e));
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // Build the Easement command.
+                            tracing::info!(
+                                is_remote, is_yolo,
+                                has_session = active_session.is_some(),
+                                "building easement command"
+                            );
+                            let mut payload = payload;
+                            let mut cmd = match &msg.remote {
+                                None => Command::new("easement"),
+                                Some(host) => {
+                                    let mut c = Command::new("ssh");
+                                    if !is_yolo {
+                                        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+                                        let remote_socket = format!(
+                                            "/tmp/puzzle-{}-{}.sock",
+                                            connect.slug, short_id
+                                        );
+                                        payload.wicket_socket = Some(remote_socket.clone());
+                                        c.arg("-R").arg(format!(
+                                            "{}:{}",
+                                            remote_socket,
+                                            socket_path.display()
+                                        ));
+                                    }
+                                    c.arg(host).arg("easement");
+                                    c
+                                }
+                            };
+
+                            cmd.stdin(Stdio::piped())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::null());
+
+                            tracing::info!("spawning easement");
+                            let mut child = match cmd.spawn() {
+                                Ok(c) => {
+                                    tracing::info!("easement spawned");
+                                    c
+                                }
+                                Err(e) => {
+                                    tracing::error!("failed to spawn easement: {}", e);
+                                    emit_error(&format!("failed to spawn easement: {}", e));
+                                    emit_lifecycle(LifecycleEvent::RoundFailed {
+                                        message: format!("spawn error: {}", e),
+                                    });
+                                    continue;
+                                }
+                            };
+
+                            let mut child_stdin = child.stdin.take()
+                                .expect("stdin was set to piped");
+                            let child_stdout = child.stdout.take()
+                                .expect("stdout was set to piped");
+
+                            // Send payload to Easement.
+                            let mut payload_json = serde_json::to_string(&payload)
+                                .expect("payload serialization cannot fail");
+                            tracing::info!(
+                                payload_len = payload_json.len(),
+                                "sending payload to easement"
+                            );
+                            payload_json.push('\n');
+                            if child_stdin
+                                .write_all(payload_json.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                tracing::error!("failed to write payload to easement");
+                                emit_error("failed to write payload to easement");
+                                emit_lifecycle(LifecycleEvent::RoundFailed {
+                                    message: "payload write failed".into(),
+                                });
+                                continue;
+                            }
+                            let _ = child_stdin.flush().await;
+                            tracing::info!("payload sent to easement");
+
+                            // Spawn stdout reader task.
+                            let (tx, rx) = mpsc::channel::<String>(256);
+                            tokio::spawn(async move {
+                                let mut stdout_reader = BufReader::new(child_stdout);
+                                let mut line = String::new();
+                                loop {
+                                    line.clear();
+                                    match stdout_reader.read_line(&mut line).await {
+                                        Ok(0) => break,
+                                        Ok(_) => {
+                                            let trimmed = line.trim().to_string();
+                                            if !trimmed.is_empty() {
+                                                if tx.send(trimmed).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+
+                            easement_stdin = Some(child_stdin);
+                            easement_child = Some(child);
+                            stdout_rx = Some(rx);
+                            drain_gate = Some(DrainGate::new());
+
+                            tracing::info!("round started");
+                            emit_lifecycle(LifecycleEvent::RoundStarted);
                         }
-                    }
-                    "exit" => {
-                        tracing::info!("exit envelope received, closing easement stdin");
-                        easement_stdin.take();
                     }
                     "approval" => {
                         if let Some(mut writer) = approval_writer.take() {
-                            let mut response = serde_json::to_string(&envelope.data)
-                                .expect("approval data serialization cannot fail");
+                            let decision: ApprovalDecision = match serde_json::from_value(envelope.data) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    tracing::warn!("bad approval decision: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let mut response = serde_json::to_string(&decision)
+                                .expect("approval serialization cannot fail");
                             response.push('\n');
                             let _ = writer.write_all(response.as_bytes()).await;
                             let _ = writer.flush().await;
                             let _ = writer.shutdown().await;
                             tracing::info!("approval response sent");
                         } else {
-                            tracing::warn!("approval envelope with no pending connection");
+                            tracing::warn!("approval decision with no pending connection");
                         }
+                    }
+                    "exit" => {
+                        tracing::info!("client disconnected");
+                        // Close Easement stdin if a round is in flight.
+                        easement_stdin.take();
+                        break;
                     }
                     other => {
                         tracing::warn!("unknown inbound stream: {}", other);
@@ -387,7 +668,7 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
                 }
             }
 
-            // Approval socket — accept a connection from Easement's HTTP MCP server.
+            // Approval socket — accept connection from Easement's MCP server.
             result = async {
                 match &approval_listener {
                     Some(l) => l.accept().await.map(|(s, _)| s),
@@ -405,8 +686,8 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
                             }
                             Ok(_) => {
                                 if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
-                                    tracing::info!("approval request received");
-                                    emit("approval", request);
+                                    tracing::info!("approval request from easement");
+                                    emit_approval(request);
                                     approval_writer = Some(write_half);
                                 } else {
                                     tracing::warn!("bad approval request: {}", line.trim());
@@ -424,63 +705,73 @@ async fn run_coordinator(remote: Option<String>, yolo: bool) {
             }
 
             // Easement exited.
-            status = child.wait() => {
+            status = async {
+                match &mut easement_child {
+                    Some(child) => child.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match status {
                     Ok(s) => {
                         let code = s.code().unwrap_or(-1);
                         tracing::info!(exit_code = code, "easement exited");
-                        emit("meta", json!({ "exit_code": code }));
+
+                        // If the drain gate didn't fire, the round failed.
+                        // Clear the session ID so the next round falls back
+                        // to transcript mode rather than retrying a dead session.
+                        if drain_gate.is_some() {
+                            tracing::warn!("easement exited before drain gate fired");
+                            sessions.clear_local();
+                            emit_lifecycle(LifecycleEvent::RoundFailed {
+                                message: format!("easement exited with code {}", code),
+                            });
+                            drain_gate = None;
+                        }
                     }
                     Err(e) => {
                         tracing::error!("error waiting for easement: {}", e);
-                        emit_error(&format!("error waiting for easement: {}", e));
+                        emit_lifecycle(LifecycleEvent::RoundFailed {
+                            message: format!("wait error: {}", e),
+                        });
+                        drain_gate = None;
                     }
                 }
-                break;
-            }
-
-            else => {
-                tracing::info!("all channels closed, shutting down");
-                break;
+                // Clean up round state.
+                easement_child = None;
+                easement_stdin = None;
+                stdout_rx = None;
+                approval_writer = None;
+                if !connect.slug.is_empty() {
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+                approval_listener = None;
             }
         }
     }
 
-    if !yolo {
-        let _ = std::fs::remove_file(&socket_path);
+    // Clean up.
+    let _ = std::fs::remove_file(&socket_path);
+    if let Some(mut child) = easement_child {
+        let _ = child.wait().await;
     }
 }
 
-// ---- Entry point ----
+// -- Entry point --
 
 #[tokio::main]
 async fn main() {
     let _guard = init_tracing();
 
     let args: Vec<String> = env::args().collect();
-    let mut remote: Option<String> = None;
-    let mut yolo = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--remote" => {
-                i += 1;
-                if i < args.len() {
-                    remote = Some(args[i].clone());
-                } else {
-                    emit_error("--remote requires a host argument");
-                    std::process::exit(1);
-                }
-            }
-            "--yolo" => {
-                yolo = true;
-            }
             "--input" => {
                 i += 1;
                 if i < args.len() {
                     match args[i].as_str() {
                         "lpjson" => {
-                            let _ = FRAMING.set(Framing::Lpjson);
+                            framing::set_framing(framing::Framing::Lpjson);
                         }
                         other => {
                             emit_error(&format!("unknown input format: {}", other));
@@ -500,7 +791,7 @@ async fn main() {
         i += 1;
     }
 
-    let _ = FRAMING.get_or_init(|| Framing::Ndjson);
-    tracing::info!(remote = ?remote, yolo, framing = ?framing(), "wicket starting");
-    run_coordinator(remote, yolo).await;
+    framing::init_default();
+    tracing::info!(framing = ?framing::framing(), "wicket starting");
+    run_coordinator().await;
 }
