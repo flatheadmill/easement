@@ -1011,7 +1011,12 @@ async fn main() {
                     tracing::warn!("no transcript path discovered");
                 }
 
-                break;
+                // Exit immediately. The tokio runtime cannot shut down
+                // cleanly because stdin is backed by a blocking thread
+                // pool read that will never complete while Wicket holds
+                // the pipe open. Bypassing runtime Drop is the only way
+                // to avoid the deadlock.
+                std::process::exit(0);
             }
         }
     }
