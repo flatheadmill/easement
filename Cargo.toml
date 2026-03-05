@@ -11,5 +11,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4"] }
-notify = "7"
-walkdir = "2"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-tungstenite = "0.15"
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
