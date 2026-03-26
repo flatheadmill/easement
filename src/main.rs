@@ -275,6 +275,10 @@ enum CoordMessage {
         tool_use_id: Option<String>,
         reply: oneshot::Sender<Value>,
     },
+    ServiceRequest {
+        request_type: String,
+        reply: oneshot::Sender<ServiceResponse>,
+    },
 }
 
 // -- Pending approval state --
@@ -282,6 +286,18 @@ enum CoordMessage {
 struct PendingApproval {
     reply: oneshot::Sender<Value>,
     original_input: Value,
+}
+
+// -- Service request/response --
+
+struct ServiceResponse {
+    content_type: String,
+    body: Vec<u8>,
+}
+
+struct PendingService {
+    id: String,
+    reply: oneshot::Sender<ServiceResponse>,
 }
 
 // -- MCP JSON-RPC types --
@@ -381,7 +397,7 @@ fn broadcast_error(clients: &Clients, message: &str) {
 
 // -- Coordinator (per-slug) --
 
-async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
+async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
     let mut transcript = Transcript::new(&slug);
     let mut sessions = Sessions::new(&slug);
     let history = transcript.load_history();
@@ -396,6 +412,7 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
     let mut easement_child: Option<tokio::process::Child> = None;
     let mut drain_gate: Option<DrainGate> = None;
     let mut pending_approval: Option<PendingApproval> = None;
+    let mut pending_service: Option<PendingService> = None;
     let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
 
     tracing::info!(
@@ -510,6 +527,34 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         pending_approval = Some(PendingApproval {
                             reply,
                             original_input: input,
+                        });
+                    }
+                    CoordMessage::ServiceRequest { request_type, reply } => {
+                        let request_id = uuid::Uuid::new_v4().to_string();
+                        tracing::info!(request_type = %request_type, id = %request_id, "service request");
+                        broadcast(&clients, "request", json!({
+                            "type": request_type,
+                            "id": request_id,
+                        }));
+                        let id_for_timeout = request_id.clone();
+                        pending_service = Some(PendingService {
+                            id: request_id,
+                            reply,
+                        });
+                        // Claim timeout — if no client claims within 2 seconds,
+                        // fire the oneshot with a 404-equivalent empty response.
+                        let coord_tx_timeout = coord_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            // Send a synthetic timeout envelope. The coordinator
+                            // checks if the pending service still matches this id.
+                            let _ = coord_tx_timeout.send(CoordMessage::Envelope {
+                                id: 0,
+                                envelope: InboundEnvelope {
+                                    stream: "service_timeout".to_string(),
+                                    data: json!({ "id": id_for_timeout }),
+                                },
+                            });
                         });
                     }
                     CoordMessage::Envelope { id, envelope } => {
@@ -697,6 +742,58 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                     tracing::warn!("approval decision with no pending request");
                                 }
                             }
+                            "claim" => {
+                                let claim_id = envelope.data.get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if let Some(ref pending) = pending_service {
+                                    if pending.id == claim_id {
+                                        tracing::info!(id = %claim_id, "service request claimed");
+                                    }
+                                }
+                            }
+                            "response" => {
+                                let resp_id = envelope.data.get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if let Some(pending) = pending_service.take() {
+                                    if pending.id == resp_id {
+                                        let content_type = envelope.data.get("content_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("application/octet-stream")
+                                            .to_string();
+                                        let body = envelope.data.get("body")
+                                            .and_then(|v| v.as_str())
+                                            .map(|b64| {
+                                                use base64::Engine;
+                                                base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_default()
+                                            })
+                                            .unwrap_or_default();
+                                        tracing::info!(id = %resp_id, content_type = %content_type, bytes = body.len(), "service response received");
+                                        let _ = pending.reply.send(ServiceResponse { content_type, body });
+                                    } else {
+                                        tracing::warn!(expected = %pending.id, got = %resp_id, "service response id mismatch");
+                                        pending_service = Some(pending);
+                                    }
+                                }
+                            }
+                            "service_timeout" => {
+                                let timeout_id = envelope.data.get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if let Some(pending) = pending_service.take() {
+                                    if pending.id == timeout_id {
+                                        tracing::warn!(id = %timeout_id, "service request timed out (no claim)");
+                                        // Drop the reply sender — the HTTP handler
+                                        // will see the channel close.
+                                    } else {
+                                        // Was claimed or fulfilled already, put it back.
+                                        pending_service = Some(pending);
+                                    }
+                                }
+                            }
+                            "heartbeat" => {}
                             "exit" => {
                                 clients.remove(&id);
                                 tracing::info!(client_id = id, "client sent exit");
@@ -791,8 +888,9 @@ async fn handle_websocket(
         let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             let slug_clone = slug.clone();
+            let tx_clone = tx.clone();
             tokio::spawn(async move {
-                run_coordinator(slug_clone, rx).await;
+                run_coordinator(slug_clone, tx_clone, rx).await;
             });
             CoordinatorHandle { tx }
         });
@@ -1003,6 +1101,57 @@ async fn handle_mcp(
     make_json_response(response)
 }
 
+// -- Capture HTTP handler --
+
+async fn handle_capture(
+    slug: &str,
+    server: Arc<RwLock<ServerState>>,
+) -> Response<Full<Bytes>> {
+    let coord_tx = {
+        let state = server.read().await;
+        state.coordinators.get(slug).map(|h| h.tx.clone())
+    };
+
+    let coord_tx = match coord_tx {
+        Some(tx) => tx,
+        None => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("no coordinator for slug")))
+                .unwrap();
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let _ = coord_tx.send(CoordMessage::ServiceRequest {
+        request_type: "capture".to_string(),
+        reply: reply_tx,
+    });
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+        Ok(Ok(resp)) => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", resp.content_type)
+                .body(Full::new(Bytes::from(resp.body)))
+                .unwrap()
+        }
+        Ok(Err(_)) => {
+            // Channel dropped — no client claimed or timeout fired.
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("no client handled the request")))
+                .unwrap()
+        }
+        Err(_) => {
+            Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .body(Full::new(Bytes::from("capture timed out")))
+                .unwrap()
+        }
+    }
+}
+
 // -- HTTP/WebSocket connection handler --
 
 async fn handle_request(
@@ -1028,6 +1177,16 @@ async fn handle_request(
                     .unwrap())
             }
         }
+    } else if let Some(slug) = path.strip_prefix("/capture/") {
+        if slug.is_empty() {
+            Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("missing slug in /capture/<slug>")))
+                .unwrap())
+        } else {
+            let slug = slug.to_string();
+            Ok(handle_capture(&slug, server).await)
+        }
     } else if let Some(slug) = path.strip_prefix("/mcp/") {
         if slug.is_empty() {
             Ok(Response::builder()
@@ -1038,6 +1197,11 @@ async fn handle_request(
             let slug = slug.to_string();
             Ok(handle_mcp(req, &slug, server).await)
         }
+    } else if path == "/health" {
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from("ok")))
+            .unwrap())
     } else {
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
