@@ -64,7 +64,6 @@ struct Payload {
     message: String,
     session_id: Option<String>,
     transcript: Option<Vec<serde_json::Value>>,
-    wicket_socket: Option<String>,
 }
 
 // -- Output envelopes --
