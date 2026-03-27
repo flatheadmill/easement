@@ -411,7 +411,6 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut easement_stdin: Option<tokio::process::ChildStdin> = None;
     let mut easement_child: Option<tokio::process::Child> = None;
     let mut drain_gate: Option<DrainGate> = None;
-    let mut round_had_session: Option<String> = None;
     let mut pending_approval: Option<PendingApproval> = None;
     let mut pending_service: Option<PendingService> = None;
     let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
@@ -449,18 +448,6 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     let round_done = gate.handle(&event);
 
                                     if round_done {
-                                        // Use the session ID we resumed from, not
-                                        // the new one Claude generated. Claude
-                                        // appends to the original transcript file
-                                        // but reports a different session ID on
-                                        // stdout. On the first round (no prior
-                                        // session), use the drain gate's ID.
-                                        let sid = round_had_session.take()
-                                            .or_else(|| gate.session_id().map(|s| s.to_string()));
-                                        if let Some(sid) = sid {
-                                            tracing::info!(session_id = %sid, "round completed, recording session");
-                                            sessions.set_local(sid);
-                                        }
 
                                         tracing::info!("round completed");
                                         broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
@@ -630,22 +617,12 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     let is_remote = msg.remote.is_some();
                                     let is_yolo = msg.yolo;
 
-                                    let active_session = if is_remote {
-                                        sessions.remote().map(|s| s.to_string())
-                                    } else {
-                                        sessions.local().map(|s| s.to_string())
-                                    };
-
                                     let payload = EasementPayload {
                                         slug: slug.clone(),
                                         yolo: is_yolo,
                                         message: msg.message,
-                                        session_id: active_session.clone(),
-                                        transcript: if active_session.is_none() {
-                                            Some(transcript.entries().to_vec())
-                                        } else {
-                                            None
-                                        },
+                                        session_id: None,
+                                        transcript: Some(transcript.entries().to_vec()),
                                         wicket_socket: None,
                                     };
 
@@ -653,7 +630,6 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
                                     tracing::info!(
                                         is_remote, is_yolo,
-                                        has_session = active_session.is_some(),
                                         "building easement command"
                                     );
                                     let mut cmd = match &msg.remote {
@@ -740,7 +716,6 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     easement_child = Some(child);
                                     stdout_rx = Some(rx);
                                     drain_gate = Some(DrainGate::new());
-                                    round_had_session = active_session.clone();
 
                                     tracing::info!("round started");
                                     broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
@@ -875,7 +850,6 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
                         if drain_gate.is_some() {
                             tracing::warn!("easement exited before drain gate fired");
-                            sessions.clear_local();
                             broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed {
                                 message: format!("easement exited with code {}", code),
                             });
