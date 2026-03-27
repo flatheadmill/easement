@@ -411,6 +411,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut easement_stdin: Option<tokio::process::ChildStdin> = None;
     let mut easement_child: Option<tokio::process::Child> = None;
     let mut drain_gate: Option<DrainGate> = None;
+    let mut round_had_session: Option<String> = None;
     let mut pending_approval: Option<PendingApproval> = None;
     let mut pending_service: Option<PendingService> = None;
     let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
@@ -448,8 +449,15 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     let round_done = gate.handle(&event);
 
                                     if round_done {
-                                        if let Some(sid) = gate.session_id() {
-                                            let sid = sid.to_string();
+                                        // Use the session ID we resumed from, not
+                                        // the new one Claude generated. Claude
+                                        // appends to the original transcript file
+                                        // but reports a different session ID on
+                                        // stdout. On the first round (no prior
+                                        // session), use the drain gate's ID.
+                                        let sid = round_had_session.take()
+                                            .or_else(|| gate.session_id().map(|s| s.to_string()));
+                                        if let Some(sid) = sid {
                                             tracing::info!(session_id = %sid, "round completed, recording session");
                                             sessions.set_local(sid);
                                         }
@@ -732,6 +740,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     easement_child = Some(child);
                                     stdout_rx = Some(rx);
                                     drain_gate = Some(DrainGate::new());
+                                    round_had_session = active_session.clone();
 
                                     tracing::info!("round started");
                                     broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
