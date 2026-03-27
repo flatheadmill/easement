@@ -86,6 +86,14 @@ fn emit_error(message: &str) {
     emit("error", serde_json::json!({ "message": message }));
 }
 
+fn emit_log(level: &str, message: &str, fields: serde_json::Value) {
+    emit("log", serde_json::json!({
+        "level": level,
+        "message": message,
+        "fields": fields,
+    }));
+}
+
 fn emit_meta(data: serde_json::Value) {
     emit("meta", data);
 }
@@ -425,6 +433,11 @@ async fn main() {
         has_transcript = payload.transcript.is_some(),
         "payload received"
     );
+    emit_log("info", "payload received", serde_json::json!({
+        "slug": &payload.slug,
+        "yolo": payload.yolo,
+        "has_session_id": payload.session_id.is_some(),
+    }));
 
     // Set up the working directory.
     let pane_dir = PathBuf::from(&home).join("pane").join(&payload.slug);
@@ -475,6 +488,9 @@ async fn main() {
     }
 
     tracing::info!(resume_arg = %resume_arg, "spawning claude");
+    emit_log("info", "spawning claude", serde_json::json!({
+        "resume_arg": &resume_arg,
+    }));
 
     // Build the command.
     let mut cmd = Command::new("claude");
@@ -584,6 +600,9 @@ async fn main() {
                 }
 
                 tracing::info!(session_id = %session_id, "captured session id from first event");
+                emit_log("info", "session id captured", serde_json::json!({
+                    "session_id": &session_id,
+                }));
                 emit_meta(serde_json::json!({ "session_id": session_id }));
                 emit("stdout", data);
             } else {
@@ -722,6 +741,9 @@ async fn main() {
                     Ok(s) => {
                         let code = s.code().unwrap_or(-1);
                         tracing::info!(exit_code = code, "claude exited");
+                        emit_log("info", "claude exited", serde_json::json!({
+                            "exit_code": code,
+                        }));
                         emit_meta(serde_json::json!({
                             "exit_code": code
                         }));
