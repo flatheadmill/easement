@@ -794,6 +794,29 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 }
                             }
                             "heartbeat" => {}
+                            "log" => {
+                                let level = envelope.data.get("level")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("info");
+                                let message = envelope.data.get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let fields = envelope.data.get("fields");
+                                match level {
+                                    "error" => tracing::error!(
+                                        client_id = id, slug = %slug,
+                                        fields = ?fields, "[client] {}", message
+                                    ),
+                                    "warn" => tracing::warn!(
+                                        client_id = id, slug = %slug,
+                                        fields = ?fields, "[client] {}", message
+                                    ),
+                                    _ => tracing::info!(
+                                        client_id = id, slug = %slug,
+                                        fields = ?fields, "[client] {}", message
+                                    ),
+                                }
+                            }
                             "exit" => {
                                 clients.remove(&id);
                                 tracing::info!(client_id = id, "client sent exit");
