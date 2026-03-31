@@ -279,6 +279,15 @@ enum CoordMessage {
         request_type: String,
         reply: oneshot::Sender<ServiceResponse>,
     },
+    ZshExec {
+        command: String,
+        reply: oneshot::Sender<ZshResult>,
+    },
+}
+
+struct ZshResult {
+    output: String,
+    exit_code: i32,
 }
 
 // -- Pending approval state --
@@ -413,6 +422,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut drain_gate: Option<DrainGate> = None;
     let mut pending_approval: Option<PendingApproval> = None;
     let mut pending_service: Option<PendingService> = None;
+    let mut pending_zsh: Option<oneshot::Sender<ZshResult>> = None;
     let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
 
     tracing::info!(
@@ -505,6 +515,19 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 ),
                             }
                         }
+                        "zsh_result" => {
+                            if let Some(reply) = pending_zsh.take() {
+                                let output = envelope.data.get("output")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let exit_code = envelope.data.get("exit_code")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(-1) as i32;
+                                tracing::info!(exit_code, output_len = output.len(), "zsh result received");
+                                let _ = reply.send(ZshResult { output, exit_code });
+                            }
+                        }
                         _ => {
                             tracing::warn!("unknown easement stream: {}", envelope.stream);
                         }
@@ -574,6 +597,25 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 },
                             });
                         });
+                    }
+                    CoordMessage::ZshExec { command, reply } => {
+                        tracing::info!(command = %command, "zsh exec request");
+                        if let Some(ref mut stdin) = easement_stdin {
+                            let env = json!({
+                                "stream": "zsh",
+                                "data": { "command": command }
+                            });
+                            let mut env_line = serde_json::to_string(&env).unwrap();
+                            env_line.push('\n');
+                            let _ = stdin.write_all(env_line.as_bytes()).await;
+                            let _ = stdin.flush().await;
+                            pending_zsh = Some(reply);
+                        } else {
+                            let _ = reply.send(ZshResult {
+                                output: "no active easement process".to_string(),
+                                exit_code: 1,
+                            });
+                        }
                     }
                     CoordMessage::Envelope { id, envelope } => {
                         match envelope.stream.as_str() {
@@ -1039,6 +1081,16 @@ async fn handle_mcp(
                         },
                         "required": ["tool_name", "input"]
                     }
+                }, {
+                    "name": "zsh",
+                    "description": "Execute a command in a sandboxed Zsh shell. The command runs in a sandbox that restricts filesystem writes to the project directory. Use this for all shell commands.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string", "description": "The Zsh command to execute" }
+                        },
+                        "required": ["command"]
+                    }
                 }]
             }),
         ),
@@ -1053,23 +1105,6 @@ async fn handle_mcp(
                     ));
                 }
             };
-            if params.name != "wicket_approve" {
-                return make_json_response(jsonrpc_error(
-                    id,
-                    -32601,
-                    format!("Unknown tool: {}", params.name),
-                ));
-            }
-
-            let tool_name = params.arguments["tool_name"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
-            let input = params.arguments["input"].clone();
-            let tool_use_id = params.arguments["tool_use_id"]
-                .as_str()
-                .map(|s| s.to_string());
-
             // Find the coordinator for this slug.
             let coord_tx = {
                 let state = server.read().await;
@@ -1092,35 +1127,86 @@ async fn handle_mcp(
                 }
             };
 
-            // Send to coordinator and wait for the approval decision.
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = coord_tx.send(CoordMessage::McpApprovalRequest {
-                tool_name,
-                input,
-                tool_use_id,
-                reply: reply_tx,
-            });
+            if params.name == "zsh" {
+                // Route to Easement for sandboxed execution.
+                let command = params.arguments["command"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                tracing::info!(command = %command, "zsh tool call");
 
-            match reply_rx.await {
-                Ok(decision) => {
-                    let text = serde_json::to_string(&decision).unwrap();
-                    jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": text }] }),
-                    )
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::ZshExec {
+                    command,
+                    reply: reply_tx,
+                });
+
+                match reply_rx.await {
+                    Ok(result) => {
+                        let output = if result.exit_code != 0 {
+                            format!("{}\n[exit code: {}]", result.output, result.exit_code)
+                        } else {
+                            result.output
+                        };
+                        jsonrpc_response(
+                            id,
+                            json!({ "content": [{ "type": "text", "text": output }] }),
+                        )
+                    }
+                    Err(_) => {
+                        tracing::warn!("zsh exec reply channel dropped");
+                        jsonrpc_response(
+                            id,
+                            json!({ "content": [{ "type": "text", "text": "command execution failed: reply dropped" }], "isError": true }),
+                        )
+                    }
                 }
-                Err(_) => {
-                    tracing::warn!("approval reply channel dropped");
-                    let deny = json!({
-                        "behavior": "deny",
-                        "message": "Approval request dropped"
-                    });
-                    let text = serde_json::to_string(&deny).unwrap();
-                    jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": text }] }),
-                    )
+            } else if params.name == "wicket_approve" {
+                let tool_name = params.arguments["tool_name"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string();
+                let input = params.arguments["input"].clone();
+                let tool_use_id = params.arguments["tool_use_id"]
+                    .as_str()
+                    .map(|s| s.to_string());
+
+                // Send to coordinator and wait for the approval decision.
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::McpApprovalRequest {
+                    tool_name,
+                    input,
+                    tool_use_id,
+                    reply: reply_tx,
+                });
+
+                match reply_rx.await {
+                    Ok(decision) => {
+                        let text = serde_json::to_string(&decision).unwrap();
+                        jsonrpc_response(
+                            id,
+                            json!({ "content": [{ "type": "text", "text": text }] }),
+                        )
+                    }
+                    Err(_) => {
+                        tracing::warn!("approval reply channel dropped");
+                        let deny = json!({
+                            "behavior": "deny",
+                            "message": "Approval request dropped"
+                        });
+                        let text = serde_json::to_string(&deny).unwrap();
+                        jsonrpc_response(
+                            id,
+                            json!({ "content": [{ "type": "text", "text": text }] }),
+                        )
+                    }
                 }
+            } else {
+                return make_json_response(jsonrpc_error(
+                    id,
+                    -32601,
+                    format!("Unknown tool: {}", params.name),
+                ));
             }
         }
         "notifications/initialized" => jsonrpc_response(id, json!({})),
