@@ -391,6 +391,126 @@ fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
 // http://localhost:6502/mcp/<slug>. Easement just writes the MCP config
 // pointing Claude to that endpoint.
 
+// -- Sandbox --
+//
+// Reads ~/.local/state/puzzle/<slug>/sandbox.conf and builds a
+// platform-specific sandbox command. On macOS, sandbox-exec with an
+// SBPL policy. On Linux, bwrap with bind mounts.
+
+struct SandboxConfig {
+    writable: Vec<String>,
+}
+
+fn read_sandbox_config(slug: &str) -> SandboxConfig {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = std::path::Path::new(&home)
+        .join(".local/state/puzzle")
+        .join(slug)
+        .join("sandbox.conf");
+
+    let mut writable = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(path) = line.strip_prefix("writable ") {
+                let expanded = path.trim().replace("~/", &format!("{}/", home));
+                writable.push(expanded);
+            }
+        }
+    }
+
+    SandboxConfig { writable }
+}
+
+#[cfg(target_os = "macos")]
+fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::process::Command {
+    // Build the SBPL policy.
+    let mut policy = String::new();
+    policy.push_str("(version 1)\n");
+    policy.push_str("(deny default)\n");
+
+    // Process management.
+    policy.push_str("(allow process-exec)\n");
+    policy.push_str("(allow process-fork)\n");
+    policy.push_str("(allow signal (target same-sandbox))\n");
+    policy.push_str("(allow process-info* (target same-sandbox))\n");
+
+    // Read access to everything.
+    policy.push_str("(allow file-read*)\n");
+
+    // Write access to writable roots.
+    for path in &config.writable {
+        policy.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", path));
+    }
+
+    // /dev/null, /tmp, and temp dirs.
+    policy.push_str("(allow file-write* (subpath \"/tmp\"))\n");
+    policy.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
+    policy.push_str(&format!(
+        "(allow file-write* (subpath \"{}\"))\n",
+        std::env::temp_dir().display()
+    ));
+    policy.push_str("(allow file-write-data (require-all (path \"/dev/null\") (vnode-type CHARACTER-DEVICE)))\n");
+
+    // PTY support.
+    policy.push_str("(allow pseudo-tty)\n");
+    policy.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n");
+    policy.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n");
+    policy.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))\n");
+
+    // Sysctls for basic operation.
+    policy.push_str("(allow sysctl-read)\n");
+
+    // Mach services for basic operation.
+    policy.push_str("(allow mach-lookup)\n");
+
+    // Network: allow all (for now — Wicket is on localhost:6502, Claude API is remote).
+    policy.push_str("(allow network-outbound)\n");
+    policy.push_str("(allow network-inbound)\n");
+    policy.push_str("(allow system-socket)\n");
+
+    // IPC.
+    policy.push_str("(allow ipc-posix-sem)\n");
+    policy.push_str("(allow ipc-posix-shm-read*)\n");
+    policy.push_str("(allow user-preference-read)\n");
+
+    let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
+    cmd.arg("-p").arg(&policy).arg("--").arg("zsh").arg("-c").arg(command);
+    cmd
+}
+
+#[cfg(target_os = "linux")]
+fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::process::Command {
+    let mut args = vec![
+        "--new-session".to_string(),
+        "--die-with-parent".to_string(),
+        "--ro-bind".to_string(), "/".to_string(), "/".to_string(),
+        "--dev".to_string(), "/dev".to_string(),
+        "--proc".to_string(), "/proc".to_string(),
+        "--tmpfs".to_string(), "/tmp".to_string(),
+        "--unshare-pid".to_string(),
+    ];
+
+    for path in &config.writable {
+        args.push("--bind".to_string());
+        args.push(path.clone());
+        args.push(path.clone());
+    }
+
+    args.push("--".to_string());
+    args.push("zsh".to_string());
+    args.push("-c".to_string());
+    args.push(command.to_string());
+
+    let mut cmd = tokio::process::Command::new("bwrap");
+    cmd.args(&args);
+    cmd
+}
+
 #[tokio::main]
 async fn main() {
     let _guard = init_tracing();
@@ -525,7 +645,8 @@ async fn main() {
         }
         tracing::info!(path = %mcp_config_path.display(), "wrote mcp config");
         cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
-            .arg("--mcp-config").arg(&mcp_config_path);
+            .arg("--mcp-config").arg(&mcp_config_path)
+            .arg("--disallowed-tools").arg("Bash");
     }
 
     // Capture stderr so MCP initialization errors and other diagnostics
@@ -721,7 +842,53 @@ async fn main() {
                         child_stdin.take();
                     }
                     Ok(_) => {
-                        if let Some(ref mut stdin) = child_stdin {
+                        // Check if this is a zsh exec request from Wicket.
+                        let is_zsh = stdin_line.trim()
+                            .strip_prefix('{')
+                            .and_then(|_| {
+                                serde_json::from_str::<serde_json::Value>(stdin_line.trim()).ok()
+                            })
+                            .and_then(|v| v.get("stream").and_then(|s| s.as_str()).map(|s| s == "zsh"))
+                            .unwrap_or(false);
+
+                        if is_zsh {
+                            if let Ok(env) = serde_json::from_str::<serde_json::Value>(stdin_line.trim()) {
+                                let command = env.get("data")
+                                    .and_then(|d| d.get("command"))
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("");
+                                tracing::info!(command = %command, "zsh exec request");
+                                emit_log("info", "zsh exec", serde_json::json!({ "command": command }));
+
+                                // Execute the command in a sandboxed zsh.
+                                let sandbox_config = read_sandbox_config(&payload.slug);
+                                let mut cmd = build_sandbox_command(command, &sandbox_config);
+                                let output = cmd.output().await;
+
+                                match output {
+                                    Ok(out) => {
+                                        let stdout = String::from_utf8_lossy(&out.stdout);
+                                        let stderr = String::from_utf8_lossy(&out.stderr);
+                                        let combined = if stderr.is_empty() {
+                                            stdout.to_string()
+                                        } else {
+                                            format!("{}{}", stdout, stderr)
+                                        };
+                                        let code = out.status.code().unwrap_or(-1);
+                                        emit("zsh_result", serde_json::json!({
+                                            "output": combined,
+                                            "exit_code": code,
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        emit("zsh_result", serde_json::json!({
+                                            "output": format!("failed to execute: {}", e),
+                                            "exit_code": 1,
+                                        }));
+                                    }
+                                }
+                            }
+                        } else if let Some(ref mut stdin) = child_stdin {
                             tracing::debug!("stdin passthrough");
                             if stdin.write_all(stdin_line.as_bytes()).await.is_err() {
                                 tracing::warn!("stdin write to claude failed");
