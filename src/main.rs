@@ -281,6 +281,7 @@ enum CoordMessage {
     },
     ZshExec {
         command: String,
+        sandboxed: bool,
         reply: oneshot::Sender<ZshResult>,
     },
 }
@@ -558,17 +559,27 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
                     CoordMessage::McpApprovalRequest { tool_name, input, tool_use_id, reply } => {
-                        tracing::info!(tool = %tool_name, "MCP approval request");
-                        let request_data = json!({
-                            "tool_name": tool_name,
-                            "input": input,
-                            "tool_use_id": tool_use_id,
-                        });
-                        broadcast_approval(&clients, request_data);
-                        pending_approval = Some(PendingApproval {
-                            reply,
-                            original_input: input,
-                        });
+                        // Auto-approve our own MCP tools. The sandbox is the gate.
+                        // The CLI requires updatedInput as a record in the allow response.
+                        if tool_name.starts_with("mcp__wicket__") {
+                            tracing::info!(tool = %tool_name, "auto-approving wicket MCP tool");
+                            let _ = reply.send(json!({
+                                "behavior": "allow",
+                                "updatedInput": input
+                            }));
+                        } else {
+                            tracing::info!(tool = %tool_name, "MCP approval request");
+                            let request_data = json!({
+                                "tool_name": tool_name,
+                                "input": input,
+                                "tool_use_id": tool_use_id,
+                            });
+                            broadcast_approval(&clients, request_data);
+                            pending_approval = Some(PendingApproval {
+                                reply,
+                                original_input: input,
+                            });
+                        }
                     }
                     CoordMessage::ServiceRequest { request_type, reply } => {
                         let request_id = uuid::Uuid::new_v4().to_string();
@@ -598,12 +609,12 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             });
                         });
                     }
-                    CoordMessage::ZshExec { command, reply } => {
-                        tracing::info!(command = %command, "zsh exec request");
+                    CoordMessage::ZshExec { command, sandboxed, reply } => {
+                        tracing::info!(command = %command, sandboxed, "zsh exec request");
                         if let Some(ref mut stdin) = easement_stdin {
                             let env = json!({
                                 "stream": "zsh",
-                                "data": { "command": command }
+                                "data": { "command": command, "sandboxed": sandboxed }
                             });
                             let mut env_line = serde_json::to_string(&env).unwrap();
                             env_line.push('\n');
@@ -1083,11 +1094,13 @@ async fn handle_mcp(
                     }
                 }, {
                     "name": "zsh",
-                    "description": "Execute a command in a sandboxed Zsh shell. The command runs in a sandbox that restricts filesystem writes to the project directory. Use this for all shell commands.",
+                    "description": "Execute a command in a sandboxed Zsh shell. The command runs in a sandbox that restricts filesystem writes to the project directory. Use this for all shell commands. If a command fails with a permission error, you may retry with escalate: true to request approval to run outside the sandbox.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "command": { "type": "string", "description": "The Zsh command to execute" }
+                            "command": { "type": "string", "description": "The Zsh command to execute" },
+                            "escalate": { "type": "boolean", "description": "Request approval to run outside the sandbox. Only use after a sandboxed attempt failed with a permission error." },
+                            "reason": { "type": "string", "description": "Why the command needs to run outside the sandbox." }
                         },
                         "required": ["command"]
                     }
@@ -1128,37 +1141,106 @@ async fn handle_mcp(
             };
 
             if params.name == "zsh" {
-                // Route to Easement for sandboxed execution.
                 let command = params.arguments["command"]
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                tracing::info!(command = %command, "zsh tool call");
+                let escalate = params.arguments.get("escalate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let reason = params.arguments.get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::ZshExec {
-                    command,
-                    reply: reply_tx,
-                });
+                if escalate {
+                    // Escalation: ask Puzzle for approval before running unsandboxed.
+                    tracing::info!(command = %command, reason = %reason, "zsh escalation request");
 
-                match reply_rx.await {
-                    Ok(result) => {
-                        let output = if result.exit_code != 0 {
-                            format!("{}\n[exit code: {}]", result.output, result.exit_code)
-                        } else {
-                            result.output
-                        };
-                        jsonrpc_response(
+                    let (approval_tx, approval_rx) = oneshot::channel();
+                    let _ = coord_tx.send(CoordMessage::McpApprovalRequest {
+                        tool_name: "zsh (unsandboxed)".to_string(),
+                        input: json!({ "command": command, "reason": reason }),
+                        tool_use_id: None,
+                        reply: approval_tx,
+                    });
+
+                    match approval_rx.await {
+                        Ok(decision) => {
+                            let behavior = decision.get("behavior")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("deny");
+
+                            if behavior == "allow" {
+                                // Run unsandboxed.
+                                tracing::info!(command = %command, "escalation approved, running unsandboxed");
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                let _ = coord_tx.send(CoordMessage::ZshExec {
+                                    command,
+                                    sandboxed: false,
+                                    reply: reply_tx,
+                                });
+                                // For now it runs sandboxed regardless. The sandboxed
+                                // flag on the envelope is the next piece.
+                                match reply_rx.await {
+                                    Ok(result) => {
+                                        let output = if result.exit_code != 0 {
+                                            format!("{}\n[exit code: {}]", result.output, result.exit_code)
+                                        } else {
+                                            result.output
+                                        };
+                                        jsonrpc_response(
+                                            id,
+                                            json!({ "content": [{ "type": "text", "text": output }] }),
+                                        )
+                                    }
+                                    Err(_) => jsonrpc_response(
+                                        id,
+                                        json!({ "content": [{ "type": "text", "text": "execution failed: reply dropped" }], "isError": true }),
+                                    ),
+                                }
+                            } else {
+                                jsonrpc_response(
+                                    id,
+                                    json!({ "content": [{ "type": "text", "text": "escalation denied by operator" }], "isError": true }),
+                                )
+                            }
+                        }
+                        Err(_) => jsonrpc_response(
                             id,
-                            json!({ "content": [{ "type": "text", "text": output }] }),
-                        )
+                            json!({ "content": [{ "type": "text", "text": "escalation request dropped" }], "isError": true }),
+                        ),
                     }
-                    Err(_) => {
-                        tracing::warn!("zsh exec reply channel dropped");
-                        jsonrpc_response(
-                            id,
-                            json!({ "content": [{ "type": "text", "text": "command execution failed: reply dropped" }], "isError": true }),
-                        )
+                } else {
+                    // Normal path: sandboxed execution.
+                    tracing::info!(command = %command, "zsh tool call (sandboxed)");
+
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let _ = coord_tx.send(CoordMessage::ZshExec {
+                        command,
+                        sandboxed: true,
+                        reply: reply_tx,
+                    });
+
+                    match reply_rx.await {
+                        Ok(result) => {
+                            let output = if result.exit_code != 0 {
+                                format!("{}\n[exit code: {}]", result.output, result.exit_code)
+                            } else {
+                                result.output
+                            };
+                            jsonrpc_response(
+                                id,
+                                json!({ "content": [{ "type": "text", "text": output }] }),
+                            )
+                        }
+                        Err(_) => {
+                            tracing::warn!("zsh exec reply channel dropped");
+                            jsonrpc_response(
+                                id,
+                                json!({ "content": [{ "type": "text", "text": "command execution failed: reply dropped" }], "isError": true }),
+                            )
+                        }
                     }
                 }
             } else if params.name == "wicket_approve" {
