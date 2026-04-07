@@ -645,30 +645,6 @@ async fn main() {
         }
         tracing::info!(path = %mcp_config_path.display(), "wrote mcp config");
 
-        // Write project settings with a PermissionRequest hook that
-        // auto-approves our MCP tools. This prevents the CLI's own
-        // approval dialog from firing for wicket tools. Our approval
-        // system in Wicket/Puzzle handles escalation instead.
-        let claude_dir = pane_dir.join(".claude");
-        let _ = std::fs::create_dir_all(&claude_dir);
-        let settings_path = claude_dir.join("settings.json");
-        let settings = serde_json::json!({
-            "hooks": {
-                "PermissionRequest": [{
-                    "matcher": "mcp__wicket__zsh|mcp__wicket__wicket_approve",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "echo '{\"hookSpecificOutput\":{\"decision\":{\"behavior\":\"allow\"}}}'"
-                    }]
-                }]
-            }
-        });
-        if let Err(e) = std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap()) {
-            tracing::warn!("failed to write settings.json: {}", e);
-        } else {
-            tracing::info!(path = %settings_path.display(), "wrote project settings with auto-approve hook");
-        }
-
         cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
             .arg("--mcp-config").arg(&mcp_config_path)
             .arg("--disallowed-tools").arg("Bash");
