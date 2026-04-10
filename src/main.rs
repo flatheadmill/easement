@@ -647,7 +647,7 @@ async fn main() {
 
         cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
             .arg("--mcp-config").arg(&mcp_config_path)
-            .arg("--disallowed-tools").arg("Bash");
+            .arg("--disallowed-tools").arg("Bash,Write,Edit");
     }
 
     // Capture stderr so MCP initialization errors and other diagnostics
@@ -843,70 +843,149 @@ async fn main() {
                         child_stdin.take();
                     }
                     Ok(_) => {
-                        // Check if this is a zsh exec request from Wicket.
-                        let is_zsh = stdin_line.trim()
+                        // Parse envelope to check if this is a Wicket tool request.
+                        let stream = stdin_line.trim()
                             .strip_prefix('{')
-                            .and_then(|_| {
-                                serde_json::from_str::<serde_json::Value>(stdin_line.trim()).ok()
-                            })
-                            .and_then(|v| v.get("stream").and_then(|s| s.as_str()).map(|s| s == "zsh"))
-                            .unwrap_or(false);
+                            .and_then(|_| serde_json::from_str::<serde_json::Value>(stdin_line.trim()).ok())
+                            .and_then(|v| v.get("stream").and_then(|s| s.as_str()).map(|s| s.to_string()));
 
-                        if is_zsh {
-                            if let Ok(env) = serde_json::from_str::<serde_json::Value>(stdin_line.trim()) {
-                                let data = env.get("data").cloned().unwrap_or_default();
-                                let command = data.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or("");
-                                let sandboxed = data.get("sandboxed")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(true);
-                                tracing::info!(command = %command, sandboxed, "zsh exec request");
-                                emit_log("info", "zsh exec", serde_json::json!({
-                                    "command": command,
-                                    "sandboxed": sandboxed,
-                                }));
+                        match stream.as_deref() {
+                            Some("zsh") => {
+                                if let Ok(env) = serde_json::from_str::<serde_json::Value>(stdin_line.trim()) {
+                                    let data = env.get("data").cloned().unwrap_or_default();
+                                    let command = data.get("command")
+                                        .and_then(|c| c.as_str())
+                                        .unwrap_or("");
+                                    let sandboxed = data.get("sandboxed")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(true);
+                                    tracing::info!(command = %command, sandboxed, "zsh exec request");
+                                    emit_log("info", "zsh exec", serde_json::json!({
+                                        "command": command,
+                                        "sandboxed": sandboxed,
+                                    }));
 
-                                let output = if sandboxed {
-                                    let sandbox_config = read_sandbox_config(&payload.slug);
-                                    let mut cmd = build_sandbox_command(command, &sandbox_config);
-                                    cmd.output().await
-                                } else {
-                                    tracing::warn!(command = %command, "running unsandboxed (escalation approved)");
-                                    let mut cmd = tokio::process::Command::new("zsh");
-                                    cmd.arg("-c").arg(command);
-                                    cmd.output().await
-                                };
+                                    let output = if sandboxed {
+                                        let sandbox_config = read_sandbox_config(&payload.slug);
+                                        let mut cmd = build_sandbox_command(command, &sandbox_config);
+                                        cmd.output().await
+                                    } else {
+                                        tracing::warn!(command = %command, "running unsandboxed (escalation approved)");
+                                        let mut cmd = tokio::process::Command::new("zsh");
+                                        cmd.arg("-c").arg(command);
+                                        cmd.output().await
+                                    };
 
-                                match output {
-                                    Ok(out) => {
-                                        let stdout = String::from_utf8_lossy(&out.stdout);
-                                        let stderr = String::from_utf8_lossy(&out.stderr);
-                                        let combined = if stderr.is_empty() {
-                                            stdout.to_string()
-                                        } else {
-                                            format!("{}{}", stdout, stderr)
-                                        };
-                                        let code = out.status.code().unwrap_or(-1);
-                                        emit("zsh_result", serde_json::json!({
-                                            "output": combined,
-                                            "exit_code": code,
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        emit("zsh_result", serde_json::json!({
-                                            "output": format!("failed to execute: {}", e),
-                                            "exit_code": 1,
-                                        }));
+                                    match output {
+                                        Ok(out) => {
+                                            let stdout = String::from_utf8_lossy(&out.stdout);
+                                            let stderr = String::from_utf8_lossy(&out.stderr);
+                                            let combined = if stderr.is_empty() {
+                                                stdout.to_string()
+                                            } else {
+                                                format!("{}{}", stdout, stderr)
+                                            };
+                                            let code = out.status.code().unwrap_or(-1);
+                                            emit("zsh_result", serde_json::json!({
+                                                "output": combined,
+                                                "exit_code": code,
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            emit("zsh_result", serde_json::json!({
+                                                "output": format!("failed to execute: {}", e),
+                                                "exit_code": 1,
+                                            }));
+                                        }
                                     }
                                 }
                             }
-                        } else if let Some(ref mut stdin) = child_stdin {
-                            tracing::debug!("stdin passthrough");
-                            if stdin.write_all(stdin_line.as_bytes()).await.is_err() {
-                                tracing::warn!("stdin write to claude failed");
-                            } else {
-                                let _ = stdin.flush().await;
+                            Some("apply_patch") => {
+                                if let Ok(env) = serde_json::from_str::<serde_json::Value>(stdin_line.trim()) {
+                                    let data = env.get("data").cloned().unwrap_or_default();
+                                    let patch = data.get("patch")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    tracing::info!("apply_patch request");
+
+                                    // Check sandbox before applying: parse the patch
+                                    // to get file paths and verify they're writable.
+                                    let sandbox_config = read_sandbox_config(&payload.slug);
+                                    let cwd = std::env::current_dir()
+                                        .unwrap_or_else(|_| PathBuf::from("."));
+
+                                    match codex_apply_patch::parse_patch(patch) {
+                                        Ok(parsed) => {
+                                            // Check all paths against sandbox config.
+                                            let mut denied_path = None;
+                                            for hunk in &parsed.hunks {
+                                                let path = match hunk {
+                                                    codex_apply_patch::Hunk::AddFile { path, .. } => path,
+                                                    codex_apply_patch::Hunk::DeleteFile { path } => path,
+                                                    codex_apply_patch::Hunk::UpdateFile { path, .. } => path,
+                                                };
+                                                let abs = cwd.join(path)
+                                                    .to_string_lossy().to_string();
+                                                let is_writable = sandbox_config.writable.iter()
+                                                    .any(|root| abs.starts_with(root));
+                                                if !is_writable {
+                                                    denied_path = Some(abs);
+                                                    break;
+                                                }
+                                            }
+
+                                            if let Some(denied) = denied_path {
+                                                emit("zsh_result", serde_json::json!({
+                                                    "output": format!("patch denied: {} is not inside a writable root", denied),
+                                                    "exit_code": 1,
+                                                }));
+                                            } else {
+                                                // Apply the patch.
+                                                let mut stdout_buf = Vec::new();
+                                                let mut stderr_buf = Vec::new();
+                                                match codex_apply_patch::apply_patch(
+                                                    patch, &mut stdout_buf, &mut stderr_buf,
+                                                ) {
+                                                    Ok(()) => {
+                                                        let output = String::from_utf8_lossy(&stdout_buf);
+                                                        emit("zsh_result", serde_json::json!({
+                                                            "output": output.trim_end(),
+                                                            "exit_code": 0,
+                                                        }));
+                                                    }
+                                                    Err(e) => {
+                                                        let stderr_str = String::from_utf8_lossy(&stderr_buf);
+                                                        let output = if stderr_str.is_empty() {
+                                                            format!("patch failed: {}", e)
+                                                        } else {
+                                                            format!("{}\npatch failed: {}", stderr_str.trim_end(), e)
+                                                        };
+                                                        emit("zsh_result", serde_json::json!({
+                                                            "output": output,
+                                                            "exit_code": 1,
+                                                        }));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            emit("zsh_result", serde_json::json!({
+                                                "output": format!("patch parse error: {}", e),
+                                                "exit_code": 1,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(ref mut stdin) = child_stdin {
+                                    tracing::debug!("stdin passthrough");
+                                    if stdin.write_all(stdin_line.as_bytes()).await.is_err() {
+                                        tracing::warn!("stdin write to claude failed");
+                                    } else {
+                                        let _ = stdin.flush().await;
+                                    }
+                                }
                             }
                         }
                         stdin_line.clear();
