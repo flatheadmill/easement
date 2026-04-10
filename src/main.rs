@@ -284,6 +284,11 @@ enum CoordMessage {
         sandboxed: bool,
         reply: oneshot::Sender<ZshResult>,
     },
+    FileOp {
+        op: String,
+        args: Value,
+        reply: oneshot::Sender<ZshResult>,
+    },
 }
 
 struct ZshResult {
@@ -615,6 +620,25 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             let env = json!({
                                 "stream": "zsh",
                                 "data": { "command": command, "sandboxed": sandboxed }
+                            });
+                            let mut env_line = serde_json::to_string(&env).unwrap();
+                            env_line.push('\n');
+                            let _ = stdin.write_all(env_line.as_bytes()).await;
+                            let _ = stdin.flush().await;
+                            pending_zsh = Some(reply);
+                        } else {
+                            let _ = reply.send(ZshResult {
+                                output: "no active easement process".to_string(),
+                                exit_code: 1,
+                            });
+                        }
+                    }
+                    CoordMessage::FileOp { op, args, reply } => {
+                        tracing::info!(op = %op, "file op request");
+                        if let Some(ref mut stdin) = easement_stdin {
+                            let env = json!({
+                                "stream": op,
+                                "data": args,
                             });
                             let mut env_line = serde_json::to_string(&env).unwrap();
                             env_line.push('\n');
@@ -1104,6 +1128,16 @@ async fn handle_mcp(
                         },
                         "required": ["command"]
                     }
+                }, {
+                    "name": "apply_patch",
+                    "description": "Apply a patch to create, update, or delete files. The patch uses a structured diff format with context lines for updates. Files must be inside the sandbox writable roots.\n\nFormat:\n*** Begin Patch\n*** Add File: <path>\n+<line>\n*** Update File: <path>\n@@ <optional context header>\n <context line>\n-<removed line>\n+<added line>\n <context line>\n*** Delete File: <path>\n*** End Patch\n\nPaths are relative to the working directory. Context lines (prefixed with space) locate where changes apply. Include 3 lines of context before and after each change.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "patch": { "type": "string", "description": "The patch to apply in the structured diff format" }
+                        },
+                        "required": ["patch"]
+                    }
                 }]
             }),
         ),
@@ -1242,6 +1276,37 @@ async fn handle_mcp(
                             )
                         }
                     }
+                }
+            } else if params.name == "apply_patch" {
+                let patch = params.arguments["patch"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                tracing::info!("apply_patch tool call");
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::FileOp {
+                    op: "apply_patch".to_string(),
+                    args: json!({ "patch": patch }),
+                    reply: reply_tx,
+                });
+
+                match reply_rx.await {
+                    Ok(result) => {
+                        let output = if result.exit_code != 0 {
+                            format!("{}\n[error]", result.output)
+                        } else {
+                            result.output
+                        };
+                        jsonrpc_response(
+                            id,
+                            json!({ "content": [{ "type": "text", "text": output }] }),
+                        )
+                    }
+                    Err(_) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "apply_patch failed: reply dropped" }], "isError": true }),
+                    ),
                 }
             } else if params.name == "wicket_approve" {
                 let tool_name = params.arguments["tool_name"]
