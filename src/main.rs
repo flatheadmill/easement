@@ -619,6 +619,7 @@ async fn main() {
         .arg("--output-format").arg("stream-json")
         .arg("--replay-user-messages")
         .arg("--verbose")
+        .arg("--model").arg("claude-opus-4-6")
         .arg("--max-thinking-tokens").arg("31999")
         .arg("--resume").arg(&resume_arg)
         .arg("--add-dir").arg(format!("{}/code", home));
