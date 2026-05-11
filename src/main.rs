@@ -49,6 +49,47 @@ use crate::protocol::{
 };
 use crate::transcript::{Sessions, Transcript};
 
+// -- Exchange log --
+//
+// Per-slug JSONL log of every envelope in both directions. Each line:
+// {"ts":"...","dir":"easement>wicket","data":{...}}
+
+struct ExchangeLog {
+    path: std::path::PathBuf,
+}
+
+impl ExchangeLog {
+    fn new(slug: &str) -> Self {
+        let home = env::var("HOME").expect("HOME not set");
+        let dir = std::path::Path::new(&home)
+            .join(".local/state/puzzle")
+            .join(slug);
+        let _ = std::fs::create_dir_all(&dir);
+        Self {
+            path: dir.join("exchange.jsonl"),
+        }
+    }
+
+    fn log(&self, dir: &str, data: &Value) {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let entry = json!({
+            "ts": now,
+            "dir": dir,
+            "data": data,
+        });
+        if let Ok(mut line) = serde_json::to_string(&entry) {
+            line.push('\n');
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
+                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+            }
+        }
+    }
+}
+
 // -- Stdout event types from Easement --
 
 #[derive(Debug, serde::Deserialize)]
@@ -413,6 +454,7 @@ fn broadcast_error(clients: &Clients, message: &str) {
 // -- Coordinator (per-slug) --
 
 async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
+    let exchange = ExchangeLog::new(&slug);
     let mut transcript = Transcript::new(&slug);
     let mut sessions = Sessions::new(&slug);
     let history = transcript.load_history();
@@ -447,6 +489,9 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                 }
             } => {
                 if let Ok(envelope) = serde_json::from_str::<EasementEnvelope>(&line) {
+                    if let Ok(raw) = serde_json::from_str::<Value>(&line) {
+                        exchange.log("easement>wicket", &raw);
+                    }
                     match envelope.stream.as_str() {
                         "stdout" => {
                             if let Ok(event) = serde_json::from_value::<StdoutEvent>(envelope.data) {
@@ -621,6 +666,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 "stream": "zsh",
                                 "data": { "command": command, "sandboxed": sandboxed }
                             });
+                            exchange.log("wicket>easement", &env);
                             let mut env_line = serde_json::to_string(&env).unwrap();
                             env_line.push('\n');
                             let _ = stdin.write_all(env_line.as_bytes()).await;
@@ -640,6 +686,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 "stream": op,
                                 "data": args,
                             });
+                            exchange.log("wicket>easement", &env);
                             let mut env_line = serde_json::to_string(&env).unwrap();
                             env_line.push('\n');
                             let _ = stdin.write_all(env_line.as_bytes()).await;
@@ -653,6 +700,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         }
                     }
                     CoordMessage::Envelope { id, envelope } => {
+                        exchange.log("client>wicket", &json!({
+                            "client_id": id,
+                            "stream": &envelope.stream,
+                            "data": &envelope.data,
+                        }));
                         match envelope.stream.as_str() {
                             "claude" => {
                                 if let Some(ref mut stdin) = easement_stdin {
@@ -670,6 +722,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                             "stream": "claude",
                                             "data": user_msg
                                         });
+                                        exchange.log("wicket>easement", &claude_env);
                                         let mut env_line = serde_json::to_string(&claude_env).unwrap();
                                         env_line.push('\n');
                                         let _ = stdin.write_all(env_line.as_bytes()).await;
