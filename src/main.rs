@@ -494,7 +494,18 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     match envelope.stream.as_str() {
                         "stdout" => {
-                            if let Ok(event) = serde_json::from_value::<StdoutEvent>(envelope.data) {
+                            // Check for stream_event before deserializing.
+                            let is_stream_event = envelope.data
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                == Some("stream_event");
+
+                            if is_stream_event {
+                                // Broadcast the streaming delta to all clients.
+                                if let Some(event) = envelope.data.get("event") {
+                                    broadcast(&clients, "delta", event.clone());
+                                }
+                            } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(envelope.data) {
                                 if let StdoutEvent::Assistant { ref uuid, .. } = event {
                                     if let Some(uuid) = uuid {
                                         let new_entries = transcript.set_boundary(uuid.clone());
