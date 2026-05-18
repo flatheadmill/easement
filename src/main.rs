@@ -472,6 +472,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut pending_service: Option<PendingService> = None;
     let mut pending_zsh: Option<oneshot::Sender<ZshResult>> = None;
     let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
+    let mut last_usage: Option<Value> = None;
 
     tracing::info!(
         slug = %slug,
@@ -505,27 +506,41 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 if let Some(event) = envelope.data.get("event") {
                                     broadcast(&clients, "delta", event.clone());
                                 }
-                            } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(envelope.data) {
-                                if let StdoutEvent::Assistant { ref uuid, .. } = event {
-                                    if let Some(uuid) = uuid {
-                                        let new_entries = transcript.set_boundary(uuid.clone());
-                                        for entry in &new_entries {
-                                            broadcast_entry(&clients, entry);
-                                            all_entries.push(entry.clone());
-                                        }
+                            } else {
+                                let is_result = envelope.data
+                                    .get("type")
+                                    .and_then(|v| v.as_str())
+                                    == Some("result");
+
+                                if is_result {
+                                    if let Some(usage) = envelope.data.get("usage") {
+                                        broadcast(&clients, "usage", usage.clone());
+                                        last_usage = Some(usage.clone());
                                     }
                                 }
 
-                                if let Some(ref mut gate) = drain_gate {
-                                    let round_done = gate.handle(&event);
+                                if let Ok(event) = serde_json::from_value::<StdoutEvent>(envelope.data) {
+                                    if let StdoutEvent::Assistant { ref uuid, .. } = event {
+                                        if let Some(uuid) = uuid {
+                                            let new_entries = transcript.set_boundary(uuid.clone());
+                                            for entry in &new_entries {
+                                                broadcast_entry(&clients, entry);
+                                                all_entries.push(entry.clone());
+                                            }
+                                        }
+                                    }
 
-                                    if round_done {
+                                    if let Some(ref mut gate) = drain_gate {
+                                        let round_done = gate.handle(&event);
 
-                                        tracing::info!("round completed");
-                                        broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
+                                        if round_done {
 
-                                        easement_stdin.take();
-                                        drain_gate = None;
+                                            tracing::info!("round completed");
+                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
+
+                                            easement_stdin.take();
+                                            drain_gate = None;
+                                        }
                                     }
                                 }
                             }
@@ -610,6 +625,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 if let Some(json) = envelope_json("entry", data) {
                                     let _ = tx.send(json);
                                 }
+                            }
+                        }
+                        if let Some(ref usage) = last_usage {
+                            if let Some(json) = envelope_json("usage", usage.clone()) {
+                                let _ = tx.send(json);
                             }
                         }
                         clients.insert(id, tx);
