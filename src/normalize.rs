@@ -37,8 +37,14 @@ fn normalize_user(entry: UserEntry, seq: u64) -> Option<NormalizedEntry> {
                     }) => {
                         let text = match content {
                             Some(ToolResultContent::Text(s)) => s,
-                            Some(ToolResultContent::Blocks(_)) => {
-                                "(structured content)".into()
+                            Some(ToolResultContent::Blocks(blocks)) => {
+                                blocks
+                                    .iter()
+                                    .filter_map(|b| {
+                                        b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
                             }
                             None => String::new(),
                         };

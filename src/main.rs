@@ -330,6 +330,13 @@ enum CoordMessage {
         args: Value,
         reply: oneshot::Sender<ZshResult>,
     },
+    SetRemoteHost {
+        host: Option<String>,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    GetRemoteHost {
+        reply: oneshot::Sender<Option<String>>,
+    },
 }
 
 struct ZshResult {
@@ -473,6 +480,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut pending_zsh: Option<oneshot::Sender<ZshResult>> = None;
     let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
     let mut last_usage: Option<Value> = None;
+    let mut remote_host: Option<String> = None;
 
     tracing::info!(
         slug = %slug,
@@ -602,6 +610,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     .and_then(|v| v.as_i64())
                                     .unwrap_or(-1) as i32;
                                 tracing::info!(exit_code, output_len = output.len(), "zsh result received");
+                                broadcast(&clients, "tool_done", json!({
+                                    "tool": "zsh",
+                                    "output": &output,
+                                    "exit_code": exit_code
+                                }));
                                 let _ = reply.send(ZshResult { output, exit_code });
                             }
                         }
@@ -692,6 +705,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     CoordMessage::ZshExec { command, sandboxed, reply } => {
                         tracing::info!(command = %command, sandboxed, "zsh exec request");
+                        broadcast(&clients, "tool_start", json!({
+                            "tool": "zsh",
+                            "command": command,
+                            "sandboxed": sandboxed
+                        }));
                         if let Some(ref mut stdin) = easement_stdin {
                             let env = json!({
                                 "stream": "zsh",
@@ -729,6 +747,15 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 exit_code: 1,
                             });
                         }
+                    }
+                    CoordMessage::SetRemoteHost { host, reply } => {
+                        let effective = if host.as_deref() == Some("local") { None } else { host };
+                        tracing::info!(remote_host = ?effective, "remote host set");
+                        remote_host = effective.clone();
+                        let _ = reply.send(effective);
+                    }
+                    CoordMessage::GetRemoteHost { reply } => {
+                        let _ = reply.send(remote_host.clone());
                     }
                     CoordMessage::Envelope { id, envelope } => {
                         exchange.log("client>wicket", &json!({
@@ -775,7 +802,8 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                     };
 
-                                    let is_remote = msg.remote.is_some();
+                                    let effective_remote = remote_host.clone().or(msg.remote);
+                                    let is_remote = effective_remote.is_some();
                                     let is_yolo = msg.yolo;
 
                                     let payload = EasementPayload {
@@ -793,7 +821,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         is_remote, is_yolo,
                                         "building easement command"
                                     );
-                                    let mut cmd = match &msg.remote {
+                                    let mut cmd = match &effective_remote {
                                         None => Command::new("easement"),
                                         Some(host) => {
                                             let mut c = Command::new("ssh");
@@ -1542,6 +1570,62 @@ async fn handle_request(
         } else {
             let slug = slug.to_string();
             Ok(handle_mcp(req, &slug, server).await)
+        }
+    } else if let Some(slug) = path.strip_prefix("/easement/") {
+        if slug.is_empty() {
+            Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("missing slug in /easement/<slug>")))
+                .unwrap())
+        } else {
+            let slug = slug.to_string();
+            let coord_tx = {
+                let mut state = server.write().await;
+                let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let slug_clone = slug.clone();
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        run_coordinator(slug_clone, tx_clone, rx).await;
+                    });
+                    CoordinatorHandle { tx }
+                });
+                handle.tx.clone()
+            };
+
+            if req.method() == hyper::Method::POST {
+                let body = req.collect().await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
+                let host = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("host").and_then(|h| h.as_str()).map(|s| s.to_string()));
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::SetRemoteHost {
+                    host,
+                    reply: reply_tx,
+                });
+
+                let current = reply_rx.await.unwrap_or(None);
+                let body = json!({ "host": current }).to_string();
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap())
+            } else {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::GetRemoteHost { reply: reply_tx });
+
+                let current = reply_rx.await.unwrap_or(None);
+                let body = json!({ "host": current }).to_string();
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap())
+            }
         }
     } else if path == "/health" {
         Ok(Response::builder()
