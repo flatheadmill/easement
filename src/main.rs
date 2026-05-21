@@ -1,29 +1,24 @@
-// Easement: a lightweight binary that wraps the Claude CLI for local or remote
-// execution. Receives a JSON payload on stdin, spawns claude with the right
-// flags, multiplexes output streams (claude stdout, transcript, errors) into
-// typed JSON envelopes on stdout, and passes messages from stdin through to
-// claude. Runs identically whether invoked locally or over SSH.
+// Easement: a long-lived process on the execution target that connects back
+// to Wicket over WebSocket. Receives work envelopes (claude turns, zsh
+// commands, apply_patch), dispatches them, sends results back. The Claude
+// CLI is ephemeral within Easement, spawned per turn.
 //
-// The payload is one line of JSON. Everything after that line is the NDJSON
-// message stream from Wicket, passed through to claude's stdin.
+// Wicket spawns Easement (locally or over SSH). Easement reads a bootstrap
+// slug from stdin, connects to ws://localhost:6502 with protocol "easement",
+// and enters the envelope loop.
 //
-// Output is NDJSON envelopes: {"stream":"stdout","data":{...}} for claude
-// events, {"stream":"transcript","data":{...}} for JSONL entries,
-// {"stream":"meta","data":{...}} for session info, {"stream":"error",...}
-// for failures.
-//
-// Approval is handled by Wicket at http://localhost:6502/mcp/<slug>.
-// Easement writes the MCP config pointing Claude to that endpoint.
 // On remote machines, ssh -R 6502:localhost:6502 tunnels the port.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use futures_util::{SinkExt, StreamExt};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -54,51 +49,30 @@ fn init_tracing() -> WorkerGuard {
     guard
 }
 
-// -- Payload --
+// -- WebSocket send --
 
-#[derive(Debug, Deserialize)]
-struct Payload {
-    slug: String,
-    #[serde(default)]
-    yolo: bool,
-    message: String,
-    session_id: Option<String>,
-    transcript: Option<Vec<serde_json::Value>>,
-}
+type WsSender = mpsc::UnboundedSender<String>;
 
-// -- Output envelopes --
-
-#[derive(Debug, Serialize)]
-struct Envelope {
-    stream: &'static str,
-    data: serde_json::Value,
-}
-
-fn emit(stream: &'static str, data: serde_json::Value) {
-    if let Ok(line) = serde_json::to_string(&Envelope { stream, data }) {
-        // Ignoring write errors — if stdout is broken, we're done anyway.
-        let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes());
-        let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), b"\n");
+fn ws_emit(tx: &WsSender, stream: &str, data: serde_json::Value) {
+    let envelope = serde_json::json!({ "stream": stream, "data": data });
+    if let Ok(json) = serde_json::to_string(&envelope) {
+        let _ = tx.send(json);
     }
 }
 
-fn emit_error(message: &str) {
-    emit("error", serde_json::json!({ "message": message }));
+fn ws_emit_error(tx: &WsSender, message: &str) {
+    ws_emit(tx, "error", serde_json::json!({ "message": message }));
 }
 
-fn emit_log(level: &str, message: &str, fields: serde_json::Value) {
-    emit("log", serde_json::json!({
+fn ws_emit_log(tx: &WsSender, level: &str, message: &str, fields: serde_json::Value) {
+    ws_emit(tx, "log", serde_json::json!({
         "level": level,
         "message": message,
         "fields": fields,
     }));
 }
 
-fn emit_meta(data: serde_json::Value) {
-    emit("meta", data);
-}
-
-// -- Stdin message for claude --
+// -- Claude stdin message --
 
 #[derive(Debug, Serialize)]
 struct UserMessage {
@@ -127,12 +101,60 @@ fn format_user_message(content: &str) -> String {
     s
 }
 
+// -- Drain gate --
+
+struct DrainGate {
+    sent: u64,
+    replayed: u64,
+}
+
+impl DrainGate {
+    fn new() -> Self {
+        Self { sent: 1, replayed: 0 }
+    }
+
+    fn is_drained(&self) -> bool {
+        self.sent == self.replayed
+    }
+}
+
+// -- Stdout event types from Claude CLI --
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum StdoutEvent {
+    Result {
+        subtype: Option<String>,
+        #[serde(default)]
+        is_error: bool,
+        duration_ms: Option<u64>,
+        num_turns: Option<u64>,
+        result: Option<String>,
+        session_id: Option<String>,
+    },
+    System {
+        subtype: Option<String>,
+        session_id: Option<String>,
+    },
+    Assistant {
+        message: serde_json::Value,
+        session_id: Option<String>,
+        uuid: Option<String>,
+    },
+    User {
+        message: serde_json::Value,
+        session_id: Option<String>,
+        #[serde(default)]
+        #[serde(rename = "isReplay")]
+        is_replay: bool,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 // -- Transcript discovery --
-//
-// Two paths: for session-id resumes the transcript file already exists
-// under ~/.claude/projects/<cwd-slug>/<session-id>.jsonl. We search
-// the projects directory for it. For forks (resume from file path) the
-// CLI creates a new file — we watch for creation with notify.
 
 fn find_transcript(projects_dir: &PathBuf, target_name: &str) -> Option<PathBuf> {
     let walker = walkdir::WalkDir::new(projects_dir)
@@ -168,8 +190,6 @@ async fn watch_for_transcript(
     })
     .expect("failed to create filesystem watcher");
 
-    // Register the watch first — any creation events from this point
-    // forward will be captured.
     if watcher
         .watch(&projects_dir, RecursiveMode::Recursive)
         .is_err()
@@ -177,8 +197,6 @@ async fn watch_for_transcript(
         return;
     }
 
-    // Now scan. If the file was created before the watcher registered,
-    // this catches it. If it was created after, the watcher has it.
     if let Some(existing) = find_transcript(&projects_dir, &target_name) {
         tracing::info!(path = %existing.display(), "found transcript on scan after watch");
         let _ = tx.send(existing).await;
@@ -206,28 +224,20 @@ async fn watch_for_transcript(
         }
         Ok(None) => {
             tracing::error!("transcript watcher ended without finding transcript");
-            emit_error("transcript watcher ended without finding transcript");
         }
         Err(_) => {
             tracing::error!(target_name, "timeout waiting for transcript after 15 seconds");
-            emit_error("timeout waiting for transcript after 15 seconds");
         }
     }
 }
 
 // -- Transcript tailer --
-//
-// Once we know the transcript path, tail it. Read from the current position,
-// emit each line as a transcript envelope. Watch for modifications with notify
-// and read new content when it arrives. Returns the number of lines emitted so
-// the caller can do a final deterministic read after claude exits.
 
-async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
+async fn tail_transcript(path: PathBuf, ws_tx: WsSender, stop: mpsc::Receiver<()>) -> usize {
     use tokio::fs::File;
     let mut stop = stop;
     let mut lines_emitted: usize = 0;
 
-    // Wait for the file to exist.
     loop {
         if path.exists() {
             break;
@@ -238,7 +248,7 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
     let file = match File::open(&path).await {
         Ok(f) => f,
         Err(e) => {
-            emit_error(&format!("cannot open transcript: {}", e));
+            ws_emit_error(&ws_tx, &format!("cannot open transcript: {}", e));
             return 0;
         }
     };
@@ -246,7 +256,6 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
     let mut reader = BufReader::new(file);
     let mut line = String::new();
 
-    // Read existing content first.
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
@@ -255,7 +264,7 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        emit("transcript", data);
+                        ws_emit(&ws_tx, "transcript", data);
                         lines_emitted += 1;
                     }
                 }
@@ -264,7 +273,6 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
         }
     }
 
-    // Now tail: wait for modifications, read new lines.
     let (notify_tx, mut notify_rx) = mpsc::channel::<()>(16);
 
     let watch_path = path.clone();
@@ -300,7 +308,7 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
                                 if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                                    emit("transcript", data);
+                                    ws_emit(&ws_tx, "transcript", data);
                                     lines_emitted += 1;
                                 }
                             }
@@ -317,13 +325,8 @@ async fn tail_transcript(path: PathBuf, stop: mpsc::Receiver<()>) -> usize {
 }
 
 // -- Trust injection --
-//
-// The Claude CLI requires hasTrustDialogAccepted in ~/.claude.json for
-// each working directory. Puzzle handles this locally; Easement handles
-// it on remote machines where Puzzle can't reach the config.
 
 fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
-    // Acquire mkdir-based lock matching the CLI's proper-lockfile protocol.
     let lock_path = config_path.with_extension("json.lock");
     if std::fs::create_dir(&lock_path).is_err() {
         return Err("lock contention".to_string());
@@ -338,7 +341,6 @@ fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
             Err(e) => return Err(e.to_string()),
         };
 
-        // Check if trust is already set.
         let already = config
             .get("projects")
             .and_then(|p| p.get(directory))
@@ -387,15 +389,7 @@ fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
     result
 }
 
-// MCP approval is now handled by Wicket directly at
-// http://localhost:6502/mcp/<slug>. Easement just writes the MCP config
-// pointing Claude to that endpoint.
-
 // -- Sandbox --
-//
-// Reads ~/.local/state/puzzle/<slug>/sandbox.conf and builds a
-// platform-specific sandbox command. On macOS, sandbox-exec with an
-// SBPL policy. On Linux, bwrap with bind mounts.
 
 struct SandboxConfig {
     writable: Vec<String>,
@@ -428,26 +422,17 @@ fn read_sandbox_config(slug: &str) -> SandboxConfig {
 
 #[cfg(target_os = "macos")]
 fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::process::Command {
-    // Build the SBPL policy.
     let mut policy = String::new();
     policy.push_str("(version 1)\n");
     policy.push_str("(deny default)\n");
-
-    // Process management.
     policy.push_str("(allow process-exec)\n");
     policy.push_str("(allow process-fork)\n");
     policy.push_str("(allow signal (target same-sandbox))\n");
     policy.push_str("(allow process-info* (target same-sandbox))\n");
-
-    // Read access to everything.
     policy.push_str("(allow file-read*)\n");
-
-    // Write access to writable roots.
     for path in &config.writable {
         policy.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", path));
     }
-
-    // /dev/null, /tmp, and temp dirs.
     policy.push_str("(allow file-write* (subpath \"/tmp\"))\n");
     policy.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
     policy.push_str(&format!(
@@ -455,25 +440,15 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
         std::env::temp_dir().display()
     ));
     policy.push_str("(allow file-write-data (require-all (path \"/dev/null\") (vnode-type CHARACTER-DEVICE)))\n");
-
-    // PTY support.
     policy.push_str("(allow pseudo-tty)\n");
     policy.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n");
     policy.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n");
     policy.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))\n");
-
-    // Sysctls for basic operation.
     policy.push_str("(allow sysctl-read)\n");
-
-    // Mach services for basic operation.
     policy.push_str("(allow mach-lookup)\n");
-
-    // Network: allow all (for now — Wicket is on localhost:6502, Claude API is remote).
     policy.push_str("(allow network-outbound)\n");
     policy.push_str("(allow network-inbound)\n");
     policy.push_str("(allow system-socket)\n");
-
-    // IPC.
     policy.push_str("(allow ipc-posix-sem)\n");
     policy.push_str("(allow ipc-posix-shm-read*)\n");
     policy.push_str("(allow user-preference-read)\n");
@@ -494,13 +469,11 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
         "--tmpfs".to_string(), "/tmp".to_string(),
         "--unshare-pid".to_string(),
     ];
-
     for path in &config.writable {
         args.push("--bind".to_string());
         args.push(path.clone());
         args.push(path.clone());
     }
-
     args.push("--".to_string());
     args.push("zsh".to_string());
     args.push("-c".to_string());
@@ -511,84 +484,144 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
     cmd
 }
 
-#[tokio::main]
-async fn main() {
-    let _guard = init_tracing();
+// -- Zsh execution --
 
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => {
-            emit_error("HOME not set");
-            std::process::exit(1);
-        }
-    };
-
-    // Read the payload — one line of JSON from stdin.
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut payload_line = String::new();
-
-    let payload_bytes = reader.read_line(&mut payload_line).await;
-    match payload_bytes {
-        Ok(0) => std::process::exit(0),
-        Ok(_) => {}
-        Err(_) => {
-            emit_error("failed to read payload from stdin");
-            std::process::exit(1);
-        }
-    }
-
-    let payload: Payload = match serde_json::from_str(payload_line.trim()) {
-        Ok(p) => p,
-        Err(e) => {
-            emit_error(&format!("invalid payload: {}", e));
-            std::process::exit(1);
-        }
-    };
-
-    tracing::info!(
-        slug = %payload.slug,
-        yolo = payload.yolo,
-        has_session_id = payload.session_id.is_some(),
-        has_transcript = payload.transcript.is_some(),
-        "payload received"
-    );
-    emit_log("info", "payload received", serde_json::json!({
-        "slug": &payload.slug,
-        "yolo": payload.yolo,
-        "has_session_id": payload.session_id.is_some(),
+async fn handle_zsh(ws_tx: &WsSender, slug: &str, data: serde_json::Value) {
+    let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
+    let sandboxed = data.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true);
+    tracing::info!(command = %command, sandboxed, "zsh exec");
+    ws_emit_log(ws_tx, "info", "zsh exec", serde_json::json!({
+        "command": command, "sandboxed": sandboxed,
     }));
 
-    // Set up the working directory.
-    let pane_dir = PathBuf::from(&home).join("pane").join(&payload.slug);
-    if std::fs::create_dir_all(&pane_dir).is_err() {
-        emit_error(&format!("cannot create {}", pane_dir.display()));
-        std::process::exit(1);
+    let output = if sandboxed {
+        let config = read_sandbox_config(slug);
+        let mut cmd = build_sandbox_command(command, &config);
+        cmd.output().await
+    } else {
+        tracing::warn!(command = %command, "running unsandboxed");
+        let mut cmd = tokio::process::Command::new("zsh");
+        cmd.arg("-c").arg(command);
+        cmd.output().await
+    };
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = if stderr.is_empty() {
+                stdout.to_string()
+            } else {
+                format!("{}{}", stdout, stderr)
+            };
+            let code = out.status.code().unwrap_or(-1);
+            ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                "output": combined,
+                "exit_code": code,
+            }));
+        }
+        Err(e) => {
+            ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                "output": format!("failed to execute: {}", e),
+                "exit_code": 1,
+            }));
+        }
     }
+}
+
+// -- Apply patch --
+
+async fn handle_apply_patch(ws_tx: &WsSender, slug: &str, data: serde_json::Value) {
+    let patch = data.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+    tracing::info!("apply_patch request");
+
+    let sandbox_config = read_sandbox_config(slug);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    match codex_apply_patch::parse_patch(patch) {
+        Ok(parsed) => {
+            let mut denied_path = None;
+            for hunk in &parsed.hunks {
+                let path = match hunk {
+                    codex_apply_patch::Hunk::AddFile { path, .. } => path,
+                    codex_apply_patch::Hunk::DeleteFile { path } => path,
+                    codex_apply_patch::Hunk::UpdateFile { path, .. } => path,
+                };
+                let abs = cwd.join(path).to_string_lossy().to_string();
+                let is_writable = sandbox_config.writable.iter()
+                    .any(|root| abs.starts_with(root));
+                if !is_writable {
+                    denied_path = Some(abs);
+                    break;
+                }
+            }
+
+            if let Some(denied) = denied_path {
+                ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                    "output": format!("patch denied: {} is not inside a writable root", denied),
+                    "exit_code": 1,
+                }));
+            } else {
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                match codex_apply_patch::apply_patch(patch, &mut stdout_buf, &mut stderr_buf) {
+                    Ok(()) => {
+                        let output = String::from_utf8_lossy(&stdout_buf);
+                        ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                            "output": output.trim_end(),
+                            "exit_code": 0,
+                        }));
+                    }
+                    Err(e) => {
+                        let stderr_str = String::from_utf8_lossy(&stderr_buf);
+                        let output = if stderr_str.is_empty() {
+                            format!("patch failed: {}", e)
+                        } else {
+                            format!("{}\npatch failed: {}", stderr_str.trim_end(), e)
+                        };
+                        ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                            "output": output,
+                            "exit_code": 1,
+                        }));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                "output": format!("patch parse error: {}", e),
+                "exit_code": 1,
+            }));
+        }
+    }
+}
+
+// -- Claude turn --
+
+async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Value) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let yolo = data.get("yolo").and_then(|v| v.as_bool()).unwrap_or(false);
+    let transcript = data.get("transcript").and_then(|v| v.as_array());
+
+    let pane_dir = PathBuf::from(&home).join("pane").join(slug);
+    let _ = std::fs::create_dir_all(&pane_dir);
     if std::env::set_current_dir(&pane_dir).is_err() {
-        emit_error(&format!("cannot cd to {}", pane_dir.display()));
-        std::process::exit(1);
+        ws_emit_error(ws_tx, &format!("cannot cd to {}", pane_dir.display()));
+        return;
     }
 
-    // Ensure trust for the pane directory so the CLI skips its approval
-    // dialog. Same protocol as Puzzle's config.rs — locked read-modify-write
-    // of ~/.claude.json with mkdir-based locking.
     let config_path = PathBuf::from(&home).join(".claude.json");
     let pane_dir_str = pane_dir.to_str().unwrap_or("");
     if let Err(e) = ensure_trust(&config_path, pane_dir_str) {
         tracing::warn!("failed to ensure trust: {}", e);
     }
 
-    // Determine the resume target.
     let resume_arg: String;
     let mut temp_transcript: Option<PathBuf> = None;
 
-    if let Some(sid) = &payload.session_id {
-        resume_arg = sid.clone();
-    } else if let Some(ref entries) = payload.transcript {
-        // Write transcript entries to a temp file, one per line.
-        let tmp_path = std::env::temp_dir()
-            .join(format!("easement-{}.jsonl", payload.slug));
+    if let Some(entries) = transcript {
+        let tmp_path = std::env::temp_dir().join(format!("easement-{}.jsonl", slug));
         let mut content = String::new();
         for entry in entries {
             if let Ok(line) = serde_json::to_string(entry) {
@@ -597,22 +630,21 @@ async fn main() {
             }
         }
         if std::fs::write(&tmp_path, &content).is_err() {
-            emit_error("cannot write transcript temp file");
-            std::process::exit(1);
+            ws_emit_error(ws_tx, "cannot write transcript temp file");
+            return;
         }
         resume_arg = tmp_path.to_string_lossy().to_string();
         temp_transcript = Some(tmp_path);
     } else {
-        emit_error("payload must have session_id or transcript");
-        std::process::exit(1);
+        ws_emit_error(ws_tx, "claude envelope must have transcript");
+        return;
     }
 
     tracing::info!(resume_arg = %resume_arg, "spawning claude");
-    emit_log("info", "spawning claude", serde_json::json!({
+    ws_emit_log(ws_tx, "info", "spawning claude", serde_json::json!({
         "resume_arg": &resume_arg,
     }));
 
-    // Build the command.
     let mut cmd = Command::new("claude");
     cmd.arg("--print")
         .arg("--input-format").arg("stream-json")
@@ -626,35 +658,28 @@ async fn main() {
         .arg("--resume").arg(&resume_arg)
         .arg("--add-dir").arg(format!("{}/code", home));
 
-    if payload.yolo {
+    if yolo {
         cmd.arg("--dangerously-skip-permissions");
     } else {
-        // Write the MCP config pointing Claude to Wicket's HTTP endpoint.
-        // Wicket serves approval requests at /mcp/<slug>. On remote machines,
-        // ssh -R 6502:localhost:6502 tunnels the port back to the Mac.
         let mcp_config_path = std::env::temp_dir()
-            .join(format!("easement-wicket-{}.json", payload.slug));
+            .join(format!("easement-wicket-{}.json", slug));
         let mcp_config = serde_json::json!({
             "mcpServers": {
                 "wicket": {
                     "type": "http",
-                    "url": format!("http://localhost:6502/mcp/{}", payload.slug)
+                    "url": format!("http://localhost:6502/mcp/{}", slug)
                 }
             }
         });
         if let Err(e) = std::fs::write(&mcp_config_path, mcp_config.to_string()) {
-            emit_error(&format!("cannot write mcp config: {}", e));
-            std::process::exit(1);
+            ws_emit_error(ws_tx, &format!("cannot write mcp config: {}", e));
+            return;
         }
-        tracing::info!(path = %mcp_config_path.display(), "wrote mcp config");
-
         cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
             .arg("--mcp-config").arg(&mcp_config_path)
             .arg("--disallowed-tools").arg("Bash,Write,Edit");
     }
 
-    // Capture stderr so MCP initialization errors and other diagnostics
-    // are visible in the log rather than swallowed.
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -662,16 +687,15 @@ async fn main() {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            emit_error(&format!("cannot spawn claude: {}", e));
-            std::process::exit(1);
+            ws_emit_error(ws_tx, &format!("cannot spawn claude: {}", e));
+            return;
         }
     };
 
-    let mut child_stdin: Option<tokio::process::ChildStdin> = Some(child.stdin.take().expect("stdin was piped"));
+    let mut child_stdin = child.stdin.take().expect("stdin was piped");
     let child_stdout = child.stdout.take().expect("stdout was piped");
     let child_stderr = child.stderr.take().expect("stderr was piped");
 
-    // Log stderr lines so MCP errors and Claude diagnostics are visible.
     tokio::spawn(async move {
         let mut reader = BufReader::new(child_stderr);
         let mut line = String::new();
@@ -690,373 +714,313 @@ async fn main() {
         }
     });
 
-    // Send the kickoff message.
-    let kickoff = format_user_message(&payload.message);
-    if let Some(ref mut stdin) = child_stdin {
-        if stdin.write_all(kickoff.as_bytes()).await.is_err() {
-            emit_error("failed to send kickoff message");
-            std::process::exit(1);
-        }
-        let _ = stdin.flush().await;
-    }
+    ws_emit(ws_tx, "lifecycle", serde_json::json!("round_started"));
 
-    // Read the first stdout event to capture the session ID.
+    let kickoff = format_user_message(message);
+    if child_stdin.write_all(kickoff.as_bytes()).await.is_err() {
+        ws_emit_error(ws_tx, "failed to send kickoff message");
+        return;
+    }
+    let _ = child_stdin.flush().await;
+
+    // Read first stdout event for session ID.
     let mut stdout_reader = BufReader::new(child_stdout);
     let mut first_line = String::new();
     let session_id: String;
 
     match stdout_reader.read_line(&mut first_line).await {
         Ok(0) => {
-            emit_error("claude exited without output");
-            std::process::exit(1);
+            ws_emit_error(ws_tx, "claude exited without output");
+            return;
         }
         Ok(_) => {
             let trimmed = first_line.trim();
             if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                session_id = data
-                    .get("session_id")
+                session_id = data.get("session_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-
                 if session_id.is_empty() {
-                    emit_error("first event has no session_id");
-                    std::process::exit(1);
+                    ws_emit_error(ws_tx, "first event has no session_id");
+                    return;
                 }
+                tracing::info!(session_id = %session_id, "captured session id");
+                ws_emit(ws_tx, "meta", serde_json::json!({ "session_id": session_id }));
 
-                tracing::info!(session_id = %session_id, "captured session id from first event");
-                emit_log("info", "session id captured", serde_json::json!({
-                    "session_id": &session_id,
-                }));
-                emit_meta(serde_json::json!({ "session_id": session_id }));
-                emit("stdout", data);
+                // Forward the first event as stdout (for stream_event detection).
+                let is_stream = data.get("type").and_then(|v| v.as_str()) == Some("stream_event");
+                if is_stream {
+                    if let Some(event) = data.get("event") {
+                        ws_emit(ws_tx, "delta", event.clone());
+                    }
+                }
             } else {
-                emit_error("first event is not valid JSON");
-                std::process::exit(1);
+                ws_emit_error(ws_tx, "first event is not valid JSON");
+                return;
             }
         }
         Err(e) => {
-            emit_error(&format!("failed to read claude stdout: {}", e));
-            std::process::exit(1);
+            ws_emit_error(ws_tx, &format!("failed to read claude stdout: {}", e));
+            return;
         }
     }
 
-    // Clean up the temp transcript file — claude has already read it.
     if let Some(ref tmp) = temp_transcript {
         let _ = std::fs::remove_file(tmp);
     }
 
-    // Find or watch for the transcript file. For session-id resumes,
-    // Claude writes to the original session file — use the payload's
-    // session ID. For forks (transcript payload), a new file is created
-    // under the stdout session ID.
+    // Start transcript tailer.
     let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
     let (transcript_tx, mut transcript_rx) = mpsc::channel::<PathBuf>(1);
-    let target_name = if let Some(ref sid) = payload.session_id {
-        tracing::info!(payload_sid = %sid, stdout_sid = %session_id, "using payload session id for transcript");
-        format!("{}.jsonl", sid)
-    } else {
-        tracing::info!(stdout_sid = %session_id, "using stdout session id for transcript (fork)");
-        format!("{}.jsonl", session_id)
-    };
+    let target_name = format!("{}.jsonl", session_id);
 
-    // Start the watcher first, then scan. If the file was created before
-    // the watcher registered, the scan catches it. If it's created after,
-    // the watcher catches it.
     let watch_target = target_name.clone();
     let watch_projects_dir = projects_dir.clone();
     tokio::spawn(async move {
         watch_for_transcript(watch_projects_dir, watch_target, transcript_tx).await;
     });
 
-    // Start the tailer once we discover the transcript path. The stop channel
-    // tells the tailer to stop watching. After claude exits we join the handle
-    // to get the line count, then do a final deterministic read of the file.
     let (tailer_stop_tx, tailer_stop_rx) = mpsc::channel::<()>(1);
     let mut tailer_stop_rx = Some(tailer_stop_rx);
     let mut tailer_started = false;
     let mut tailer_handle: Option<tokio::task::JoinHandle<usize>> = None;
     let mut transcript_path: Option<PathBuf> = None;
 
-    // Spawn a task to read claude's stdout and emit envelopes.
-    let (stdout_done_tx, mut stdout_done_rx) = mpsc::channel::<()>(1);
+    // Drain gate.
+    let mut gate = DrainGate::new();
+    let mut round_done = false;
 
-    tokio::spawn(async move {
-        let mut line = String::new();
-        let mut stdout_lines: usize = 0;
-        loop {
-            line.clear();
-            match stdout_reader.read_line(&mut line).await {
-                Ok(0) => {
-                    tracing::debug!(total_lines = stdout_lines, "claude stdout EOF");
-                    break;
-                }
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                            let event_type = data.get("type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            tracing::debug!(event_type, "stdout event");
-                            stdout_lines += 1;
-                            emit("stdout", data);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "stdout read error");
-                    break;
-                }
-            }
-        }
-        let _ = stdout_done_tx.send(()).await;
-    });
-
-    // Stdin passthrough state. These stay in the main loop rather than a
-    // spawned task so that when child.wait() fires and the loop breaks,
-    // the stdin reading stops naturally. A spawned task would block
-    // runtime shutdown waiting on a synchronous stdin read from Wicket's
-    // pipe, deadlocking if Wicket is waiting for us to exit.
-    let mut stdin_line = String::new();
-
-    // Main loop: wait for transcript discovery, stdout completion, stdin
-    // passthrough, or child exit.
+    // Read stdout in the current task (not spawned) so we can manage the drain gate.
+    let mut line = String::new();
     loop {
         tokio::select! {
             Some(path) = transcript_rx.recv(), if !tailer_started => {
-                emit_meta(serde_json::json!({
+                ws_emit(ws_tx, "meta", serde_json::json!({
                     "transcript_path": path.to_string_lossy()
                 }));
                 transcript_path = Some(path.clone());
                 let stop_rx = tailer_stop_rx.take().unwrap();
+                let tailer_ws = ws_tx.clone();
                 tailer_handle = Some(tokio::spawn(async move {
-                    tail_transcript(path, stop_rx).await
+                    tail_transcript(path, tailer_ws, stop_rx).await
                 }));
                 tailer_started = true;
             }
-            Some(()) = stdout_done_rx.recv() => {
-                // Claude's stdout closed. Nothing to do — child.wait()
-                // will fire next.
-            }
-            result = reader.read_line(&mut stdin_line), if child_stdin.is_some() => {
+            result = stdout_reader.read_line(&mut line) => {
                 match result {
-                    Ok(0) => {
-                        tracing::debug!("puzzle stdin EOF, closing claude stdin");
-                        child_stdin.take();
-                    }
+                    Ok(0) => break,
                     Ok(_) => {
-                        // Parse envelope to check if this is a Wicket tool request.
-                        let stream = stdin_line.trim()
-                            .strip_prefix('{')
-                            .and_then(|_| serde_json::from_str::<serde_json::Value>(stdin_line.trim()).ok())
-                            .and_then(|v| v.get("stream").and_then(|s| s.as_str()).map(|s| s.to_string()));
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                                let event_type = data.get("type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
 
-                        match stream.as_deref() {
-                            Some("zsh") => {
-                                if let Ok(env) = serde_json::from_str::<serde_json::Value>(stdin_line.trim()) {
-                                    let data = env.get("data").cloned().unwrap_or_default();
-                                    let command = data.get("command")
-                                        .and_then(|c| c.as_str())
-                                        .unwrap_or("");
-                                    let sandboxed = data.get("sandboxed")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(true);
-                                    tracing::info!(command = %command, sandboxed, "zsh exec request");
-                                    emit_log("info", "zsh exec", serde_json::json!({
-                                        "command": command,
-                                        "sandboxed": sandboxed,
-                                    }));
-
-                                    let output = if sandboxed {
-                                        let sandbox_config = read_sandbox_config(&payload.slug);
-                                        let mut cmd = build_sandbox_command(command, &sandbox_config);
-                                        cmd.output().await
-                                    } else {
-                                        tracing::warn!(command = %command, "running unsandboxed (escalation approved)");
-                                        let mut cmd = tokio::process::Command::new("zsh");
-                                        cmd.arg("-c").arg(command);
-                                        cmd.output().await
-                                    };
-
-                                    match output {
-                                        Ok(out) => {
-                                            let stdout = String::from_utf8_lossy(&out.stdout);
-                                            let stderr = String::from_utf8_lossy(&out.stderr);
-                                            let combined = if stderr.is_empty() {
-                                                stdout.to_string()
-                                            } else {
-                                                format!("{}{}", stdout, stderr)
-                                            };
-                                            let code = out.status.code().unwrap_or(-1);
-                                            emit("zsh_result", serde_json::json!({
-                                                "output": combined,
-                                                "exit_code": code,
-                                            }));
-                                        }
-                                        Err(e) => {
-                                            emit("zsh_result", serde_json::json!({
-                                                "output": format!("failed to execute: {}", e),
-                                                "exit_code": 1,
-                                            }));
-                                        }
+                                let is_stream = event_type == "stream_event";
+                                if is_stream {
+                                    if let Some(event) = data.get("event") {
+                                        ws_emit(ws_tx, "delta", event.clone());
                                     }
-                                }
-                            }
-                            Some("apply_patch") => {
-                                if let Ok(env) = serde_json::from_str::<serde_json::Value>(stdin_line.trim()) {
-                                    let data = env.get("data").cloned().unwrap_or_default();
-                                    let patch = data.get("patch")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    tracing::info!("apply_patch request");
-
-                                    // Check sandbox before applying: parse the patch
-                                    // to get file paths and verify they're writable.
-                                    let sandbox_config = read_sandbox_config(&payload.slug);
-                                    let cwd = std::env::current_dir()
-                                        .unwrap_or_else(|_| PathBuf::from("."));
-
-                                    match codex_apply_patch::parse_patch(patch) {
-                                        Ok(parsed) => {
-                                            // Check all paths against sandbox config.
-                                            let mut denied_path = None;
-                                            for hunk in &parsed.hunks {
-                                                let path = match hunk {
-                                                    codex_apply_patch::Hunk::AddFile { path, .. } => path,
-                                                    codex_apply_patch::Hunk::DeleteFile { path } => path,
-                                                    codex_apply_patch::Hunk::UpdateFile { path, .. } => path,
-                                                };
-                                                let abs = cwd.join(path)
-                                                    .to_string_lossy().to_string();
-                                                let is_writable = sandbox_config.writable.iter()
-                                                    .any(|root| abs.starts_with(root));
-                                                if !is_writable {
-                                                    denied_path = Some(abs);
-                                                    break;
-                                                }
+                                } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
+                                    match &event {
+                                        StdoutEvent::User { is_replay: true, .. } => {
+                                            gate.replayed += 1;
+                                        }
+                                        StdoutEvent::Result { .. } => {
+                                            if let Some(usage) = data.get("usage") {
+                                                ws_emit(ws_tx, "usage", usage.clone());
                                             }
-
-                                            if let Some(denied) = denied_path {
-                                                emit("zsh_result", serde_json::json!({
-                                                    "output": format!("patch denied: {} is not inside a writable root", denied),
-                                                    "exit_code": 1,
-                                                }));
-                                            } else {
-                                                // Apply the patch.
-                                                let mut stdout_buf = Vec::new();
-                                                let mut stderr_buf = Vec::new();
-                                                match codex_apply_patch::apply_patch(
-                                                    patch, &mut stdout_buf, &mut stderr_buf,
-                                                ) {
-                                                    Ok(()) => {
-                                                        let output = String::from_utf8_lossy(&stdout_buf);
-                                                        emit("zsh_result", serde_json::json!({
-                                                            "output": output.trim_end(),
-                                                            "exit_code": 0,
-                                                        }));
-                                                    }
-                                                    Err(e) => {
-                                                        let stderr_str = String::from_utf8_lossy(&stderr_buf);
-                                                        let output = if stderr_str.is_empty() {
-                                                            format!("patch failed: {}", e)
-                                                        } else {
-                                                            format!("{}\npatch failed: {}", stderr_str.trim_end(), e)
-                                                        };
-                                                        emit("zsh_result", serde_json::json!({
-                                                            "output": output,
-                                                            "exit_code": 1,
-                                                        }));
-                                                    }
-                                                }
+                                            if gate.is_drained() {
+                                                round_done = true;
                                             }
                                         }
-                                        Err(e) => {
-                                            emit("zsh_result", serde_json::json!({
-                                                "output": format!("patch parse error: {}", e),
-                                                "exit_code": 1,
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                if let Some(ref mut stdin) = child_stdin {
-                                    tracing::debug!("stdin passthrough");
-                                    if stdin.write_all(stdin_line.as_bytes()).await.is_err() {
-                                        tracing::warn!("stdin write to claude failed");
-                                    } else {
-                                        let _ = stdin.flush().await;
+                                        _ => {}
                                     }
                                 }
                             }
                         }
-                        stdin_line.clear();
+                        line.clear();
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "stdin read error");
-                    }
+                    Err(_) => break,
                 }
-            }
-            status = child.wait() => {
-                match status {
-                    Ok(s) => {
-                        let code = s.code().unwrap_or(-1);
-                        tracing::info!(exit_code = code, "claude exited");
-                        emit_log("info", "claude exited", serde_json::json!({
-                            "exit_code": code,
-                        }));
-                        emit_meta(serde_json::json!({
-                            "exit_code": code
-                        }));
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "error waiting for claude");
-                        emit_error(&format!("error waiting for claude: {}", e));
-                    }
-                }
-
-                // Stop the tailer and get the number of lines it already
-                // emitted. The transcript is fully flushed on disk now that
-                // claude has exited, so we read the remainder directly.
-                let _ = tailer_stop_tx.send(()).await;
-                let lines_emitted = match tailer_handle {
-                    Some(handle) => handle.await.unwrap_or(0),
-                    None => 0,
-                };
-
-                tracing::info!(lines_emitted, "tailer stopped, reading remainder");
-
-                if let Some(ref path) = transcript_path {
-                    if let Ok(file) = std::fs::File::open(path) {
-                        use std::io::BufRead;
-                        let mut remainder: usize = 0;
-                        for line in std::io::BufReader::new(file)
-                            .lines()
-                            .skip(lines_emitted)
-                            .flatten()
-                        {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                                    emit("transcript", data);
-                                    remainder += 1;
-                                }
-                            }
-                        }
-                        tracing::info!(remainder, "final transcript lines emitted");
-                    }
-                } else {
-                    tracing::warn!("no transcript path discovered");
-                }
-
-                // Exit immediately. The tokio runtime cannot shut down
-                // cleanly because stdin is backed by a blocking thread
-                // pool read that will never complete while Wicket holds
-                // the pipe open. Bypassing runtime Drop is the only way
-                // to avoid the deadlock.
-                std::process::exit(0);
             }
         }
+        if round_done {
+            break;
+        }
     }
+
+    // Wait for claude to exit.
+    let status = child.wait().await;
+    match status {
+        Ok(s) => {
+            let code = s.code().unwrap_or(-1);
+            tracing::info!(exit_code = code, "claude exited");
+            ws_emit_log(ws_tx, "info", "claude exited", serde_json::json!({
+                "exit_code": code,
+            }));
+            ws_emit(ws_tx, "meta", serde_json::json!({ "exit_code": code }));
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "error waiting for claude");
+            ws_emit_error(ws_tx, &format!("error waiting for claude: {}", e));
+        }
+    }
+
+    // Stop tailer and read remainder.
+    let _ = tailer_stop_tx.send(()).await;
+    let lines_emitted = match tailer_handle {
+        Some(handle) => handle.await.unwrap_or(0),
+        None => 0,
+    };
+
+    if let Some(ref path) = transcript_path {
+        if let Ok(file) = std::fs::File::open(path) {
+            use std::io::BufRead;
+            let mut remainder: usize = 0;
+            for line in std::io::BufReader::new(file)
+                .lines()
+                .skip(lines_emitted)
+                .flatten()
+            {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        ws_emit(ws_tx, "transcript", data);
+                        remainder += 1;
+                    }
+                }
+            }
+            tracing::info!(remainder, "final transcript lines emitted");
+        }
+    }
+
+    ws_emit(ws_tx, "lifecycle", serde_json::json!("round_completed"));
+    tracing::info!("round completed");
+}
+
+// -- Main --
+
+#[tokio::main]
+async fn main() {
+    let _guard = init_tracing();
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("HOME not set");
+            std::process::exit(1);
+        }
+    };
+
+    // Read bootstrap from stdin: one line with the slug.
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut bootstrap_line = String::new();
+    match reader.read_line(&mut bootstrap_line).await {
+        Ok(0) => std::process::exit(0),
+        Ok(_) => {}
+        Err(_) => {
+            eprintln!("failed to read bootstrap from stdin");
+            std::process::exit(1);
+        }
+    }
+    let slug = bootstrap_line.trim().to_string();
+    if slug.is_empty() {
+        eprintln!("empty slug");
+        std::process::exit(1);
+    }
+
+    tracing::info!(slug = %slug, "easement starting");
+
+    // Set up working directory.
+    let pane_dir = PathBuf::from(&home).join("pane").join(&slug);
+    let _ = std::fs::create_dir_all(&pane_dir);
+
+    // Connect to Wicket.
+    let wicket_url = "ws://localhost:6502";
+    let (ws_stream, _) = match tokio_tungstenite::connect_async(wicket_url).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot connect to wicket");
+            eprintln!("cannot connect to wicket: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let (mut ws_sink, mut ws_stream) = ws_stream.split();
+
+    // Send connect payload.
+    let connect = serde_json::json!({
+        "slug": slug,
+        "protocol": "easement"
+    });
+    if ws_sink.send(Message::text(connect.to_string())).await.is_err() {
+        tracing::error!("failed to send connect payload");
+        std::process::exit(1);
+    }
+
+    tracing::info!("connected to wicket");
+
+    // Outbound channel: handlers send envelopes here, writer task drains to WebSocket.
+    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+
+    // Writer task.
+    tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if ws_sink.send(Message::text(msg)).await.is_err() {
+                break;
+            }
+        }
+        let _ = ws_sink.close().await;
+    });
+
+    // Envelope loop.
+    let slug_owned = slug.clone();
+    while let Some(result) = ws_stream.next().await {
+        match result {
+            Ok(Message::Text(text)) => {
+                let envelope: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "bad envelope from wicket");
+                        continue;
+                    }
+                };
+                let stream = envelope.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+                let data = envelope.get("data").cloned().unwrap_or_default();
+
+                match stream {
+                    "claude" => {
+                        handle_claude_turn(&ws_tx, &slug_owned, data).await;
+                    }
+                    "zsh" => {
+                        handle_zsh(&ws_tx, &slug_owned, data).await;
+                    }
+                    "apply_patch" => {
+                        handle_apply_patch(&ws_tx, &slug_owned, data).await;
+                    }
+                    "shutdown" => {
+                        tracing::info!("shutdown requested");
+                        break;
+                    }
+                    other => {
+                        tracing::debug!(stream = %other, "ignoring unknown envelope");
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => {
+                tracing::info!("wicket closed connection");
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "websocket read error");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    tracing::info!("easement shutting down");
 }
