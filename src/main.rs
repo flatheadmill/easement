@@ -140,12 +140,12 @@ struct EasementEnvelope {
 // -- Output envelope --
 
 #[derive(Debug, Serialize)]
-struct OutEnvelope {
-    stream: &'static str,
+struct OutEnvelope<'a> {
+    stream: &'a str,
     data: Value,
 }
 
-fn envelope_json(stream: &'static str, data: Value) -> Option<String> {
+fn envelope_json(stream: &str, data: Value) -> Option<String> {
     serde_json::to_string(&OutEnvelope { stream, data }).ok()
 }
 
@@ -301,6 +301,7 @@ enum CoordMessage {
     ClientConnected {
         id: u64,
         session_id: Option<String>,
+        protocol: String,
         tx: mpsc::UnboundedSender<String>,
     },
     ClientDisconnected {
@@ -426,6 +427,14 @@ fn make_json_response(resp: JsonRpcResponse) -> Response<Full<Bytes>> {
 
 // -- Broadcast helpers --
 
+fn send_to(clients: &Clients, client_id: u64, stream: &str, data: Value) {
+    if let Some(json) = envelope_json(stream, data) {
+        if let Some(tx) = clients.get(&client_id) {
+            let _ = tx.send(json);
+        }
+    }
+}
+
 fn broadcast(clients: &Clients, stream: &'static str, data: Value) {
     if let Some(json) = envelope_json(stream, data) {
         for tx in clients.values() {
@@ -471,14 +480,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
     let mut clients: Clients = HashMap::new();
 
-    // Easement state.
-    let mut easement_stdin: Option<tokio::process::ChildStdin> = None;
+    let mut easement_client_id: Option<u64> = None;
     let mut easement_child: Option<tokio::process::Child> = None;
-    let mut drain_gate: Option<DrainGate> = None;
     let mut pending_approval: Option<PendingApproval> = None;
     let mut pending_service: Option<PendingService> = None;
     let mut pending_zsh: Option<oneshot::Sender<ZshResult>> = None;
-    let mut stdout_rx: Option<mpsc::Receiver<String>> = None;
     let mut last_usage: Option<Value> = None;
     let mut remote_host: Option<String> = None;
 
@@ -490,166 +496,39 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
     loop {
         tokio::select! {
-            // Easement stdout — process events.
-            Some(line) = async {
-                match &mut stdout_rx {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Ok(envelope) = serde_json::from_str::<EasementEnvelope>(&line) {
-                    if let Ok(raw) = serde_json::from_str::<Value>(&line) {
-                        exchange.log("easement>wicket", &raw);
-                    }
-                    match envelope.stream.as_str() {
-                        "stdout" => {
-                            // Check for stream_event before deserializing.
-                            let is_stream_event = envelope.data
-                                .get("type")
-                                .and_then(|v| v.as_str())
-                                == Some("stream_event");
-
-                            if is_stream_event {
-                                // Broadcast the streaming delta to all clients.
-                                if let Some(event) = envelope.data.get("event") {
-                                    broadcast(&clients, "delta", event.clone());
-                                }
-                            } else {
-                                let is_result = envelope.data
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    == Some("result");
-
-                                if is_result {
-                                    if let Some(usage) = envelope.data.get("usage") {
-                                        broadcast(&clients, "usage", usage.clone());
-                                        last_usage = Some(usage.clone());
-                                    }
-                                }
-
-                                if let Ok(event) = serde_json::from_value::<StdoutEvent>(envelope.data) {
-                                    if let StdoutEvent::Assistant { ref uuid, .. } = event {
-                                        if let Some(uuid) = uuid {
-                                            let new_entries = transcript.set_boundary(uuid.clone());
-                                            for entry in &new_entries {
-                                                broadcast_entry(&clients, entry);
-                                                all_entries.push(entry.clone());
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(ref mut gate) = drain_gate {
-                                        let round_done = gate.handle(&event);
-
-                                        if round_done {
-
-                                            tracing::info!("round completed");
-                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
-
-                                            easement_stdin.take();
-                                            drain_gate = None;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        "transcript" => {
-                            let new_entries = transcript.handle_entry(envelope.data);
-                            for entry in &new_entries {
-                                broadcast_entry(&clients, entry);
-                                all_entries.push(entry.clone());
-                            }
-                        }
-                        "approval" => {
-                            tracing::info!("approval request received");
-                            broadcast_approval(&clients, envelope.data);
-                        }
-                        "meta" => {
-                            if let Some(sid) = envelope.data.get("session_id").and_then(|v| v.as_str()) {
-                                tracing::info!(session_id = %sid, "meta: session id (not persisted until round completes)");
-                            }
-                            broadcast_meta(&clients, envelope.data);
-                        }
-                        "error" => {
-                            let msg = envelope.data.get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown error");
-                            tracing::error!("easement error: {}", msg);
-                            broadcast_error(&clients, msg);
-                        }
-                        "log" => {
-                            let level = envelope.data.get("level")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("info");
-                            let message = envelope.data.get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let fields = envelope.data.get("fields");
-                            match level {
-                                "error" => tracing::error!(
-                                    slug = %slug, fields = ?fields,
-                                    "[easement] {}", message
-                                ),
-                                "warn" => tracing::warn!(
-                                    slug = %slug, fields = ?fields,
-                                    "[easement] {}", message
-                                ),
-                                _ => tracing::info!(
-                                    slug = %slug, fields = ?fields,
-                                    "[easement] {}", message
-                                ),
-                            }
-                        }
-                        "zsh_result" => {
-                            if let Some(reply) = pending_zsh.take() {
-                                let output = envelope.data.get("output")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let exit_code = envelope.data.get("exit_code")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(-1) as i32;
-                                tracing::info!(exit_code, output_len = output.len(), "zsh result received");
-                                broadcast(&clients, "tool_done", json!({
-                                    "tool": "zsh",
-                                    "output": &output,
-                                    "exit_code": exit_code
-                                }));
-                                let _ = reply.send(ZshResult { output, exit_code });
-                            }
-                        }
-                        _ => {
-                            tracing::warn!("unknown easement stream: {}", envelope.stream);
-                        }
-                    }
-                }
-            }
-
             // Coordinator messages (from WebSocket clients).
             Some(msg) = coord_rx.recv() => {
                 match msg {
-                    CoordMessage::ClientConnected { id, session_id, tx } => {
-                        if let Some(sid) = session_id {
-                            sessions.set_local(sid);
-                        }
-                        // Stream history to this client.
-                        for entry in &all_entries {
-                            if let Ok(data) = serde_json::to_value(entry) {
-                                if let Some(json) = envelope_json("entry", data) {
+                    CoordMessage::ClientConnected { id, session_id, protocol, tx } => {
+                        if protocol == "easement" {
+                            easement_client_id = Some(id);
+                            tracing::info!(client_id = id, "easement client connected");
+                        } else {
+                            if let Some(sid) = session_id {
+                                sessions.set_local(sid);
+                            }
+                            for entry in &all_entries {
+                                if let Ok(data) = serde_json::to_value(entry) {
+                                    if let Some(json) = envelope_json("entry", data) {
+                                        let _ = tx.send(json);
+                                    }
+                                }
+                            }
+                            if let Some(ref usage) = last_usage {
+                                if let Some(json) = envelope_json("usage", usage.clone()) {
                                     let _ = tx.send(json);
                                 }
                             }
                         }
-                        if let Some(ref usage) = last_usage {
-                            if let Some(json) = envelope_json("usage", usage.clone()) {
-                                let _ = tx.send(json);
-                            }
-                        }
                         clients.insert(id, tx);
-                        tracing::info!(client_id = id, clients = clients.len(), "client connected");
+                        tracing::info!(client_id = id, protocol = %protocol, clients = clients.len(), "client connected");
                     }
                     CoordMessage::ClientDisconnected { id } => {
                         clients.remove(&id);
+                        if easement_client_id == Some(id) {
+                            easement_client_id = None;
+                            tracing::info!(client_id = id, "easement client disconnected");
+                        }
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
                     CoordMessage::McpApprovalRequest { tool_name, input, tool_use_id, reply } => {
@@ -710,40 +589,27 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             "command": command,
                             "sandboxed": sandboxed
                         }));
-                        if let Some(ref mut stdin) = easement_stdin {
-                            let env = json!({
-                                "stream": "zsh",
-                                "data": { "command": command, "sandboxed": sandboxed }
-                            });
-                            exchange.log("wicket>easement", &env);
-                            let mut env_line = serde_json::to_string(&env).unwrap();
-                            env_line.push('\n');
-                            let _ = stdin.write_all(env_line.as_bytes()).await;
-                            let _ = stdin.flush().await;
+                        if let Some(eid) = easement_client_id {
+                            send_to(&clients, eid, "zsh", json!({
+                                "command": command,
+                                "sandboxed": sandboxed
+                            }));
                             pending_zsh = Some(reply);
                         } else {
                             let _ = reply.send(ZshResult {
-                                output: "no active easement process".to_string(),
+                                output: "no easement connected".to_string(),
                                 exit_code: 1,
                             });
                         }
                     }
                     CoordMessage::FileOp { op, args, reply } => {
                         tracing::info!(op = %op, "file op request");
-                        if let Some(ref mut stdin) = easement_stdin {
-                            let env = json!({
-                                "stream": op,
-                                "data": args,
-                            });
-                            exchange.log("wicket>easement", &env);
-                            let mut env_line = serde_json::to_string(&env).unwrap();
-                            env_line.push('\n');
-                            let _ = stdin.write_all(env_line.as_bytes()).await;
-                            let _ = stdin.flush().await;
+                        if let Some(eid) = easement_client_id {
+                            send_to(&clients, eid, &op, args);
                             pending_zsh = Some(reply);
                         } else {
                             let _ = reply.send(ZshResult {
-                                output: "no active easement process".to_string(),
+                                output: "no easement connected".to_string(),
                                 exit_code: 1,
                             });
                         }
@@ -763,36 +629,92 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             "stream": &envelope.stream,
                             "data": &envelope.data,
                         }));
+
+                        if easement_client_id == Some(id) {
+                            match envelope.stream.as_str() {
+                                "delta" => {
+                                    broadcast(&clients, "delta", envelope.data);
+                                }
+                                "transcript" => {
+                                    let new_entries = transcript.handle_entry(envelope.data);
+                                    for entry in &new_entries {
+                                        broadcast_entry(&clients, entry);
+                                        all_entries.push(entry.clone());
+                                    }
+                                }
+                                "usage" => {
+                                    broadcast(&clients, "usage", envelope.data.clone());
+                                    last_usage = Some(envelope.data);
+                                }
+                                "lifecycle" => {
+                                    let name = envelope.data.as_str().unwrap_or("");
+                                    match name {
+                                        "round_started" => {
+                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
+                                        }
+                                        "round_completed" => {
+                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
+                                        }
+                                        _ => {
+                                            tracing::debug!(lifecycle = %name, "unknown easement lifecycle");
+                                        }
+                                    }
+                                }
+                                "zsh_result" => {
+                                    if let Some(reply) = pending_zsh.take() {
+                                        let output = envelope.data.get("output")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let exit_code = envelope.data.get("exit_code")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(-1) as i32;
+                                        tracing::info!(exit_code, output_len = output.len(), "zsh result received");
+                                        broadcast(&clients, "tool_done", json!({
+                                            "tool": "zsh",
+                                            "output": &output,
+                                            "exit_code": exit_code
+                                        }));
+                                        let _ = reply.send(ZshResult { output, exit_code });
+                                    }
+                                }
+                                "meta" => {
+                                    if let Some(sid) = envelope.data.get("session_id").and_then(|v| v.as_str()) {
+                                        tracing::info!(session_id = %sid, "easement meta: session id");
+                                    }
+                                    broadcast_meta(&clients, envelope.data);
+                                }
+                                "error" => {
+                                    let msg = envelope.data.get("message")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown error");
+                                    tracing::error!("easement error: {}", msg);
+                                    broadcast_error(&clients, msg);
+                                }
+                                "log" => {
+                                    let level = envelope.data.get("level")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("info");
+                                    let message = envelope.data.get("message")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let fields = envelope.data.get("fields");
+                                    match level {
+                                        "error" => tracing::error!(slug = %slug, fields = ?fields, "[easement] {}", message),
+                                        "warn" => tracing::warn!(slug = %slug, fields = ?fields, "[easement] {}", message),
+                                        _ => tracing::info!(slug = %slug, fields = ?fields, "[easement] {}", message),
+                                    }
+                                }
+                                _ => {
+                                    tracing::debug!(stream = %envelope.stream, "unknown easement envelope");
+                                }
+                            }
+                            continue;
+                        }
+
                         match envelope.stream.as_str() {
                             "claude" => {
-                                if let Some(ref mut stdin) = easement_stdin {
-                                    // Round in flight — interjection.
-                                    if let Some(msg) = envelope.data.get("message").and_then(|v| v.as_str()) {
-                                        let user_msg = json!({
-                                            "type": "user",
-                                            "message": {
-                                                "role": "user",
-                                                "content": msg
-                                            },
-                                            "uuid": uuid::Uuid::new_v4().to_string()
-                                        });
-                                        let claude_env = json!({
-                                            "stream": "claude",
-                                            "data": user_msg
-                                        });
-                                        exchange.log("wicket>easement", &claude_env);
-                                        let mut env_line = serde_json::to_string(&claude_env).unwrap();
-                                        env_line.push('\n');
-                                        let _ = stdin.write_all(env_line.as_bytes()).await;
-                                        let _ = stdin.flush().await;
-
-                                        if let Some(ref mut gate) = drain_gate {
-                                            gate.sent += 1;
-                                        }
-                                        tracing::info!("interjection forwarded");
-                                    }
-                                } else {
-                                    // No round in flight — start a new round.
+                                if let Some(eid) = easement_client_id {
                                     let msg: ClaudeMessage = match serde_json::from_value(envelope.data) {
                                         Ok(m) => m,
                                         Err(e) => {
@@ -802,112 +724,18 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                     };
 
-                                    let effective_remote = remote_host.clone().or(msg.remote);
-                                    let is_remote = effective_remote.is_some();
-                                    let is_yolo = msg.yolo;
-
-                                    let payload = EasementPayload {
-                                        slug: slug.clone(),
-                                        yolo: is_yolo,
-                                        message: msg.message,
-                                        session_id: None,
-                                        transcript: Some(transcript.entries().to_vec()),
-                                        wicket_socket: None,
-                                    };
-
                                     transcript.begin_round();
 
-                                    tracing::info!(
-                                        is_remote, is_yolo,
-                                        "building easement command"
-                                    );
-                                    let mut cmd = match &effective_remote {
-                                        None => Command::new("easement"),
-                                        Some(host) => {
-                                            let mut c = Command::new("ssh");
-                                            if !is_yolo {
-                                                c.arg("-R").arg("6502:localhost:6502");
-                                            }
-                                            c.arg(host).arg("easement");
-                                            c
-                                        }
-                                    };
-
-                                    cmd.stdin(Stdio::piped())
-                                        .stdout(Stdio::piped())
-                                        .stderr(Stdio::null());
-
-                                    tracing::info!("spawning easement");
-                                    let mut child = match cmd.spawn() {
-                                        Ok(c) => {
-                                            tracing::info!("easement spawned");
-                                            c
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("failed to spawn easement: {}", e);
-                                            broadcast_error(&clients, &format!("failed to spawn easement: {}", e));
-                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed {
-                                                message: format!("spawn error: {}", e),
-                                            });
-                                            continue;
-                                        }
-                                    };
-
-                                    let mut child_stdin = child.stdin.take()
-                                        .expect("stdin was set to piped");
-                                    let child_stdout = child.stdout.take()
-                                        .expect("stdout was set to piped");
-
-                                    let mut payload_json = serde_json::to_string(&payload)
-                                        .expect("payload serialization cannot fail");
-                                    tracing::info!(
-                                        payload_len = payload_json.len(),
-                                        "sending payload to easement"
-                                    );
-                                    payload_json.push('\n');
-                                    if child_stdin
-                                        .write_all(payload_json.as_bytes())
-                                        .await
-                                        .is_err()
-                                    {
-                                        tracing::error!("failed to write payload to easement");
-                                        broadcast_error(&clients, "failed to write payload to easement");
-                                        broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed {
-                                            message: "payload write failed".into(),
-                                        });
-                                        continue;
-                                    }
-                                    let _ = child_stdin.flush().await;
-                                    tracing::info!("payload sent to easement");
-
-                                    let (tx, rx) = mpsc::channel::<String>(256);
-                                    tokio::spawn(async move {
-                                        let mut stdout_reader = BufReader::new(child_stdout);
-                                        let mut line = String::new();
-                                        loop {
-                                            line.clear();
-                                            match stdout_reader.read_line(&mut line).await {
-                                                Ok(0) => break,
-                                                Ok(_) => {
-                                                    let trimmed = line.trim().to_string();
-                                                    if !trimmed.is_empty() {
-                                                        if tx.send(trimmed).await.is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                Err(_) => break,
-                                            }
-                                        }
+                                    let claude_data = json!({
+                                        "message": msg.message,
+                                        "yolo": msg.yolo,
+                                        "transcript": transcript.entries()
                                     });
-
-                                    easement_stdin = Some(child_stdin);
-                                    easement_child = Some(child);
-                                    stdout_rx = Some(rx);
-                                    drain_gate = Some(DrainGate::new());
-
-                                    tracing::info!("round started");
-                                    broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
+                                    send_to(&clients, eid, "claude", claude_data);
+                                    tracing::info!("claude envelope forwarded to easement");
+                                } else {
+                                    tracing::warn!("claude message but no easement connected");
+                                    broadcast_error(&clients, "no easement connected");
                                 }
                             }
                             "approval" => {
@@ -1025,39 +853,6 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                 }
             }
 
-            // Easement exited.
-            status = async {
-                match &mut easement_child {
-                    Some(child) => child.wait().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match status {
-                    Ok(s) => {
-                        let code = s.code().unwrap_or(-1);
-                        tracing::info!(exit_code = code, "easement exited");
-
-                        if drain_gate.is_some() {
-                            tracing::warn!("easement exited before drain gate fired");
-                            broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed {
-                                message: format!("easement exited with code {}", code),
-                            });
-                            drain_gate = None;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("error waiting for easement: {}", e);
-                        broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed {
-                            message: format!("wait error: {}", e),
-                        });
-                        drain_gate = None;
-                    }
-                }
-                easement_child = None;
-                easement_stdin = None;
-                stdout_rx = None;
-                pending_approval = None;
-            }
         }
     }
 }
@@ -1119,10 +914,13 @@ async fn handle_websocket(
     // Channel for outbound messages from coordinator to this client.
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<String>();
 
+    let protocol = connect.protocol.unwrap_or_else(|| "wicket".to_string());
+
     // Register with coordinator.
     let _ = coord_tx.send(CoordMessage::ClientConnected {
         id: client_id,
         session_id: connect.session_id,
+        protocol,
         tx: client_tx,
     });
 
