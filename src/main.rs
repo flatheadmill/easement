@@ -714,6 +714,85 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
                         match envelope.stream.as_str() {
                             "claude" => {
+                                // Spawn Easement if not connected.
+                                if easement_client_id.is_none() && easement_child.is_none() {
+                                    let effective_remote = remote_host.clone();
+                                    let mut cmd = match &effective_remote {
+                                        None => Command::new("easement"),
+                                        Some(host) => {
+                                            let mut c = Command::new("ssh");
+                                            c.arg("-R").arg("6502:localhost:6502");
+                                            c.arg(host).arg("easement");
+                                            c
+                                        }
+                                    };
+                                    cmd.stdin(Stdio::piped())
+                                        .stdout(Stdio::null())
+                                        .stderr(Stdio::null());
+
+                                    match cmd.spawn() {
+                                        Ok(mut child) => {
+                                            if let Some(mut stdin) = child.stdin.take() {
+                                                let slug_line = format!("{}\n", slug);
+                                                let _ = stdin.write_all(slug_line.as_bytes()).await;
+                                                let _ = stdin.flush().await;
+                                                drop(stdin);
+                                            }
+                                            tracing::info!("easement spawned, waiting for WebSocket connect");
+                                            easement_child = Some(child);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("failed to spawn easement: {}", e);
+                                            broadcast_error(&clients, &format!("failed to spawn easement: {}", e));
+                                            continue;
+                                        }
+                                    }
+
+                                    // Wait for Easement to connect back.
+                                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                                    while easement_client_id.is_none() {
+                                        if tokio::time::Instant::now() > deadline {
+                                            tracing::error!("timeout waiting for easement to connect");
+                                            broadcast_error(&clients, "timeout waiting for easement to connect");
+                                            break;
+                                        }
+                                        // Process coordinator messages while waiting.
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(100),
+                                            coord_rx.recv(),
+                                        ).await {
+                                            Ok(Some(CoordMessage::ClientConnected { id: cid, session_id: sid, protocol: proto, tx })) => {
+                                                if proto == "easement" {
+                                                    easement_client_id = Some(cid);
+                                                    tracing::info!(client_id = cid, "easement client connected");
+                                                } else {
+                                                    if let Some(sid) = sid {
+                                                        sessions.set_local(sid);
+                                                    }
+                                                    for entry in &all_entries {
+                                                        if let Ok(data) = serde_json::to_value(entry) {
+                                                            if let Some(json) = envelope_json("entry", data) {
+                                                                let _ = tx.send(json);
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(ref usage) = last_usage {
+                                                        if let Some(json) = envelope_json("usage", usage.clone()) {
+                                                            let _ = tx.send(json);
+                                                        }
+                                                    }
+                                                }
+                                                clients.insert(cid, tx);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
+                                    if easement_client_id.is_none() {
+                                        continue;
+                                    }
+                                }
+
                                 if let Some(eid) = easement_client_id {
                                     let msg: ClaudeMessage = match serde_json::from_value(envelope.data) {
                                         Ok(m) => m,
@@ -733,9 +812,6 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     });
                                     send_to(&clients, eid, "claude", claude_data);
                                     tracing::info!("claude envelope forwarded to easement");
-                                } else {
-                                    tracing::warn!("claude message but no easement connected");
-                                    broadcast_error(&clients, "no easement connected");
                                 }
                             }
                             "approval" => {
