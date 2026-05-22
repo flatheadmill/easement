@@ -703,6 +703,9 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         let _ = reply.send(ZshResult { output, exit_code });
                                     }
                                 }
+                                "shell_result" => {
+                                    broadcast_except(&clients, Some(eid), "shell_result", envelope.data);
+                                }
                                 "meta" => {
                                     if let Some(sid) = envelope.data.get("session_id").and_then(|v| v.as_str()) {
                                         tracing::info!(session_id = %sid, "easement meta: session id");
@@ -842,6 +845,55 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     });
                                     send_to(&clients, eid, "claude", claude_data);
                                     tracing::info!("claude envelope forwarded to easement");
+                                }
+                            }
+                            "shell" => {
+                                // Spawn Easement if not connected (same as claude handler).
+                                if easement_client_id.is_none() && easement_child.is_none() {
+                                    let effective_remote = remote_host.clone();
+                                    let mut cmd = match &effective_remote {
+                                        None => Command::new("easement"),
+                                        Some(host) => {
+                                            let mut c = Command::new("ssh");
+                                            c.arg("-R").arg("6502:localhost:6502");
+                                            c.arg(host).arg("easement");
+                                            c
+                                        }
+                                    };
+                                    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+                                    match cmd.spawn() {
+                                        Ok(mut child) => {
+                                            if let Some(mut stdin) = child.stdin.take() {
+                                                let bootstrap = json!({ "slug": slug, "timestamp": current_timestamp });
+                                                let mut bj = serde_json::to_string(&bootstrap).unwrap();
+                                                bj.push('\n');
+                                                let _ = stdin.write_all(bj.as_bytes()).await;
+                                                let _ = stdin.flush().await;
+                                                drop(stdin);
+                                            }
+                                            easement_child = Some(child);
+                                            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                                            while easement_client_id.is_none() {
+                                                if tokio::time::Instant::now() > deadline { break; }
+                                                match tokio::time::timeout(std::time::Duration::from_millis(100), coord_rx.recv()).await {
+                                                    Ok(Some(CoordMessage::ClientConnected { id: cid, protocol: proto, timestamp: _, session_id: _, tx })) => {
+                                                        if proto == "easement" { easement_client_id = Some(cid); }
+                                                        clients.insert(cid, tx);
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            broadcast_error(&clients, &format!("failed to spawn easement: {}", e));
+                                        }
+                                    }
+                                }
+                                if let Some(eid) = easement_client_id {
+                                    send_to(&clients, eid, "shell", envelope.data);
+                                    tracing::info!("shell command forwarded to easement");
+                                } else {
+                                    broadcast_error(&clients, "no easement connected for shell command");
                                 }
                             }
                             "approval" => {
