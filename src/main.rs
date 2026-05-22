@@ -598,7 +598,7 @@ async fn handle_apply_patch(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
 
 // -- Claude turn --
 
-async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Value) {
+async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Value, inbound_rx: &mut mpsc::Receiver<(String, serde_json::Value)>) {
     let home = std::env::var("HOME").unwrap_or_default();
     let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
     let yolo = data.get("yolo").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -806,6 +806,23 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                 }));
                 tailer_started = true;
             }
+            Some((stream, idata)) = inbound_rx.recv() => {
+                match stream.as_str() {
+                    "zsh" => {
+                        handle_zsh(ws_tx, slug, idata).await;
+                    }
+                    "apply_patch" => {
+                        handle_apply_patch(ws_tx, slug, idata).await;
+                    }
+                    "shutdown" => {
+                        tracing::info!("shutdown during turn");
+                        round_done = true;
+                    }
+                    _ => {
+                        tracing::debug!(stream = %stream, "ignoring envelope during turn");
+                    }
+                }
+            }
             result = stdout_reader.read_line(&mut line) => {
                 match result {
                     Ok(0) => break,
@@ -993,49 +1010,49 @@ async fn main() {
         let _ = ws_sink.close().await;
     });
 
-    // Envelope loop.
-    let slug_owned = slug.clone();
-    while let Some(result) = ws_stream.next().await {
-        match result {
-            Ok(Message::Text(text)) => {
-                let envelope: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bad envelope from wicket");
-                        continue;
-                    }
-                };
-                let stream = envelope.get("stream").and_then(|v| v.as_str()).unwrap_or("");
-                let data = envelope.get("data").cloned().unwrap_or_default();
+    // Inbound channel: reader task feeds envelopes here.
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<(String, serde_json::Value)>(64);
 
-                match stream {
-                    "claude" => {
-                        handle_claude_turn(&ws_tx, &slug_owned, data).await;
-                    }
-                    "zsh" => {
-                        handle_zsh(&ws_tx, &slug_owned, data).await;
-                    }
-                    "apply_patch" => {
-                        handle_apply_patch(&ws_tx, &slug_owned, data).await;
-                    }
-                    "shutdown" => {
-                        tracing::info!("shutdown requested");
-                        break;
-                    }
-                    other => {
-                        tracing::debug!(stream = %other, "ignoring unknown envelope");
+    // Reader task: reads WebSocket, parses envelopes, sends to channel.
+    tokio::spawn(async move {
+        while let Some(result) = ws_stream.next().await {
+            match result {
+                Ok(Message::Text(text)) => {
+                    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let stream = envelope.get("stream").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let data = envelope.get("data").cloned().unwrap_or_default();
+                        if inbound_tx.send((stream, data)).await.is_err() {
+                            break;
+                        }
                     }
                 }
+                Ok(Message::Close(_)) => break,
+                Err(_) => break,
+                _ => {}
             }
-            Ok(Message::Close(_)) => {
-                tracing::info!("wicket closed connection");
+        }
+    });
+
+    // Envelope loop.
+    let slug_owned = slug.clone();
+    while let Some((stream, data)) = inbound_rx.recv().await {
+        match stream.as_str() {
+            "claude" => {
+                handle_claude_turn(&ws_tx, &slug_owned, data, &mut inbound_rx).await;
+            }
+            "zsh" => {
+                handle_zsh(&ws_tx, &slug_owned, data).await;
+            }
+            "apply_patch" => {
+                handle_apply_patch(&ws_tx, &slug_owned, data).await;
+            }
+            "shutdown" => {
+                tracing::info!("shutdown requested");
                 break;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "websocket read error");
-                break;
+            _ => {
+                tracing::debug!(stream = %stream, "ignoring unknown envelope");
             }
-            _ => {}
         }
     }
 
