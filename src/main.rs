@@ -824,6 +824,11 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                                     }
                                 } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                                     match &event {
+                                        StdoutEvent::Assistant { uuid, .. } => {
+                                            if let Some(uuid) = uuid {
+                                                ws_emit(ws_tx, "boundary", serde_json::json!({ "uuid": uuid }));
+                                            }
+                                        }
                                         StdoutEvent::User { is_replay: true, .. } => {
                                             gate.replayed += 1;
                                         }
@@ -850,6 +855,9 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
             break;
         }
     }
+
+    // Close stdin so Claude exits cleanly.
+    drop(child_stdin);
 
     // Wait for claude to exit.
     let status = child.wait().await;
@@ -914,7 +922,7 @@ async fn main() {
         }
     };
 
-    // Read bootstrap from stdin: one line with the slug.
+    // Read bootstrap from stdin: one line of JSON with slug and timestamp.
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut bootstrap_line = String::new();
@@ -926,13 +934,21 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let slug = bootstrap_line.trim().to_string();
+    let bootstrap: serde_json::Value = match serde_json::from_str(bootstrap_line.trim()) {
+        Ok(v) => v,
+        Err(_) => {
+            // Backward compat: plain slug string.
+            serde_json::json!({ "slug": bootstrap_line.trim() })
+        }
+    };
+    let slug = bootstrap.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let timestamp = bootstrap.get("timestamp").and_then(|v| v.as_str()).map(|s| s.to_string());
     if slug.is_empty() {
         eprintln!("empty slug");
         std::process::exit(1);
     }
 
-    tracing::info!(slug = %slug, "easement starting");
+    tracing::info!(slug = %slug, timestamp = ?timestamp, "easement starting");
 
     // Set up working directory.
     let pane_dir = PathBuf::from(&home).join("pane").join(&slug);
@@ -954,7 +970,8 @@ async fn main() {
     // Send connect payload.
     let connect = serde_json::json!({
         "slug": slug,
-        "protocol": "easement"
+        "protocol": "easement",
+        "timestamp": timestamp
     });
     if ws_sink.send(Message::text(connect.to_string())).await.is_err() {
         tracing::error!("failed to send connect payload");
