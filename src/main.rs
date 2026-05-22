@@ -811,6 +811,27 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                     "zsh" => {
                         handle_zsh(ws_tx, slug, idata).await;
                     }
+                    "shell" => {
+                        let cmd = idata.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        tracing::info!(command = %cmd, "user shell during turn (unsandboxed)");
+                        let out = tokio::process::Command::new("zsh")
+                            .arg("-c").arg(cmd).output().await;
+                        match out {
+                            Ok(o) => {
+                                let stdout = String::from_utf8_lossy(&o.stdout);
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                let combined = if stderr.is_empty() { stdout.to_string() } else { format!("{}{}", stdout, stderr) };
+                                ws_emit(ws_tx, "shell_result", serde_json::json!({
+                                    "output": combined, "exit_code": o.status.code().unwrap_or(-1),
+                                }));
+                            }
+                            Err(e) => {
+                                ws_emit(ws_tx, "shell_result", serde_json::json!({
+                                    "output": format!("failed: {}", e), "exit_code": 1,
+                                }));
+                            }
+                        }
+                    }
                     "apply_patch" => {
                         handle_apply_patch(ws_tx, slug, idata).await;
                     }
@@ -1042,6 +1063,37 @@ async fn main() {
             }
             "zsh" => {
                 handle_zsh(&ws_tx, &slug_owned, data).await;
+            }
+            "shell" => {
+                let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                tracing::info!(command = %command, "user shell command (unsandboxed)");
+                let output = tokio::process::Command::new("zsh")
+                    .arg("-c")
+                    .arg(command)
+                    .output()
+                    .await;
+                match output {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let combined = if stderr.is_empty() {
+                            stdout.to_string()
+                        } else {
+                            format!("{}{}", stdout, stderr)
+                        };
+                        let code = out.status.code().unwrap_or(-1);
+                        ws_emit(&ws_tx, "shell_result", serde_json::json!({
+                            "output": combined,
+                            "exit_code": code,
+                        }));
+                    }
+                    Err(e) => {
+                        ws_emit(&ws_tx, "shell_result", serde_json::json!({
+                            "output": format!("failed to execute: {}", e),
+                            "exit_code": 1,
+                        }));
+                    }
+                }
             }
             "apply_patch" => {
                 handle_apply_patch(&ws_tx, &slug_owned, data).await;
