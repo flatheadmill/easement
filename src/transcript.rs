@@ -30,7 +30,7 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    pub fn new(slug: &str) -> Self {
+    pub fn new(slug: &str, timestamp: Option<&str>) -> Self {
         let home = std::env::var("HOME").expect("HOME not set");
         let dir = std::path::Path::new(&home)
             .join(".local")
@@ -38,7 +38,11 @@ impl Transcript {
             .join("puzzle")
             .join(slug);
         let _ = fs::create_dir_all(&dir);
-        let path = dir.join("transcript.jsonl");
+        let filename = match timestamp {
+            Some(ts) => format!("{}.jsonl", ts),
+            None => "transcript.jsonl".to_string(),
+        };
+        let path = dir.join(filename);
 
         Self {
             entries: Vec::new(),

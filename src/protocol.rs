@@ -62,6 +62,8 @@ pub struct ConnectPayload {
     pub session_id: Option<String>,
     #[serde(default)]
     pub protocol: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

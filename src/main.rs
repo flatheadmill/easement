@@ -302,6 +302,7 @@ enum CoordMessage {
         id: u64,
         session_id: Option<String>,
         protocol: String,
+        timestamp: Option<String>,
         tx: mpsc::UnboundedSender<String>,
     },
     ClientDisconnected {
@@ -436,8 +437,13 @@ fn send_to(clients: &Clients, client_id: u64, stream: &str, data: Value) {
 }
 
 fn broadcast(clients: &Clients, stream: &'static str, data: Value) {
+    broadcast_except(clients, None, stream, data);
+}
+
+fn broadcast_except(clients: &Clients, exclude: Option<u64>, stream: &'static str, data: Value) {
     if let Some(json) = envelope_json(stream, data) {
-        for tx in clients.values() {
+        for (&id, tx) in clients.iter() {
+            if exclude == Some(id) { continue; }
             let _ = tx.send(json.clone());
         }
     }
@@ -471,7 +477,7 @@ fn broadcast_error(clients: &Clients, message: &str) {
 
 async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
     let exchange = ExchangeLog::new(&slug);
-    let mut transcript = Transcript::new(&slug);
+    let mut transcript = Transcript::new(&slug, None);
     let mut sessions = Sessions::new(&slug);
     let history = transcript.load_history();
 
@@ -487,6 +493,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut pending_zsh: Option<oneshot::Sender<ZshResult>> = None;
     let mut last_usage: Option<Value> = None;
     let mut remote_host: Option<String> = None;
+    let mut current_timestamp: Option<String> = None;
 
     tracing::info!(
         slug = %slug,
@@ -499,11 +506,18 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
             // Coordinator messages (from WebSocket clients).
             Some(msg) = coord_rx.recv() => {
                 match msg {
-                    CoordMessage::ClientConnected { id, session_id, protocol, tx } => {
+                    CoordMessage::ClientConnected { id, session_id, protocol, timestamp, tx } => {
                         if protocol == "easement" {
                             easement_client_id = Some(id);
                             tracing::info!(client_id = id, "easement client connected");
                         } else {
+                            if let Some(ref ts) = timestamp {
+                                current_timestamp = Some(ts.clone());
+                                transcript = Transcript::new(&slug, Some(ts));
+                                let history = transcript.load_history();
+                                all_entries = history;
+                                tracing::info!(timestamp = %ts, entries = all_entries.len(), "switched to timestamped transcript");
+                            }
                             if let Some(sid) = session_id {
                                 sessions.set_local(sid);
                             }
@@ -631,9 +645,20 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         }));
 
                         if easement_client_id == Some(id) {
+                            let eid = id;
                             match envelope.stream.as_str() {
                                 "delta" => {
-                                    broadcast(&clients, "delta", envelope.data);
+                                    broadcast_except(&clients, Some(eid), "delta", envelope.data);
+                                }
+                                "boundary" => {
+                                    if let Some(uuid) = envelope.data.get("uuid").and_then(|v| v.as_str()) {
+                                        let new_entries = transcript.set_boundary(uuid.to_string());
+                                        for entry in &new_entries {
+                                            broadcast_entry(&clients, entry);
+                                            all_entries.push(entry.clone());
+                                        }
+                                        tracing::info!(uuid = %uuid, "boundary set from easement");
+                                    }
                                 }
                                 "transcript" => {
                                     let new_entries = transcript.handle_entry(envelope.data);
@@ -643,7 +668,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     }
                                 }
                                 "usage" => {
-                                    broadcast(&clients, "usage", envelope.data.clone());
+                                    broadcast_except(&clients, Some(eid), "usage", envelope.data.clone());
                                     last_usage = Some(envelope.data);
                                 }
                                 "lifecycle" => {
@@ -670,7 +695,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                             .and_then(|v| v.as_i64())
                                             .unwrap_or(-1) as i32;
                                         tracing::info!(exit_code, output_len = output.len(), "zsh result received");
-                                        broadcast(&clients, "tool_done", json!({
+                                        broadcast_except(&clients, Some(eid), "tool_done", json!({
                                             "tool": "zsh",
                                             "output": &output,
                                             "exit_code": exit_code
@@ -733,8 +758,13 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     match cmd.spawn() {
                                         Ok(mut child) => {
                                             if let Some(mut stdin) = child.stdin.take() {
-                                                let slug_line = format!("{}\n", slug);
-                                                let _ = stdin.write_all(slug_line.as_bytes()).await;
+                                                let bootstrap = json!({
+                                                    "slug": slug,
+                                                    "timestamp": current_timestamp
+                                                });
+                                                let mut bootstrap_json = serde_json::to_string(&bootstrap).unwrap();
+                                                bootstrap_json.push('\n');
+                                                let _ = stdin.write_all(bootstrap_json.as_bytes()).await;
                                                 let _ = stdin.flush().await;
                                                 drop(stdin);
                                             }
@@ -761,7 +791,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                             std::time::Duration::from_millis(100),
                                             coord_rx.recv(),
                                         ).await {
-                                            Ok(Some(CoordMessage::ClientConnected { id: cid, session_id: sid, protocol: proto, tx })) => {
+                                            Ok(Some(CoordMessage::ClientConnected { id: cid, session_id: sid, protocol: proto, timestamp: _, tx })) => {
                                                 if proto == "easement" {
                                                     easement_client_id = Some(cid);
                                                     tracing::info!(client_id = cid, "easement client connected");
@@ -997,6 +1027,7 @@ async fn handle_websocket(
         id: client_id,
         session_id: connect.session_id,
         protocol,
+        timestamp: connect.timestamp,
         tx: client_tx,
     });
 
