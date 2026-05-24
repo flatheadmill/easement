@@ -598,6 +598,18 @@ async fn handle_apply_patch(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
 
 // -- Claude turn --
 
+async fn send_interrupt(stdin: &mut tokio::process::ChildStdin) {
+    let msg = serde_json::json!({
+        "type": "control_request",
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "request": { "subtype": "interrupt" }
+    });
+    let mut line = serde_json::to_string(&msg).unwrap();
+    line.push('\n');
+    let _ = stdin.write_all(line.as_bytes()).await;
+    let _ = stdin.flush().await;
+}
+
 async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Value, inbound_rx: &mut mpsc::Receiver<(String, serde_json::Value)>) {
     let home = std::env::var("HOME").unwrap_or_default();
     let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -834,6 +846,10 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                     }
                     "apply_patch" => {
                         handle_apply_patch(ws_tx, slug, idata).await;
+                    }
+                    "interrupt" => {
+                        tracing::info!("interrupt received during turn");
+                        send_interrupt(&mut child_stdin).await;
                     }
                     "shutdown" => {
                         tracing::info!("shutdown during turn");
