@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 fn init_tracing() -> WorkerGuard {
     let home = std::env::var("HOME").expect("HOME not set");
     let log_dir = std::path::Path::new(&home)
-        .join(".local").join("state").join("puzzle");
+        .join(".local").join("state").join("easement");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let log_file = std::fs::OpenOptions::new()
@@ -70,6 +70,74 @@ fn ws_emit_log(tx: &WsSender, level: &str, message: &str, fields: serde_json::Va
         "message": message,
         "fields": fields,
     }));
+}
+
+// -- Per-round log --
+//
+// Each Claude invocation gets its own directory. Captures the raw CLI
+// stdout verbatim and the full transcript file. The sent transcript
+// (what we gave --resume) is logged too so we can diff against what
+// came back.
+
+use chrono::Utc;
+
+struct RoundLog {
+    dir: PathBuf,
+}
+
+impl RoundLog {
+    fn begin(slug: &str) -> Self {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let now = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+        let pid = std::process::id();
+        let dir = std::path::Path::new(&home)
+            .join(".local/state/easement")
+            .join(slug)
+            .join("rounds")
+            .join(format!("{}-{}", now, pid));
+        let _ = std::fs::create_dir_all(&dir);
+        tracing::info!(round_dir = %dir.display(), "round log started");
+        Self { dir }
+    }
+
+    fn log_sent(&self, entries: &[serde_json::Value]) {
+        let path = self.dir.join("sent.jsonl");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+        {
+            for entry in entries {
+                if let Ok(mut line) = serde_json::to_string(entry) {
+                    line.push('\n');
+                    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+                }
+            }
+        }
+    }
+
+    fn log_stdout(&self, raw_line: &str) {
+        let path = self.dir.join("stdout.jsonl");
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let entry = serde_json::json!({ "ts": now, "line": raw_line });
+        if let Ok(mut line) = serde_json::to_string(&entry) {
+            line.push('\n');
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+            }
+        }
+    }
+
+    fn copy_transcript(&self, cli_transcript: &Path) {
+        let dest = self.dir.join("transcript.jsonl");
+        if let Err(e) = std::fs::copy(cli_transcript, &dest) {
+            tracing::warn!(error = %e, "failed to copy CLI transcript to round log");
+        }
+    }
 }
 
 // -- Claude stdin message --
@@ -398,7 +466,7 @@ struct SandboxConfig {
 fn read_sandbox_config(slug: &str) -> SandboxConfig {
     let home = std::env::var("HOME").unwrap_or_default();
     let path = std::path::Path::new(&home)
-        .join(".local/state/puzzle")
+        .join(".local/state/easement")
         .join(slug)
         .join("sandbox.conf");
 
@@ -629,30 +697,32 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
         tracing::warn!("failed to ensure trust: {}", e);
     }
 
-    let resume_arg: String;
+    let mut resume_arg: Option<String> = None;
     let mut temp_transcript: Option<PathBuf> = None;
 
+    let round_log = std::sync::Arc::new(RoundLog::begin(slug));
+
     if let Some(entries) = transcript {
-        let tmp_path = std::env::temp_dir().join(format!("easement-{}.jsonl", slug));
-        let mut content = String::new();
-        for entry in entries {
-            if let Ok(line) = serde_json::to_string(entry) {
-                content.push_str(&line);
-                content.push('\n');
+        round_log.log_sent(entries);
+        if !entries.is_empty() {
+            let tmp_path = std::env::temp_dir().join(format!("easement-{}.jsonl", slug));
+            let mut content = String::new();
+            for entry in entries {
+                if let Ok(line) = serde_json::to_string(entry) {
+                    content.push_str(&line);
+                    content.push('\n');
+                }
             }
+            if std::fs::write(&tmp_path, &content).is_err() {
+                ws_emit_error(ws_tx, "cannot write transcript temp file");
+                return;
+            }
+            resume_arg = Some(tmp_path.to_string_lossy().to_string());
+            temp_transcript = Some(tmp_path);
         }
-        if std::fs::write(&tmp_path, &content).is_err() {
-            ws_emit_error(ws_tx, "cannot write transcript temp file");
-            return;
-        }
-        resume_arg = tmp_path.to_string_lossy().to_string();
-        temp_transcript = Some(tmp_path);
-    } else {
-        ws_emit_error(ws_tx, "claude envelope must have transcript");
-        return;
     }
 
-    tracing::info!(resume_arg = %resume_arg, "spawning claude");
+    tracing::info!(resume_arg = ?resume_arg, "spawning claude");
     ws_emit_log(ws_tx, "info", "spawning claude", serde_json::json!({
         "resume_arg": &resume_arg,
     }));
@@ -667,8 +737,11 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
         .arg("--model").arg("claude-opus-4-6")
         .arg("--thinking-display").arg("summarized")
         .arg("--max-thinking-tokens").arg("31999")
-        .arg("--resume").arg(&resume_arg)
         .arg("--add-dir").arg(format!("{}/code", home));
+
+    if let Some(ref ra) = resume_arg {
+        cmd.arg("--resume").arg(ra);
+    }
 
     if yolo {
         cmd.arg("--dangerously-skip-permissions");
@@ -747,6 +820,7 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
         }
         Ok(_) => {
             let trimmed = first_line.trim();
+            round_log.log_stdout(trimmed);
             if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 session_id = data.get("session_id")
                     .and_then(|v| v.as_str())
@@ -866,6 +940,7 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                     Ok(_) => {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
+                            round_log.log_stdout(trimmed);
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
                                 let event_type = data.get("type")
                                     .and_then(|v| v.as_str())
@@ -878,11 +953,7 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                                     }
                                 } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                                     match &event {
-                                        StdoutEvent::Assistant { uuid, .. } => {
-                                            if let Some(uuid) = uuid {
-                                                ws_emit(ws_tx, "boundary", serde_json::json!({ "uuid": uuid }));
-                                            }
-                                        }
+                                        StdoutEvent::Assistant { .. } => {}
                                         StdoutEvent::User { is_replay: true, .. } => {
                                             gate.replayed += 1;
                                         }
@@ -956,6 +1027,7 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
             }
             tracing::info!(remainder, "final transcript lines emitted");
         }
+        round_log.copy_transcript(path);
     }
 
     ws_emit(ws_tx, "lifecycle", serde_json::json!("round_completed"));
