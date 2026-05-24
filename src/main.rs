@@ -62,7 +62,7 @@ impl ExchangeLog {
     fn new(slug: &str) -> Self {
         let home = env::var("HOME").expect("HOME not set");
         let dir = std::path::Path::new(&home)
-            .join(".local/state/puzzle")
+            .join(".local/state/wicket")
             .join(slug);
         let _ = std::fs::create_dir_all(&dir);
         Self {
@@ -172,7 +172,7 @@ fn init_tracing() -> WorkerGuard {
     let log_dir = std::path::Path::new(&home)
         .join(".local")
         .join("state")
-        .join("puzzle");
+        .join("wicket");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let log_file = std::fs::OpenOptions::new()
@@ -651,14 +651,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     broadcast_except(&clients, Some(eid), "delta", envelope.data);
                                 }
                                 "boundary" => {
-                                    if let Some(uuid) = envelope.data.get("uuid").and_then(|v| v.as_str()) {
-                                        let new_entries = transcript.set_boundary(uuid.to_string());
-                                        for entry in &new_entries {
-                                            broadcast_entry(&clients, entry);
-                                            all_entries.push(entry.clone());
-                                        }
-                                        tracing::info!(uuid = %uuid, "boundary set from easement");
-                                    }
+                                    tracing::debug!("boundary envelope ignored");
                                 }
                                 "transcript" => {
                                     let new_entries = transcript.handle_entry(envelope.data);
@@ -836,15 +829,13 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                     };
 
-                                    transcript.begin_round();
-
                                     let claude_data = json!({
                                         "message": msg.message,
                                         "yolo": msg.yolo,
                                         "transcript": transcript.entries()
                                     });
+                                    tracing::info!(transcript_entries = transcript.entries().len(), "forwarding claude envelope to easement");
                                     send_to(&clients, eid, "claude", claude_data);
-                                    tracing::info!("claude envelope forwarded to easement");
                                 }
                             }
                             "shell" => {

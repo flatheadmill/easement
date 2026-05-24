@@ -1,17 +1,15 @@
-// Transcript authority. Wicket owns the canonical transcript — deduplication,
-// persistence, history replay, and normalization all live here. The transcript
-// is stored at ~/.local/state/puzzle/<slug>/transcript.jsonl and survives
-// across windows and machine migrations.
+// Transcript authority. Wicket owns the canonical transcript as a Vec in
+// memory with a UUID index. Persistence is append-only to a JSONL file.
 //
-// The deduplication strategy uses a boundary UUID. When Easement replays
-// transcript entries at the start of a round, the transcript layer buffers
-// them until the boundary UUID (captured from the first assistant stdout
-// event) is found. Everything before the boundary is history replay and is
-// skipped. Everything from the boundary forward is new content.
+// Easement streams the entire CLI transcript from the first line. For each
+// entry: if its UUID is in our index, it is replay — skip. If its UUID is
+// not in our index, assert that its parentUuid is the UUID of the last
+// chained entry in our Vec. If it is, append. If it is not, crash.
 //
-// On the first round (empty transcript), there is no history to skip, so
-// all entries pass through as new.
+// Entries without UUIDs (queue-operation, last-prompt) do not participate
+// in the chain. They are accepted silently.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,10 +20,8 @@ use crate::protocol::NormalizedEntry;
 
 pub struct Transcript {
     entries: Vec<serde_json::Value>,
+    uuid_index: HashMap<String, usize>,
     seq: u64,
-    boundary_uuid: Option<String>,
-    boundary_found: bool,
-    buffer: Vec<serde_json::Value>,
     path: PathBuf,
 }
 
@@ -35,7 +31,7 @@ impl Transcript {
         let dir = std::path::Path::new(&home)
             .join(".local")
             .join("state")
-            .join("puzzle")
+            .join("wicket")
             .join(slug);
         let _ = fs::create_dir_all(&dir);
         let filename = match timestamp {
@@ -46,16 +42,12 @@ impl Transcript {
 
         Self {
             entries: Vec::new(),
+            uuid_index: HashMap::new(),
             seq: 0,
-            boundary_uuid: None,
-            boundary_found: false,
-            buffer: Vec::new(),
             path,
         }
     }
 
-    /// Load existing transcript from disk. Returns normalized entries for
-    /// streaming to the client on connect.
     pub fn load_history(&mut self) -> Vec<NormalizedEntry> {
         let content = match fs::read_to_string(&self.path) {
             Ok(c) => c,
@@ -70,8 +62,7 @@ impl Transcript {
             }
             match serde_json::from_str::<serde_json::Value>(line) {
                 Ok(data) => {
-                    // Load into memory without persisting — the data is
-                    // already on disk.
+                    self.index_entry(&data);
                     results.extend(self.ingest(data));
                 }
                 Err(e) => {
@@ -81,83 +72,93 @@ impl Transcript {
         }
 
         tracing::info!(
-            loaded = self.entries.len(),
+            entries = self.entries.len(),
+            indexed = self.uuid_index.len(),
             normalized = results.len(),
             "transcript loaded from disk"
         );
         results
     }
 
-    /// Call at the start of each round, before spawning Easement.
-    pub fn begin_round(&mut self) {
-        self.boundary_uuid = None;
-        self.boundary_found = self.entries.is_empty();
-        self.buffer.clear();
-        tracing::info!(
-            entries = self.entries.len(),
-            boundary_found = self.boundary_found,
-            "begin round (first={})",
-            self.entries.is_empty()
-        );
-    }
-
-    /// Set the boundary UUID from the first assistant stdout event.
-    /// Processes any buffered entries and returns new normalized entries.
-    pub fn set_boundary(&mut self, uuid: String) -> Vec<NormalizedEntry> {
-        tracing::info!(
-            uuid = %uuid,
-            buffered = self.buffer.len(),
-            "boundary uuid set"
-        );
-        self.boundary_uuid = Some(uuid);
-        self.process_buffer()
-    }
-
-    /// Handle a transcript entry from Easement. Returns new normalized
-    /// entries if the data contains new content past the boundary.
     pub fn handle_entry(&mut self, data: serde_json::Value) -> Vec<NormalizedEntry> {
-        let entry_type = data
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let entry_uuid = data.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let entry_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-        if self.boundary_found {
-            tracing::debug!(
-                entry_type = %entry_type,
-                entries = self.entries.len(),
-                "accepting transcript entry"
-            );
-            return self.accept(data);
+        match &entry_uuid {
+            Some(uuid) if self.uuid_index.contains_key(uuid) => {
+                tracing::debug!(uuid = %uuid, entry_type = %entry_type, "replay, skipping");
+                vec![]
+            }
+            Some(uuid) => {
+                let parent_uuid = data.get("parentUuid").and_then(|v| v.as_str());
+                let chain_head = self.chain_head();
+
+                match (parent_uuid, chain_head) {
+                    (Some(parent), Some(head)) if parent == head => {
+                        tracing::debug!(
+                            uuid = %uuid,
+                            parent = %parent,
+                            entry_type = %entry_type,
+                            "new entry, chain valid"
+                        );
+                    }
+                    (None, None) => {
+                        tracing::debug!(
+                            uuid = %uuid,
+                            entry_type = %entry_type,
+                            "new root entry"
+                        );
+                    }
+                    (None, Some(head)) => {
+                        tracing::debug!(
+                            uuid = %uuid,
+                            chain_head = %head,
+                            entry_type = %entry_type,
+                            "new entry without parentUuid, chain head exists"
+                        );
+                    }
+                    (Some(parent), chain_head) => {
+                        tracing::error!(
+                            uuid = %uuid,
+                            parent_uuid = %parent,
+                            chain_head = ?chain_head,
+                            entry_type = %entry_type,
+                            "CHAIN BREAK: parentUuid does not match chain head"
+                        );
+                        panic!(
+                            "transcript chain break: entry {} parentUuid {} does not match chain head {:?}",
+                            uuid, parent, chain_head
+                        );
+                    }
+                }
+
+                self.index_entry(&data);
+                self.persist(&data);
+                self.ingest(data)
+            }
+            None => {
+                tracing::debug!(entry_type = %entry_type, "entry without uuid, dropping");
+                vec![]
+            }
         }
-
-        self.buffer.push(data);
-        tracing::debug!(
-            entry_type = %entry_type,
-            buffered = self.buffer.len(),
-            has_boundary = self.boundary_uuid.is_some(),
-            "buffering transcript entry"
-        );
-
-        if self.boundary_uuid.is_some() {
-            return self.process_buffer();
-        }
-
-        vec![]
     }
 
-    /// The raw entries for transcript transfer to Easement when forking
-    /// to a new machine (no session ID yet).
     pub fn entries(&self) -> &[serde_json::Value] {
         &self.entries
     }
 
-    fn accept(&mut self, data: serde_json::Value) -> Vec<NormalizedEntry> {
-        self.persist(&data);
-        self.ingest(data)
+    fn chain_head(&self) -> Option<&str> {
+        self.entries.iter().rev().find_map(|e| {
+            e.get("uuid").and_then(|v| v.as_str())
+        })
     }
 
-    /// Add to in-memory state and normalize, without persisting.
+    fn index_entry(&mut self, data: &serde_json::Value) {
+        if let Some(uuid) = data.get("uuid").and_then(|v| v.as_str()) {
+            self.uuid_index.insert(uuid.to_string(), self.entries.len());
+        }
+    }
+
     fn ingest(&mut self, data: serde_json::Value) -> Vec<NormalizedEntry> {
         self.entries.push(data.clone());
 
@@ -170,56 +171,6 @@ impl Transcript {
         }
 
         vec![]
-    }
-
-    fn process_buffer(&mut self) -> Vec<NormalizedEntry> {
-        let uuid = match &self.boundary_uuid {
-            Some(u) => u.clone(),
-            None => return vec![],
-        };
-
-        let boundary_pos = self.buffer.iter().position(|data| {
-            data.get("uuid").and_then(|v| v.as_str()) == Some(uuid.as_str())
-        });
-
-        let boundary_pos = match boundary_pos {
-            Some(pos) => pos,
-            None => {
-                tracing::debug!(
-                    buffered = self.buffer.len(),
-                    boundary_uuid = %uuid,
-                    "boundary not in buffer yet, waiting"
-                );
-                return vec![];
-            }
-        };
-
-        self.boundary_found = true;
-
-        // The new turn includes a user entry before the assistant boundary.
-        let start = self.buffer[..boundary_pos]
-            .iter()
-            .rposition(|data| {
-                data.get("type").and_then(|v| v.as_str()) == Some("user")
-            })
-            .unwrap_or(boundary_pos);
-
-        let skipped = start;
-        let new_content: Vec<_> = self.buffer.drain(start..).collect();
-        let accepted_count = new_content.len();
-        self.buffer.clear();
-
-        tracing::info!(
-            skipped,
-            accepted = accepted_count,
-            "boundary found, processing new content"
-        );
-
-        let mut results = vec![];
-        for data in new_content {
-            results.extend(self.accept(data));
-        }
-        results
     }
 
     fn persist(&self, data: &serde_json::Value) {
@@ -271,7 +222,7 @@ impl Sessions {
         let state_dir = std::path::Path::new(&home)
             .join(".local")
             .join("state")
-            .join("puzzle");
+            .join("wicket");
 
         // Load the most recent local session from disk.
         let local = Self::read_latest(&state_dir, slug);
