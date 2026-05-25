@@ -957,9 +957,15 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                                         StdoutEvent::User { is_replay: true, .. } => {
                                             gate.replayed += 1;
                                         }
-                                        StdoutEvent::Result { .. } => {
+                                        StdoutEvent::Result { subtype, .. } => {
+                                            tracing::info!(subtype = ?subtype, "result event received");
                                             if let Some(usage) = data.get("usage") {
                                                 ws_emit(ws_tx, "usage", usage.clone());
+                                            }
+                                            let is_interrupted = subtype.as_deref() == Some("error_during_execution");
+                                            if is_interrupted {
+                                                tracing::info!("sending round_interrupted lifecycle");
+                                                ws_emit(ws_tx, "lifecycle", serde_json::json!("round_interrupted"));
                                             }
                                             if gate.is_drained() {
                                                 round_done = true;
