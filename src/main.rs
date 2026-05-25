@@ -664,6 +664,63 @@ async fn handle_apply_patch(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
     }
 }
 
+// -- View image --
+
+async fn handle_view_image(ws_tx: &WsSender, data: serde_json::Value) {
+    let path_str = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    tracing::info!(path = %path_str, "view_image");
+
+    let path = std::path::Path::new(path_str);
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+
+    let file_bytes = match std::fs::read(&abs_path) {
+        Ok(b) => b,
+        Err(e) => {
+            ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                "output": format!("cannot read image: {}", e),
+                "exit_code": 1,
+            }));
+            return;
+        }
+    };
+
+    let ext = abs_path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let media_type = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => {
+            ws_emit(ws_tx, "zsh_result", serde_json::json!({
+                "output": format!("unsupported image format: {}", ext),
+                "exit_code": 1,
+            }));
+            return;
+        }
+    };
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
+
+    let content = serde_json::json!([
+        { "type": "text", "text": format!("{} ({})", abs_path.display(), media_type) },
+        { "type": "image", "data": encoded, "mimeType": media_type }
+    ]);
+
+    ws_emit(ws_tx, "zsh_result", serde_json::json!({
+        "output": serde_json::to_string(&content).unwrap_or_default(),
+        "exit_code": 0,
+    }));
+}
+
 // -- Claude turn --
 
 async fn send_interrupt(stdin: &mut tokio::process::ChildStdin) {
@@ -762,7 +819,7 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
         }
         cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
             .arg("--mcp-config").arg(&mcp_config_path)
-            .arg("--disallowed-tools").arg("Bash,Write,Edit");
+            .arg("--disallowed-tools").arg("Bash,Write,Edit,Read,Glob,Grep,Skill,ToolSearch,NotebookEdit,WebFetch,WebSearch,CronCreate,CronDelete,CronList,RemoteTrigger,TaskOutput,TaskStop,EnterWorktree,ExitWorktree,ExitPlanMode,Monitor,PushNotification,AskUserQuestion,ScheduleWakeup,ShareOnboardingGuide");
     }
 
     cmd.stdin(Stdio::piped())
@@ -920,6 +977,9 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
                     }
                     "apply_patch" => {
                         handle_apply_patch(ws_tx, slug, idata).await;
+                    }
+                    "view_image" => {
+                        handle_view_image(ws_tx, idata).await;
                     }
                     "interrupt" => {
                         tracing::info!("interrupt received during turn");
@@ -1191,6 +1251,9 @@ async fn main() {
             }
             "apply_patch" => {
                 handle_apply_patch(&ws_tx, &slug_owned, data).await;
+            }
+            "view_image" => {
+                handle_view_image(&ws_tx, data).await;
             }
             "shutdown" => {
                 tracing::info!("shutdown requested");
