@@ -44,6 +44,7 @@ pub enum ContentBlock {
 pub enum LifecycleEvent {
     RoundStarted,
     RoundCompleted,
+    RoundInterrupted,
     RoundFailed { message: String },
 }
 

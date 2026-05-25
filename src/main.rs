@@ -673,6 +673,10 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         "round_completed" => {
                                             broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
                                         }
+                                        "round_interrupted" => {
+                                            tracing::info!("round_interrupted received from easement");
+                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundInterrupted);
+                                        }
                                         _ => {
                                             tracing::debug!(lifecycle = %name, "unknown easement lifecycle");
                                         }
@@ -964,6 +968,12 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         // Was claimed or fulfilled already, put it back.
                                         pending_service = Some(pending);
                                     }
+                                }
+                            }
+                            "interrupt" => {
+                                if let Some(eid) = easement_client_id {
+                                    send_to(&clients, eid, "interrupt", serde_json::json!({}));
+                                    tracing::info!("interrupt forwarded to easement");
                                 }
                             }
                             "heartbeat" => {}
