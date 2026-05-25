@@ -1208,6 +1208,16 @@ async fn handle_mcp(
                         },
                         "required": ["patch"]
                     }
+                }, {
+                    "name": "view_image",
+                    "description": "View an image file. Returns the image inline so you can see it. Use this to view screenshots, diagrams, photos, or any image file.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Path to the image file" }
+                        },
+                        "required": ["path"]
+                    }
                 }]
             }),
         ),
@@ -1376,6 +1386,42 @@ async fn handle_mcp(
                     Err(_) => jsonrpc_response(
                         id,
                         json!({ "content": [{ "type": "text", "text": "apply_patch failed: reply dropped" }], "isError": true }),
+                    ),
+                }
+            } else if params.name == "view_image" {
+                let path = params.arguments["path"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                tracing::info!(path = %path, "view_image tool call");
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::FileOp {
+                    op: "view_image".to_string(),
+                    args: json!({ "path": path }),
+                    reply: reply_tx,
+                });
+
+                match reply_rx.await {
+                    Ok(result) => {
+                        if result.exit_code != 0 {
+                            jsonrpc_response(
+                                id,
+                                json!({ "content": [{ "type": "text", "text": result.output }], "isError": true }),
+                            )
+                        } else {
+                            match serde_json::from_str::<Value>(&result.output) {
+                                Ok(content) => jsonrpc_response(id, json!({ "content": content })),
+                                Err(_) => jsonrpc_response(
+                                    id,
+                                    json!({ "content": [{ "type": "text", "text": result.output }] }),
+                                ),
+                            }
+                        }
+                    }
+                    Err(_) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "view_image failed: reply dropped" }], "isError": true }),
                     ),
                 }
             } else if params.name == "wicket_approve" {
