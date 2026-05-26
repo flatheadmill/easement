@@ -805,8 +805,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     let mut cmd = match &effective_remote {
                                         None => Command::new("easement"),
                                         Some(host) => {
+                                            let is_orb = host.contains("orb");
                                             let mut c = Command::new("ssh");
-                                            c.arg("-R").arg("6502:localhost:6502");
+                                            if !is_orb {
+                                                c.arg("-R").arg("6502:localhost:6502");
+                                            }
                                             c.arg(host).arg("easement");
                                             c
                                         }
@@ -818,9 +821,14 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     match cmd.spawn() {
                                         Ok(mut child) => {
                                             if let Some(mut stdin) = child.stdin.take() {
+                                                let wicket_url = match remote_host.as_deref() {
+                                                    Some(h) if h.contains("orb") => "ws://host.internal:6502",
+                                                    _ => "ws://localhost:6502",
+                                                };
                                                 let bootstrap = json!({
                                                     "slug": slug,
-                                                    "timestamp": current_timestamp
+                                                    "timestamp": current_timestamp,
+                                                    "wicket_url": wicket_url
                                                 });
                                                 let mut bootstrap_json = serde_json::to_string(&bootstrap).unwrap();
                                                 bootstrap_json.push('\n');
@@ -918,8 +926,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     let mut cmd = match &effective_remote {
                                         None => Command::new("easement"),
                                         Some(host) => {
+                                            let is_orb = host.contains("orb");
                                             let mut c = Command::new("ssh");
-                                            c.arg("-R").arg("6502:localhost:6502");
+                                            if !is_orb {
+                                                c.arg("-R").arg("6502:localhost:6502");
+                                            }
                                             c.arg(host).arg("easement");
                                             c
                                         }
@@ -928,7 +939,11 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     match cmd.spawn() {
                                         Ok(mut child) => {
                                             if let Some(mut stdin) = child.stdin.take() {
-                                                let bootstrap = json!({ "slug": slug, "timestamp": current_timestamp });
+                                                let wicket_url = match remote_host.as_deref() {
+                                                    Some(h) if h.contains("orb") => "ws://host.internal:6502",
+                                                    _ => "ws://localhost:6502",
+                                                };
+                                                let bootstrap = json!({ "slug": slug, "timestamp": current_timestamp, "wicket_url": wicket_url });
                                                 let mut bj = serde_json::to_string(&bootstrap).unwrap();
                                                 bj.push('\n');
                                                 let _ = stdin.write_all(bj.as_bytes()).await;
