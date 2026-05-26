@@ -666,6 +666,8 @@ async fn handle_apply_patch(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
 
 // -- View image --
 
+const MAX_IMAGE_DIMENSION: u32 = 1568;
+
 async fn handle_view_image(ws_tx: &WsSender, data: serde_json::Value) {
     let path_str = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
     tracing::info!(path = %path_str, "view_image");
@@ -688,30 +690,49 @@ async fn handle_view_image(ws_tx: &WsSender, data: serde_json::Value) {
         }
     };
 
-    let ext = abs_path.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let media_type = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        _ => {
+    let img = match image::load_from_memory(&file_bytes) {
+        Ok(i) => i,
+        Err(e) => {
             ws_emit(ws_tx, "zsh_result", serde_json::json!({
-                "output": format!("unsupported image format: {}", ext),
+                "output": format!("cannot decode image: {}", e),
                 "exit_code": 1,
             }));
             return;
         }
     };
 
+    let (w, h) = (img.width(), img.height());
+    let needs_resize = w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION;
+
+    let (output_bytes, output_w, output_h, media_type) = if needs_resize {
+        let resized = img.resize(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION, image::imageops::FilterType::Triangle);
+        let (rw, rh) = (resized.width(), resized.height());
+        let mut buf = std::io::Cursor::new(Vec::new());
+        resized.write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap_or_else(|e| tracing::warn!("jpeg encode failed: {}", e));
+        (buf.into_inner(), rw, rh, "image/jpeg")
+    } else {
+        let ext = abs_path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let media_type = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        (file_bytes, w, h, media_type)
+    };
+
+    tracing::info!(original = format!("{}x{}", w, h), output = format!("{}x{}", output_w, output_h), resized = needs_resize, bytes = output_bytes.len(), "view_image encoded");
+
     use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&output_bytes);
 
     let content = serde_json::json!([
-        { "type": "text", "text": format!("{} ({})", abs_path.display(), media_type) },
+        { "type": "text", "text": format!("{} ({}x{} {})", abs_path.display(), output_w, output_h, media_type) },
         { "type": "image", "data": encoded, "mimeType": media_type }
     ]);
 
