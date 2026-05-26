@@ -806,6 +806,7 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
     }));
 
     let mut cmd = Command::new("claude");
+    cmd.env("MCP_TOOL_TIMEOUT", "2147483647");
     cmd.arg("--print")
         .arg("--input-format").arg("stream-json")
         .arg("--output-format").arg("stream-json")
