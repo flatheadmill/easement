@@ -544,6 +544,18 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         if easement_client_id == Some(id) {
                             easement_client_id = None;
                             tracing::info!(client_id = id, "easement client disconnected");
+                            if let Some(reply) = pending_zsh.take() {
+                                let _ = reply.send(ZshResult {
+                                    output: "easement disconnected".to_string(),
+                                    exit_code: 1,
+                                });
+                            }
+                            if let Some(pending) = pending_approval.take() {
+                                let _ = pending.reply.send(json!({
+                                    "behavior": "deny",
+                                    "message": "easement disconnected"
+                                }));
+                            }
                         }
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
@@ -640,6 +652,30 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         let effective = if host.as_deref() == Some("local") { None } else { host };
                         tracing::info!(remote_host = ?effective, "remote host set");
                         remote_host = effective.clone();
+
+                        if let Some(eid) = easement_client_id.take() {
+                            tracing::info!(client_id = eid, "disconnecting current easement for host switch");
+                            send_to(&clients, eid, "shutdown", json!({}));
+                            clients.remove(&eid);
+                            if let Some(reply) = pending_zsh.take() {
+                                let _ = reply.send(ZshResult {
+                                    output: "easement disconnected during host switch".to_string(),
+                                    exit_code: 1,
+                                });
+                            }
+                            if let Some(pending) = pending_approval.take() {
+                                let _ = pending.reply.send(json!({
+                                    "behavior": "deny",
+                                    "message": "easement disconnected during host switch"
+                                }));
+                            }
+                        }
+                        if let Some(mut child) = easement_child.take() {
+                            tokio::spawn(async move {
+                                let _ = child.wait().await;
+                            });
+                        }
+
                         let _ = reply.send(effective);
                     }
                     CoordMessage::GetRemoteHost { reply } => {
