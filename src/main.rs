@@ -445,10 +445,13 @@ impl Easement {
         });
     }
 
-    fn end_turn(&mut self) {
+    fn end_turn(&mut self) -> bool {
         self.turn = None;
-        if self.pending_host_switch.is_some() {
-            self.begin_drain();
+        if self.pending_host_switch.is_some() && matches!(self.connection, EasementConnection::Draining { .. }) {
+            self.pending_host_switch = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -755,12 +758,17 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     CoordMessage::ZshExec { command, sandboxed, reply } => {
                         tracing::info!(command = %command, sandboxed, "zsh exec request");
-                        broadcast(&clients, "tool_start", json!({
-                            "tool": "zsh",
-                            "command": command,
-                            "sandboxed": sandboxed
-                        }));
-                        if let Some(eid) = easement.client_id() {
+                        if matches!(easement.connection, EasementConnection::Draining { .. }) {
+                            let _ = reply.send(ZshResult {
+                                output: "host switch in progress, no further tool calls available".to_string(),
+                                exit_code: 1,
+                            });
+                        } else if let Some(eid) = easement.client_id() {
+                            broadcast(&clients, "tool_start", json!({
+                                "tool": "zsh",
+                                "command": command,
+                                "sandboxed": sandboxed
+                            }));
                             send_to(&clients, eid, "zsh", json!({
                                 "command": command,
                                 "sandboxed": sandboxed
@@ -775,7 +783,12 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     CoordMessage::FileOp { op, args, reply } => {
                         tracing::info!(op = %op, "file op request");
-                        if let Some(eid) = easement.client_id() {
+                        if matches!(easement.connection, EasementConnection::Draining { .. }) {
+                            let _ = reply.send(ZshResult {
+                                output: "host switch in progress, no further tool calls available".to_string(),
+                                exit_code: 1,
+                            });
+                        } else if let Some(eid) = easement.client_id() {
                             send_to(&clients, eid, &op, args);
                             easement.set_pending_mcp(reply);
                         } else {
@@ -788,22 +801,22 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     CoordMessage::SetRemoteHost { host, reply } => {
                         let effective = if host.as_deref() == Some("local") { None } else { host };
                         tracing::info!(remote_host = ?effective, "remote host set");
+                        easement.host = effective.clone();
 
                         if let Some(eid) = easement.client_id() {
                             if easement.is_idle() {
                                 send_to(&clients, eid, "shutdown", json!({}));
                                 clients.remove(&eid);
                                 easement.on_disconnected();
+                                if let Some(mut child) = easement.child.take() {
+                                    tokio::spawn(async move { let _ = child.wait().await; });
+                                }
                             } else {
-                                tracing::info!("easement busy, deferring host switch");
+                                tracing::info!("easement busy, draining before host switch");
+                                easement.pending_host_switch = Some(effective.as_deref().unwrap_or("local").to_string());
+                                easement.begin_drain();
                             }
                         }
-                        if let Some(mut child) = easement.child.take() {
-                            tokio::spawn(async move {
-                                let _ = child.wait().await;
-                            });
-                        }
-                        easement.host = effective.clone();
 
                         let _ = reply.send(effective);
                     }
@@ -852,7 +865,17 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                     "status": "completed",
                                                 }));
                                             }
-                                            easement.end_turn();
+                                            if easement.end_turn() {
+                                                if let Some(eid) = easement.client_id() {
+                                                    send_to(&clients, eid, "shutdown", json!({}));
+                                                    clients.remove(&eid);
+                                                }
+                                                easement.on_disconnected();
+                                                if let Some(mut child) = easement.child.take() {
+                                                    tokio::spawn(async move { let _ = child.wait().await; });
+                                                }
+                                                tracing::info!("easement disconnected after drain for host switch");
+                                            }
                                         }
                                         "round_interrupted" => {
                                             tracing::info!("round_interrupted received from easement");
@@ -864,7 +887,17 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                     "status": "interrupted",
                                                 }));
                                             }
-                                            easement.end_turn();
+                                            if easement.end_turn() {
+                                                if let Some(eid) = easement.client_id() {
+                                                    send_to(&clients, eid, "shutdown", json!({}));
+                                                    clients.remove(&eid);
+                                                }
+                                                easement.on_disconnected();
+                                                if let Some(mut child) = easement.child.take() {
+                                                    tokio::spawn(async move { let _ = child.wait().await; });
+                                                }
+                                                tracing::info!("easement disconnected after drain for host switch");
+                                            }
                                         }
                                         _ => {
                                             tracing::debug!(lifecycle = %name, "unknown easement lifecycle");
