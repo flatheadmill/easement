@@ -386,6 +386,7 @@ struct Easement {
     child: Option<tokio::process::Child>,
     host: Option<String>,
     pending_host_switch: Option<String>,
+    notify_on_connect: bool,
     turn: Option<TurnState>,
     pending_service: Option<PendingService>,
 }
@@ -397,6 +398,7 @@ impl Easement {
             child: None,
             host: None,
             pending_host_switch: None,
+            notify_on_connect: false,
             turn: None,
             pending_service: None,
         }
@@ -665,6 +667,25 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     CoordMessage::ClientConnected { id, session_id, protocol, timestamp, tx } => {
                         if protocol == "easement" {
                             easement.on_connected(id);
+                            if easement.notify_on_connect {
+                                easement.notify_on_connect = false;
+                                let host_name = easement.host.clone().unwrap_or_else(|| "local".to_string());
+                                let notify_msg = format!("[notification] You are now on host `{}`.", host_name);
+                                let turn_id = uuid::Uuid::new_v4().to_string();
+                                easement.begin_turn(turn_id.clone());
+                                broadcast(&clients, "turn", json!({
+                                    "event": "started",
+                                    "turn_id": turn_id,
+                                    "message": notify_msg,
+                                }));
+                                let claude_data = json!({
+                                    "message": notify_msg,
+                                    "yolo": false,
+                                    "transcript": transcript.entries()
+                                });
+                                tracing::info!(host = %host_name, "sending host notification turn");
+                                send_to(&clients, id, "claude", claude_data);
+                            }
                         } else {
                             if let Some(ref ts) = timestamp {
                                 current_timestamp = Some(ts.clone());
@@ -874,6 +895,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                 if let Some(mut child) = easement.child.take() {
                                                     tokio::spawn(async move { let _ = child.wait().await; });
                                                 }
+                                                easement.notify_on_connect = true;
                                                 tracing::info!("easement disconnected after drain for host switch");
                                             }
                                         }
@@ -896,6 +918,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                 if let Some(mut child) = easement.child.take() {
                                                     tokio::spawn(async move { let _ = child.wait().await; });
                                                 }
+                                                easement.notify_on_connect = true;
                                                 tracing::info!("easement disconnected after drain for host switch");
                                             }
                                         }
