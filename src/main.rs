@@ -320,6 +320,7 @@ enum CoordMessage {
     },
     ServiceRequest {
         request_type: String,
+        data: Value,
         reply: oneshot::Sender<ServiceResponse>,
     },
     ZshExec {
@@ -569,13 +570,19 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             });
                         }
                     }
-                    CoordMessage::ServiceRequest { request_type, reply } => {
+                    CoordMessage::ServiceRequest { request_type, data: req_data, reply } => {
                         let request_id = uuid::Uuid::new_v4().to_string();
                         tracing::info!(request_type = %request_type, id = %request_id, "service request");
-                        broadcast(&clients, "request", json!({
+                        let mut request_envelope = json!({
                             "type": request_type,
                             "id": request_id,
-                        }));
+                        });
+                        if let Some(obj) = req_data.as_object() {
+                            for (k, v) in obj {
+                                request_envelope[k.clone()] = v.clone();
+                            }
+                        }
+                        broadcast(&clients, "request", request_envelope);
                         let id_for_timeout = request_id.clone();
                         pending_service = Some(PendingService {
                             id: request_id,
@@ -1252,6 +1259,16 @@ async fn handle_mcp(
                         "properties": {},
                         "required": []
                     }
+                }, {
+                    "name": "javascript",
+                    "description": "Execute JavaScript code in the context of the active browser tab. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression. Do NOT use 'return' statements. Output is sanitized to block credentials, tokens, and cookies.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "code": { "type": "string", "description": "The JavaScript code to execute. The result of the last expression is returned automatically." }
+                        },
+                        "required": ["code"]
+                    }
                 }]
             }),
         ),
@@ -1458,12 +1475,65 @@ async fn handle_mcp(
                         json!({ "content": [{ "type": "text", "text": "view_image failed: reply dropped" }], "isError": true }),
                     ),
                 }
+            } else if params.name == "javascript" {
+                let code = params.arguments["code"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                tracing::info!("javascript tool call");
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::ServiceRequest {
+                    request_type: "javascript".to_string(),
+                    data: json!({ "code": code }),
+                    reply: reply_tx,
+                });
+
+                match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+                    Ok(Ok(resp)) => {
+                        use base64::Engine;
+                        let body = base64::engine::general_purpose::STANDARD.decode(&resp.body).unwrap_or_default();
+                        let body_str = String::from_utf8_lossy(&body);
+
+                        match serde_json::from_str::<Value>(&body_str) {
+                            Ok(result) => {
+                                if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                                    jsonrpc_response(
+                                        id,
+                                        json!({ "content": [{ "type": "text", "text": error }], "isError": true }),
+                                    )
+                                } else {
+                                    let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                                    jsonrpc_response(
+                                        id,
+                                        json!({ "content": [{ "type": "text", "text": output }] }),
+                                    )
+                                }
+                            }
+                            Err(_) => {
+                                jsonrpc_response(
+                                    id,
+                                    json!({ "content": [{ "type": "text", "text": body_str }] }),
+                                )
+                            }
+                        }
+                    }
+                    Ok(Err(_)) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "javascript failed: no browser companion connected" }], "isError": true }),
+                    ),
+                    Err(_) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "javascript execution timed out" }], "isError": true }),
+                    ),
+                }
             } else if params.name == "screenshot" {
                 tracing::info!("screenshot tool call");
 
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let _ = coord_tx.send(CoordMessage::ServiceRequest {
                     request_type: "capture".to_string(),
+                    data: json!({}),
                     reply: reply_tx,
                 });
 
@@ -1570,6 +1640,7 @@ async fn handle_capture(
     let (reply_tx, reply_rx) = oneshot::channel();
     let _ = coord_tx.send(CoordMessage::ServiceRequest {
         request_type: "capture".to_string(),
+        data: json!({}),
         reply: reply_tx,
     });
 
