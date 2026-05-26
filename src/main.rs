@@ -366,6 +366,163 @@ struct PendingService {
     reply: oneshot::Sender<ServiceResponse>,
 }
 
+// -- Easement state --
+
+enum EasementConnection {
+    Disconnected,
+    Spawning,
+    Connected { client_id: u64 },
+    Draining { client_id: u64 },
+}
+
+struct TurnState {
+    turn_id: String,
+    pending_mcp: Option<oneshot::Sender<ZshResult>>,
+    pending_approval: Option<PendingApproval>,
+}
+
+struct Easement {
+    connection: EasementConnection,
+    child: Option<tokio::process::Child>,
+    host: Option<String>,
+    pending_host_switch: Option<String>,
+    turn: Option<TurnState>,
+    pending_service: Option<PendingService>,
+}
+
+impl Easement {
+    fn new() -> Self {
+        Self {
+            connection: EasementConnection::Disconnected,
+            child: None,
+            host: None,
+            pending_host_switch: None,
+            turn: None,
+            pending_service: None,
+        }
+    }
+
+    fn client_id(&self) -> Option<u64> {
+        match &self.connection {
+            EasementConnection::Connected { client_id } => Some(*client_id),
+            EasementConnection::Draining { client_id } => Some(*client_id),
+            _ => None,
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        matches!(self.connection, EasementConnection::Connected { .. })
+    }
+
+    fn is_idle(&self) -> bool {
+        self.is_connected() && self.turn.is_none()
+    }
+
+    fn is_busy(&self) -> bool {
+        self.turn.is_some()
+    }
+
+    fn needs_spawn(&self) -> bool {
+        matches!(self.connection, EasementConnection::Disconnected)
+    }
+
+    fn on_connected(&mut self, client_id: u64) {
+        self.connection = EasementConnection::Connected { client_id };
+        tracing::info!(client_id, "easement connected");
+    }
+
+    fn on_disconnected(&mut self) {
+        self.connection = EasementConnection::Disconnected;
+        self.child = None;
+        self.error_in_flight("easement disconnected");
+    }
+
+    fn begin_turn(&mut self, turn_id: String) {
+        self.turn = Some(TurnState {
+            turn_id,
+            pending_mcp: None,
+            pending_approval: None,
+        });
+    }
+
+    fn end_turn(&mut self) {
+        self.turn = None;
+        if self.pending_host_switch.is_some() {
+            self.begin_drain();
+        }
+    }
+
+    fn set_pending_mcp(&mut self, reply: oneshot::Sender<ZshResult>) {
+        if let Some(ref mut turn) = self.turn {
+            turn.pending_mcp = Some(reply);
+        }
+    }
+
+    fn resolve_mcp(&mut self, result: ZshResult) {
+        if let Some(ref mut turn) = self.turn {
+            if let Some(reply) = turn.pending_mcp.take() {
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    fn set_pending_approval(&mut self, pending: PendingApproval) {
+        if let Some(ref mut turn) = self.turn {
+            turn.pending_approval = Some(pending);
+        }
+    }
+
+    fn resolve_approval(&mut self, decision: Value) {
+        if let Some(ref mut turn) = self.turn {
+            if let Some(pending) = turn.pending_approval.take() {
+                let _ = pending.reply.send(decision);
+            }
+        }
+    }
+
+    fn request_host_switch(&mut self, host: Option<String>) {
+        let effective = if host.as_deref() == Some("local") { None } else { host };
+        if self.is_idle() {
+            self.host = effective;
+            self.pending_host_switch = None;
+            self.begin_drain();
+        } else if self.is_busy() {
+            self.pending_host_switch = Some("pending".to_string());
+            self.host = effective;
+        } else {
+            self.host = effective;
+        }
+    }
+
+    fn begin_drain(&mut self) {
+        if let Some(client_id) = self.client_id() {
+            self.connection = EasementConnection::Draining { client_id };
+            tracing::info!(client_id, "easement draining");
+        }
+    }
+
+    fn error_in_flight(&mut self, message: &str) {
+        if let Some(turn) = self.turn.take() {
+            if let Some(reply) = turn.pending_mcp {
+                let _ = reply.send(ZshResult {
+                    output: message.to_string(),
+                    exit_code: 1,
+                });
+            }
+            if let Some(pending) = turn.pending_approval {
+                let _ = pending.reply.send(serde_json::json!({
+                    "behavior": "deny",
+                    "message": message,
+                }));
+            }
+        }
+    }
+
+    fn active_turn_id(&self) -> Option<&str> {
+        self.turn.as_ref().map(|t| t.turn_id.as_str())
+    }
+}
+
 // -- MCP JSON-RPC types --
 
 #[derive(Debug, serde::Deserialize)]
@@ -487,14 +644,8 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
     let mut clients: Clients = HashMap::new();
 
-    let mut easement_client_id: Option<u64> = None;
-    let mut easement_child: Option<tokio::process::Child> = None;
-    let mut pending_approval: Option<PendingApproval> = None;
-    let mut pending_service: Option<PendingService> = None;
-    let mut pending_zsh: Option<oneshot::Sender<ZshResult>> = None;
+    let mut easement = Easement::new();
     let mut last_usage: Option<Value> = None;
-    let mut remote_host: Option<String> = None;
-    let mut active_turn_id: Option<String> = None;
     let mut current_timestamp: Option<String> = None;
 
     tracing::info!(
@@ -510,8 +661,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                 match msg {
                     CoordMessage::ClientConnected { id, session_id, protocol, timestamp, tx } => {
                         if protocol == "easement" {
-                            easement_client_id = Some(id);
-                            tracing::info!(client_id = id, "easement client connected");
+                            easement.on_connected(id);
                         } else {
                             if let Some(ref ts) = timestamp {
                                 current_timestamp = Some(ts.clone());
@@ -541,21 +691,8 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     CoordMessage::ClientDisconnected { id } => {
                         clients.remove(&id);
-                        if easement_client_id == Some(id) {
-                            easement_client_id = None;
-                            tracing::info!(client_id = id, "easement client disconnected");
-                            if let Some(reply) = pending_zsh.take() {
-                                let _ = reply.send(ZshResult {
-                                    output: "easement disconnected".to_string(),
-                                    exit_code: 1,
-                                });
-                            }
-                            if let Some(pending) = pending_approval.take() {
-                                let _ = pending.reply.send(json!({
-                                    "behavior": "deny",
-                                    "message": "easement disconnected"
-                                }));
-                            }
+                        if easement.client_id() == Some(id) {
+                            easement.on_disconnected();
                         }
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
@@ -576,7 +713,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 "tool_use_id": tool_use_id,
                             });
                             broadcast_approval(&clients, request_data);
-                            pending_approval = Some(PendingApproval {
+                            easement.set_pending_approval(PendingApproval {
                                 reply,
                                 original_input: input,
                             });
@@ -596,7 +733,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         }
                         broadcast(&clients, "request", request_envelope);
                         let id_for_timeout = request_id.clone();
-                        pending_service = Some(PendingService {
+                        easement.pending_service = Some(PendingService {
                             id: request_id,
                             reply,
                         });
@@ -623,12 +760,12 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             "command": command,
                             "sandboxed": sandboxed
                         }));
-                        if let Some(eid) = easement_client_id {
+                        if let Some(eid) = easement.client_id() {
                             send_to(&clients, eid, "zsh", json!({
                                 "command": command,
                                 "sandboxed": sandboxed
                             }));
-                            pending_zsh = Some(reply);
+                            easement.set_pending_mcp(reply);
                         } else {
                             let _ = reply.send(ZshResult {
                                 output: "no easement connected".to_string(),
@@ -638,9 +775,9 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     CoordMessage::FileOp { op, args, reply } => {
                         tracing::info!(op = %op, "file op request");
-                        if let Some(eid) = easement_client_id {
+                        if let Some(eid) = easement.client_id() {
                             send_to(&clients, eid, &op, args);
-                            pending_zsh = Some(reply);
+                            easement.set_pending_mcp(reply);
                         } else {
                             let _ = reply.send(ZshResult {
                                 output: "no easement connected".to_string(),
@@ -651,35 +788,27 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     CoordMessage::SetRemoteHost { host, reply } => {
                         let effective = if host.as_deref() == Some("local") { None } else { host };
                         tracing::info!(remote_host = ?effective, "remote host set");
-                        remote_host = effective.clone();
 
-                        if let Some(eid) = easement_client_id.take() {
-                            tracing::info!(client_id = eid, "disconnecting current easement for host switch");
-                            send_to(&clients, eid, "shutdown", json!({}));
-                            clients.remove(&eid);
-                            if let Some(reply) = pending_zsh.take() {
-                                let _ = reply.send(ZshResult {
-                                    output: "easement disconnected during host switch".to_string(),
-                                    exit_code: 1,
-                                });
-                            }
-                            if let Some(pending) = pending_approval.take() {
-                                let _ = pending.reply.send(json!({
-                                    "behavior": "deny",
-                                    "message": "easement disconnected during host switch"
-                                }));
+                        if let Some(eid) = easement.client_id() {
+                            if easement.is_idle() {
+                                send_to(&clients, eid, "shutdown", json!({}));
+                                clients.remove(&eid);
+                                easement.on_disconnected();
+                            } else {
+                                tracing::info!("easement busy, deferring host switch");
                             }
                         }
-                        if let Some(mut child) = easement_child.take() {
+                        if let Some(mut child) = easement.child.take() {
                             tokio::spawn(async move {
                                 let _ = child.wait().await;
                             });
                         }
+                        easement.host = effective.clone();
 
                         let _ = reply.send(effective);
                     }
                     CoordMessage::GetRemoteHost { reply } => {
-                        let _ = reply.send(remote_host.clone());
+                        let _ = reply.send(easement.host.clone());
                     }
                     CoordMessage::Envelope { id, envelope } => {
                         exchange.log("client>wicket", &json!({
@@ -688,7 +817,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             "data": &envelope.data,
                         }));
 
-                        if easement_client_id == Some(id) {
+                        if easement.client_id() == Some(id) {
                             let eid = id;
                             match envelope.stream.as_str() {
                                 "delta" => {
@@ -716,26 +845,26 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                         "round_completed" => {
                                             broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
-                                            if let Some(ref tid) = active_turn_id {
+                                            if let Some(tid) = easement.active_turn_id() {
                                                 broadcast(&clients, "turn", json!({
                                                     "event": "completed",
                                                     "turn_id": tid,
                                                     "status": "completed",
                                                 }));
                                             }
-                                            active_turn_id = None;
+                                            easement.end_turn();
                                         }
                                         "round_interrupted" => {
                                             tracing::info!("round_interrupted received from easement");
                                             broadcast_lifecycle(&clients, LifecycleEvent::RoundInterrupted);
-                                            if let Some(ref tid) = active_turn_id {
+                                            if let Some(tid) = easement.active_turn_id() {
                                                 broadcast(&clients, "turn", json!({
                                                     "event": "completed",
                                                     "turn_id": tid,
                                                     "status": "interrupted",
                                                 }));
                                             }
-                                            active_turn_id = None;
+                                            easement.end_turn();
                                         }
                                         _ => {
                                             tracing::debug!(lifecycle = %name, "unknown easement lifecycle");
@@ -743,7 +872,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     }
                                 }
                                 "zsh_result" => {
-                                    if let Some(reply) = pending_zsh.take() {
+                                    {
                                         let output = envelope.data.get("output")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("")
@@ -757,7 +886,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                             "output": &output,
                                             "exit_code": exit_code
                                         }));
-                                        let _ = reply.send(ZshResult { output, exit_code });
+                                        easement.resolve_mcp(ZshResult { output, exit_code });
                                     }
                                 }
                                 "shell_result" => {
@@ -800,8 +929,8 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         match envelope.stream.as_str() {
                             "claude" => {
                                 // Spawn Easement if not connected.
-                                if easement_client_id.is_none() && easement_child.is_none() {
-                                    let effective_remote = remote_host.clone();
+                                if easement.needs_spawn() {
+                                    let effective_remote = easement.host.clone();
                                     let mut cmd = match &effective_remote {
                                         None => Command::new("easement"),
                                         Some(host) => {
@@ -821,7 +950,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     match cmd.spawn() {
                                         Ok(mut child) => {
                                             if let Some(mut stdin) = child.stdin.take() {
-                                                let wicket_url = match remote_host.as_deref() {
+                                                let wicket_url = match easement.host.as_deref() {
                                                     Some(h) if h.contains("orb") => "ws://host.internal:6502",
                                                     _ => "ws://localhost:6502",
                                                 };
@@ -837,7 +966,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                 drop(stdin);
                                             }
                                             tracing::info!("easement spawned, waiting for WebSocket connect");
-                                            easement_child = Some(child);
+                                            easement.child = Some(child);
                                         }
                                         Err(e) => {
                                             tracing::error!("failed to spawn easement: {}", e);
@@ -848,7 +977,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
                                     // Wait for Easement to connect back.
                                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                                    while easement_client_id.is_none() {
+                                    while !easement.is_connected() {
                                         if tokio::time::Instant::now() > deadline {
                                             tracing::error!("timeout waiting for easement to connect");
                                             broadcast_error(&clients, "timeout waiting for easement to connect");
@@ -861,7 +990,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         ).await {
                                             Ok(Some(CoordMessage::ClientConnected { id: cid, session_id: sid, protocol: proto, timestamp: _, tx })) => {
                                                 if proto == "easement" {
-                                                    easement_client_id = Some(cid);
+                                                    easement.on_connected(cid);
                                                     tracing::info!(client_id = cid, "easement client connected");
                                                 } else {
                                                     if let Some(sid) = sid {
@@ -886,12 +1015,12 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                     }
 
-                                    if easement_client_id.is_none() {
+                                    if !easement.is_connected() {
                                         continue;
                                     }
                                 }
 
-                                if let Some(eid) = easement_client_id {
+                                if let Some(eid) = easement.client_id() {
                                     let msg: ClaudeMessage = match serde_json::from_value(envelope.data) {
                                         Ok(m) => m,
                                         Err(e) => {
@@ -902,7 +1031,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     };
 
                                     let turn_id = msg.turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                                    active_turn_id = Some(turn_id.clone());
+                                    easement.begin_turn(turn_id.clone());
 
                                     broadcast(&clients, "turn", json!({
                                         "event": "started",
@@ -921,8 +1050,8 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             }
                             "shell" => {
                                 // Spawn Easement if not connected (same as claude handler).
-                                if easement_client_id.is_none() && easement_child.is_none() {
-                                    let effective_remote = remote_host.clone();
+                                if easement.needs_spawn() {
+                                    let effective_remote = easement.host.clone();
                                     let mut cmd = match &effective_remote {
                                         None => Command::new("easement"),
                                         Some(host) => {
@@ -939,7 +1068,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     match cmd.spawn() {
                                         Ok(mut child) => {
                                             if let Some(mut stdin) = child.stdin.take() {
-                                                let wicket_url = match remote_host.as_deref() {
+                                                let wicket_url = match easement.host.as_deref() {
                                                     Some(h) if h.contains("orb") => "ws://host.internal:6502",
                                                     _ => "ws://localhost:6502",
                                                 };
@@ -950,13 +1079,13 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                 let _ = stdin.flush().await;
                                                 drop(stdin);
                                             }
-                                            easement_child = Some(child);
+                                            easement.child = Some(child);
                                             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                                            while easement_client_id.is_none() {
+                                            while !easement.is_connected() {
                                                 if tokio::time::Instant::now() > deadline { break; }
                                                 match tokio::time::timeout(std::time::Duration::from_millis(100), coord_rx.recv()).await {
                                                     Ok(Some(CoordMessage::ClientConnected { id: cid, protocol: proto, timestamp: _, session_id: _, tx })) => {
-                                                        if proto == "easement" { easement_client_id = Some(cid); }
+                                                        if proto == "easement" { easement.on_connected(cid); }
                                                         clients.insert(cid, tx);
                                                     }
                                                     _ => {}
@@ -968,7 +1097,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                     }
                                 }
-                                if let Some(eid) = easement_client_id {
+                                if let Some(eid) = easement.client_id() {
                                     send_to(&clients, eid, "shell", envelope.data);
                                     tracing::info!("shell command forwarded to easement");
                                 } else {
@@ -976,7 +1105,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 }
                             }
                             "approval" => {
-                                if let Some(pending) = pending_approval.take() {
+                                if let Some(pending) = easement.turn.as_mut().and_then(|t| t.pending_approval.take()) {
                                     let decision: ApprovalDecision = match serde_json::from_value(envelope.data) {
                                         Ok(d) => d,
                                         Err(e) => {
@@ -1007,7 +1136,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 let claim_id = envelope.data.get("id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                if let Some(ref pending) = pending_service {
+                                if let Some(ref pending) = easement.pending_service {
                                     if pending.id == claim_id {
                                         tracing::info!(id = %claim_id, "service request claimed");
                                     }
@@ -1018,7 +1147,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                if let Some(pending) = pending_service.take() {
+                                if let Some(pending) = easement.pending_service.take() {
                                     if pending.id == resp_id {
                                         let content_type = envelope.data.get("content_type")
                                             .and_then(|v| v.as_str())
@@ -1035,7 +1164,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         let _ = pending.reply.send(ServiceResponse { content_type, body });
                                     } else {
                                         tracing::warn!(expected = %pending.id, got = %resp_id, "service response id mismatch");
-                                        pending_service = Some(pending);
+                                        easement.pending_service = Some(pending);
                                     }
                                 }
                             }
@@ -1043,19 +1172,19 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 let timeout_id = envelope.data.get("id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                if let Some(pending) = pending_service.take() {
+                                if let Some(pending) = easement.pending_service.take() {
                                     if pending.id == timeout_id {
                                         tracing::warn!(id = %timeout_id, "service request timed out (no claim)");
                                         // Drop the reply sender — the HTTP handler
                                         // will see the channel close.
                                     } else {
                                         // Was claimed or fulfilled already, put it back.
-                                        pending_service = Some(pending);
+                                        easement.pending_service = Some(pending);
                                     }
                                 }
                             }
                             "interrupt" => {
-                                if let Some(eid) = easement_client_id {
+                                if let Some(eid) = easement.client_id() {
                                     send_to(&clients, eid, "interrupt", serde_json::json!({}));
                                     tracing::info!("interrupt forwarded to easement");
                                 }
