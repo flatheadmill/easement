@@ -756,7 +756,7 @@ async fn send_interrupt(stdin: &mut tokio::process::ChildStdin) {
     let _ = stdin.flush().await;
 }
 
-async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Value, inbound_rx: &mut mpsc::Receiver<(String, serde_json::Value)>) {
+async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, wicket_url: &str, data: serde_json::Value, inbound_rx: &mut mpsc::Receiver<(String, serde_json::Value)>) {
     let home = std::env::var("HOME").unwrap_or_default();
     let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
     let yolo = data.get("yolo").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -827,11 +827,12 @@ async fn handle_claude_turn(ws_tx: &WsSender, slug: &str, data: serde_json::Valu
     } else {
         let mcp_config_path = std::env::temp_dir()
             .join(format!("easement-wicket-{}.json", slug));
+        let mcp_base = wicket_url.replace("ws://", "http://").replace("wss://", "https://");
         let mcp_config = serde_json::json!({
             "mcpServers": {
                 "wicket": {
                     "type": "http",
-                    "url": format!("http://localhost:6502/mcp/{}", slug)
+                    "url": format!("{}/mcp/{}", mcp_base, slug)
                 }
             }
         });
@@ -1169,8 +1170,14 @@ async fn main() {
     let _ = std::fs::create_dir_all(&pane_dir);
 
     // Connect to Wicket.
-    let wicket_url = "ws://localhost:6502";
-    let (ws_stream, _) = match tokio_tungstenite::connect_async(wicket_url).await {
+    let wicket_url = match bootstrap.get("wicket_url").and_then(|v| v.as_str()) {
+        Some(url) => url.to_string(),
+        None => {
+            eprintln!("wicket_url not in bootstrap");
+            std::process::exit(1);
+        }
+    };
+    let (ws_stream, _) = match tokio_tungstenite::connect_async(&wicket_url).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "cannot connect to wicket");
@@ -1235,7 +1242,7 @@ async fn main() {
     while let Some((stream, data)) = inbound_rx.recv().await {
         match stream.as_str() {
             "claude" => {
-                handle_claude_turn(&ws_tx, &slug_owned, data, &mut inbound_rx).await;
+                handle_claude_turn(&ws_tx, &slug_owned, &wicket_url, data, &mut inbound_rx).await;
             }
             "zsh" => {
                 handle_zsh(&ws_tx, &slug_owned, data).await;
