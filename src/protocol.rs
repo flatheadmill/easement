@@ -74,6 +74,8 @@ pub struct ClaudeMessage {
     pub remote: Option<String>,
     #[serde(default)]
     pub yolo: bool,
+    #[serde(default)]
+    pub turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

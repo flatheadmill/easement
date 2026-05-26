@@ -493,6 +493,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut pending_zsh: Option<oneshot::Sender<ZshResult>> = None;
     let mut last_usage: Option<Value> = None;
     let mut remote_host: Option<String> = None;
+    let mut active_turn_id: Option<String> = None;
     let mut current_timestamp: Option<String> = None;
 
     tracing::info!(
@@ -672,10 +673,26 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                         "round_completed" => {
                                             broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
+                                            if let Some(ref tid) = active_turn_id {
+                                                broadcast(&clients, "turn", json!({
+                                                    "event": "completed",
+                                                    "turn_id": tid,
+                                                    "status": "completed",
+                                                }));
+                                            }
+                                            active_turn_id = None;
                                         }
                                         "round_interrupted" => {
                                             tracing::info!("round_interrupted received from easement");
                                             broadcast_lifecycle(&clients, LifecycleEvent::RoundInterrupted);
+                                            if let Some(ref tid) = active_turn_id {
+                                                broadcast(&clients, "turn", json!({
+                                                    "event": "completed",
+                                                    "turn_id": tid,
+                                                    "status": "interrupted",
+                                                }));
+                                            }
+                                            active_turn_id = None;
                                         }
                                         _ => {
                                             tracing::debug!(lifecycle = %name, "unknown easement lifecycle");
@@ -833,12 +850,21 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                     };
 
+                                    let turn_id = msg.turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                    active_turn_id = Some(turn_id.clone());
+
+                                    broadcast(&clients, "turn", json!({
+                                        "event": "started",
+                                        "turn_id": turn_id,
+                                        "message": msg.message,
+                                    }));
+
                                     let claude_data = json!({
                                         "message": msg.message,
                                         "yolo": msg.yolo,
                                         "transcript": transcript.entries()
                                     });
-                                    tracing::info!(transcript_entries = transcript.entries().len(), "forwarding claude envelope to easement");
+                                    tracing::info!(turn_id = %turn_id, transcript_entries = transcript.entries().len(), "forwarding claude envelope to easement");
                                     send_to(&clients, eid, "claude", claude_data);
                                 }
                             }
@@ -1218,6 +1244,14 @@ async fn handle_mcp(
                         },
                         "required": ["path"]
                     }
+                }, {
+                    "name": "screenshot",
+                    "description": "Capture a screenshot of the active browser tab. Returns the image inline. The browser companion (Shotgun) must be connected.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
                 }]
             }),
         ),
@@ -1422,6 +1456,39 @@ async fn handle_mcp(
                     Err(_) => jsonrpc_response(
                         id,
                         json!({ "content": [{ "type": "text", "text": "view_image failed: reply dropped" }], "isError": true }),
+                    ),
+                }
+            } else if params.name == "screenshot" {
+                tracing::info!("screenshot tool call");
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::ServiceRequest {
+                    request_type: "capture".to_string(),
+                    reply: reply_tx,
+                });
+
+                match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+                    Ok(Ok(resp)) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&resp.body);
+                        let media_type = resp.content_type;
+                        jsonrpc_response(
+                            id,
+                            json!({
+                                "content": [
+                                    { "type": "text", "text": format!("screenshot ({})", media_type) },
+                                    { "type": "image", "data": b64, "mimeType": media_type }
+                                ]
+                            }),
+                        )
+                    }
+                    Ok(Err(_)) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "screenshot failed: no browser companion connected" }], "isError": true }),
+                    ),
+                    Err(_) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "screenshot timed out" }], "isError": true }),
                     ),
                 }
             } else if params.name == "wicket_approve" {
@@ -1630,6 +1697,65 @@ async fn handle_request(
                     .body(Full::new(Bytes::from(body)))
                     .unwrap())
             }
+        }
+    } else if let Some(slug) = path.strip_prefix("/turn/") {
+        if slug.is_empty() {
+            Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("missing slug in /turn/<slug>")))
+                .unwrap())
+        } else if req.method() != hyper::Method::POST {
+            Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        } else {
+            let slug = slug.to_string();
+            let body = req.collect().await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            let message = payload.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if message.is_empty() {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from("missing message")))
+                    .unwrap());
+            }
+
+            let coord_tx = {
+                let mut state = server.write().await;
+                let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let slug_clone = slug.clone();
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        run_coordinator(slug_clone, tx_clone, rx).await;
+                    });
+                    CoordinatorHandle { tx }
+                });
+                handle.tx.clone()
+            };
+
+            let _ = coord_tx.send(CoordMessage::Envelope {
+                id: 0,
+                envelope: InboundEnvelope {
+                    stream: "claude".to_string(),
+                    data: json!({ "message": message }),
+                },
+            });
+
+            tracing::info!(slug = %slug, "system turn initiated via HTTP");
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(json!({"status": "ok"}).to_string())))
+                .unwrap())
         }
     } else if path == "/health" {
         Ok(Response::builder()
