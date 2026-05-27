@@ -829,6 +829,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 send_to(&clients, eid, "shutdown", json!({}));
                                 clients.remove(&eid);
                                 easement.on_disconnected();
+                                easement.notify_on_connect = true;
                                 if let Some(mut child) = easement.child.take() {
                                     tokio::spawn(async move { let _ = child.wait().await; });
                                 }
