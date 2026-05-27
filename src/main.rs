@@ -1093,7 +1093,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         }
                                     };
 
-                                    let turn_id = msg.turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                    let turn_id = uuid::Uuid::new_v4().to_string();
                                     easement.begin_turn(turn_id.clone());
 
                                     broadcast(&clients, "turn", json!({
