@@ -667,25 +667,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     CoordMessage::ClientConnected { id, session_id, protocol, timestamp, tx } => {
                         if protocol == "easement" {
                             easement.on_connected(id);
-                            if easement.notify_on_connect {
-                                easement.notify_on_connect = false;
-                                let host_name = easement.host.clone().unwrap_or_else(|| "local".to_string());
-                                let notify_msg = format!("[notification] You are now on host `{}`.", host_name);
-                                let turn_id = uuid::Uuid::new_v4().to_string();
-                                easement.begin_turn(turn_id.clone());
-                                broadcast(&clients, "turn", json!({
-                                    "event": "started",
-                                    "turn_id": turn_id,
-                                    "message": notify_msg,
-                                }));
-                                let claude_data = json!({
-                                    "message": notify_msg,
-                                    "yolo": false,
-                                    "transcript": transcript.entries()
-                                });
-                                tracing::info!(host = %host_name, "sending host notification turn");
-                                send_to(&clients, id, "claude", claude_data);
-                            }
+                            easement.notify_on_connect = false;
                         } else {
                             if let Some(ref ts) = timestamp {
                                 current_timestamp = Some(ts.clone());
@@ -898,6 +880,18 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                 }
                                                 easement.notify_on_connect = true;
                                                 tracing::info!("easement disconnected after drain for host switch");
+                                                let host_name = easement.host.clone().unwrap_or_else(|| "local".to_string());
+                                                let notify_msg = format!("[notification] You are now on host `{}`.", host_name);
+                                                let coord_tx_notify = coord_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let _ = coord_tx_notify.send(CoordMessage::Envelope {
+                                                        id: 0,
+                                                        envelope: InboundEnvelope {
+                                                            stream: "claude".to_string(),
+                                                            data: json!({ "message": notify_msg }),
+                                                        },
+                                                    });
+                                                });
                                             }
                                         }
                                         "round_interrupted" => {
@@ -921,6 +915,18 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                 }
                                                 easement.notify_on_connect = true;
                                                 tracing::info!("easement disconnected after drain for host switch");
+                                                let host_name = easement.host.clone().unwrap_or_else(|| "local".to_string());
+                                                let notify_msg = format!("[notification] You are now on host `{}`.", host_name);
+                                                let coord_tx_notify = coord_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let _ = coord_tx_notify.send(CoordMessage::Envelope {
+                                                        id: 0,
+                                                        envelope: InboundEnvelope {
+                                                            stream: "claude".to_string(),
+                                                            data: json!({ "message": notify_msg }),
+                                                        },
+                                                    });
+                                                });
                                             }
                                         }
                                         _ => {
