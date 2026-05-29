@@ -790,16 +790,40 @@ fn spawn_smedly(host: &str, slug: &str) -> Result<tokio::process::Child, String>
 
 // -- Coordinator (per-slug) --
 
+use std::collections::BTreeMap;
+
+struct TranscriptSlot {
+    transcript: Transcript,
+    entries: Vec<NormalizedEntry>,
+}
+
+impl TranscriptSlot {
+    fn new(slug: &str, timestamp: Option<&str>) -> Self {
+        let mut transcript = Transcript::new(slug, timestamp);
+        let entries = transcript.load_history();
+        Self { transcript, entries }
+    }
+}
+
+fn current_slot(transcripts: &mut BTreeMap<String, TranscriptSlot>) -> Option<&mut TranscriptSlot> {
+    transcripts.values_mut().last()
+}
+
+fn full_slot(transcripts: &mut BTreeMap<String, TranscriptSlot>) -> Option<&mut TranscriptSlot> {
+    let len = transcripts.len();
+    if len < 2 { return None; }
+    transcripts.values_mut().rev().nth(1)
+}
+
 async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
     let exchange = ExchangeLog::new(&slug);
-    let mut transcript = Transcript::new(&slug, None);
-    let history = transcript.load_history();
+    let mut transcripts: BTreeMap<String, TranscriptSlot> = BTreeMap::new();
+    let default_ts = "default".to_string();
+    transcripts.insert(default_ts.clone(), TranscriptSlot::new(&slug, None));
 
-    let mut all_entries: Vec<NormalizedEntry> = history;
     let mut clients: Clients = HashMap::new();
     let mut claude: Option<ClaudePrint> = None;
     let mut last_usage: Option<Value> = None;
-    let mut current_timestamp: Option<String> = None;
     let mut pending_service: Option<PendingService> = None;
     let mut smedlys: HashMap<String, u64> = HashMap::new();
     let mut smedly_children: Vec<tokio::process::Child> = Vec::new();
@@ -811,9 +835,10 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
     let mut pending_message_reply: Option<oneshot::Sender<String>> = None;
     let mut response_accumulator: String = String::new();
 
+    let history_count = transcripts.values().map(|s| s.entries.len()).sum::<usize>();
     tracing::info!(
         slug = %slug,
-        history = all_entries.len(),
+        history = history_count,
         "coordinator started"
     );
 
@@ -845,16 +870,18 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             continue;
                         }
                         if let Some(ref ts) = timestamp {
-                            current_timestamp = Some(ts.clone());
-                            transcript = Transcript::new(&slug, Some(ts));
-                            let history = transcript.load_history();
-                            all_entries = history;
-                            tracing::info!(timestamp = %ts, entries = all_entries.len(), "switched to timestamped transcript");
+                            if !transcripts.contains_key(ts) {
+                                transcripts.insert(ts.clone(), TranscriptSlot::new(&slug, Some(ts)));
+                            }
+                            let slot = transcripts.get(ts).unwrap();
+                            tracing::info!(timestamp = %ts, entries = slot.entries.len(), "client using timestamped transcript");
                         }
-                        for entry in &all_entries {
-                            if let Ok(data) = serde_json::to_value(entry) {
-                                if let Some(json) = envelope_json("entry", data) {
-                                    let _ = tx.send(json);
+                        if let Some(slot) = current_slot(&mut transcripts) {
+                            for entry in &slot.entries {
+                                if let Ok(data) = serde_json::to_value(entry) {
+                                    if let Some(json) = envelope_json("entry", data) {
+                                        let _ = tx.send(json);
+                                    }
                                 }
                             }
                         }
@@ -952,7 +979,11 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 "text": message,
                             }));
                             broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
-                            let entries = transcript.entries().to_vec();
+                            let entries = if full {
+                                full_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default()
+                            } else {
+                                current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default()
+                            };
                             match spawn_claude_print(&slug, &message, &entries).await {
                                 Ok(mut cp) => {
                                     cp.turn_id = Some(turn_id);
@@ -969,9 +1000,7 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                     CoordMessage::NewSession { reply } => {
                         let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
                         tracing::info!(timestamp = %ts, "new session");
-                        current_timestamp = Some(ts.clone());
-                        transcript = Transcript::new(&slug, Some(&ts));
-                        all_entries = vec![];
+                        transcripts.insert(ts.clone(), TranscriptSlot::new(&slug, Some(&ts)));
                         let _ = reply.send(ts);
                     }
                     CoordMessage::Envelope { id, envelope } => {
@@ -1005,7 +1034,7 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 }));
                                 broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
 
-                                let entries = transcript.entries().to_vec();
+                                let entries = current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default();
                                 tracing::info!(turn_id = %turn_id, transcript_entries = entries.len(), "spawning ClaudePrint");
 
                                 match spawn_claude_print(&slug, &message, &entries).await {
@@ -1313,10 +1342,12 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                             let line = line.trim();
                                             if line.is_empty() { continue; }
                                             if let Ok(data) = serde_json::from_str::<Value>(line) {
-                                                let new_entries = transcript.handle_entry(data);
-                                                for entry in &new_entries {
-                                                    broadcast_entry(&clients, entry);
-                                                    all_entries.push(entry.clone());
+                                                if let Some(slot) = current_slot(&mut transcripts) {
+                                                    let new_entries = slot.transcript.handle_entry(data);
+                                                    for entry in &new_entries {
+                                                        broadcast_entry(&clients, entry);
+                                                        slot.entries.push(entry.clone());
+                                                    }
                                                 }
                                             }
                                         }
@@ -1353,7 +1384,7 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                     "turn_id": turn_id,
                                 }));
                                 broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
-                                let entries = transcript.entries().to_vec();
+                                let entries = current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default();
                                 match spawn_claude_print(&slug, &next_message, &entries).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
@@ -1384,10 +1415,12 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                         let line = line.trim();
                                         if line.is_empty() { continue; }
                                         if let Ok(data) = serde_json::from_str::<Value>(line) {
-                                            let new_entries = transcript.handle_entry(data);
-                                            for entry in &new_entries {
-                                                broadcast_entry(&clients, entry);
-                                                all_entries.push(entry.clone());
+                                            if let Some(slot) = current_slot(&mut transcripts) {
+                                                let new_entries = slot.transcript.handle_entry(data);
+                                                for entry in &new_entries {
+                                                    broadcast_entry(&clients, entry);
+                                                    slot.entries.push(entry.clone());
+                                                }
                                             }
                                         }
                                     }
