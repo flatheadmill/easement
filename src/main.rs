@@ -1125,6 +1125,16 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         tracing::info!(session_id = %sid, "captured session id from claude");
                         cp.session_id = Some(sid);
                     }
+                    // The CLI echoes every user message we wrote to stdin as a
+                    // replay event. The first replay is the kickoff message
+                    // (the turn start). Replays after that are steers we
+                    // injected before tool calls. We count replays for the
+                    // drain gate and broadcast steer acks to clear the TUI
+                    // preview. A stronger assertion would count queued_command
+                    // attachment entries in the CLI's transcript file after the
+                    // round and panic if the count doesn't match drain_sent - 1.
+                    // See easement/observations/transcripts.md, concern on
+                    // attachment entries.
                     ClaudeEvent::Replay { message } => {
                         cp.drain_replayed += 1;
                         let is_steer_ack = cp.drain_replayed > 1;
