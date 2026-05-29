@@ -65,6 +65,8 @@ pub struct ConnectPayload {
     pub protocol: Option<String>,
     #[serde(default)]
     pub timestamp: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

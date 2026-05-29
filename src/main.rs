@@ -3,15 +3,10 @@
 // Clients (Puzzle, Shotgun) connect over WebSocket. Claude's MCP approval
 // requests arrive over HTTP at /mcp/<slug>. One process, one port.
 //
-// Each slug gets its own coordinator task that manages Easement lifecycle,
-// transcript persistence, drain gate, and session tracking. Clients
+// Each slug gets its own coordinator task that manages the ClaudePrint
+// lifecycle, transcript persistence, and client broadcasting. Clients
 // register with the coordinator for their slug and receive normalized
 // entries and lifecycle events.
-//
-// The Easement-facing edge is Unix process management: spawn per round,
-// piped stdin/stdout, NDJSON. The client-facing edge is WebSocket JSON
-// envelopes. The MCP approval edge is HTTP JSON-RPC. These three worlds
-// meet in the coordinator.
 
 mod normalize;
 mod parser;
@@ -22,6 +17,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -44,15 +40,12 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::protocol::{
-    ApprovalDecision, ClaudeMessage, ConnectPayload, InboundEnvelope, LifecycleEvent,
+    ClaudeMessage, ConnectPayload, InboundEnvelope, LifecycleEvent,
     NormalizedEntry,
 };
-use crate::transcript::{Sessions, Transcript};
+use crate::transcript::Transcript;
 
 // -- Exchange log --
-//
-// Per-slug JSONL log of every envelope in both directions. Each line:
-// {"ts":"...","dir":"easement>wicket","data":{...}}
 
 struct ExchangeLog {
     path: std::path::PathBuf,
@@ -90,7 +83,7 @@ impl ExchangeLog {
     }
 }
 
-// -- Stdout event types from Easement --
+// -- Stdout event types from Claude CLI --
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -129,14 +122,6 @@ enum StdoutEvent {
     Unknown,
 }
 
-// -- Easement envelope from stdout --
-
-#[derive(Debug, serde::Deserialize)]
-struct EasementEnvelope {
-    stream: String,
-    data: Value,
-}
-
 // -- Output envelope --
 
 #[derive(Debug, Serialize)]
@@ -147,22 +132,6 @@ struct OutEnvelope<'a> {
 
 fn envelope_json(stream: &str, data: Value) -> Option<String> {
     serde_json::to_string(&OutEnvelope { stream, data }).ok()
-}
-
-// -- Easement payload --
-
-#[derive(Debug, Serialize)]
-struct EasementPayload {
-    slug: String,
-    #[serde(default)]
-    yolo: bool,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    transcript: Option<Vec<Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    wicket_socket: Option<String>,
 }
 
 // -- Logging --
@@ -196,74 +165,205 @@ fn init_tracing() -> WorkerGuard {
     guard
 }
 
-// -- Drain gate --
+// -- ClaudePrint: stdin message formatting --
 
-struct DrainGate {
-    sent: u64,
-    replayed: u64,
-    drained: bool,
-    session_id: Option<String>,
+#[derive(Debug, Serialize)]
+struct UserMessage {
+    r#type: &'static str,
+    message: UserMessageContent,
+    uuid: String,
 }
 
-impl DrainGate {
-    fn new() -> Self {
-        Self {
-            sent: 1,
-            replayed: 0,
-            drained: false,
-            session_id: None,
-        }
+#[derive(Debug, Serialize)]
+struct UserMessageContent {
+    role: &'static str,
+    content: String,
+}
+
+fn format_user_message(content: &str) -> String {
+    let msg = UserMessage {
+        r#type: "user",
+        message: UserMessageContent {
+            role: "user",
+            content: content.to_string(),
+        },
+        uuid: uuid::Uuid::new_v4().to_string(),
+    };
+    let mut s = serde_json::to_string(&msg).expect("UserMessage serialization cannot fail");
+    s.push('\n');
+    s
+}
+
+// -- ClaudePrint: events from the stdout reader task --
+
+enum ClaudeEvent {
+    Delta(Value),
+    Replay,
+    Result { usage: Option<Value>, is_interrupted: bool },
+    SessionId(String),
+    Eof,
+}
+
+// -- ClaudePrint: trust injection --
+
+fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
+    let lock_path = config_path.with_extension("json.lock");
+    if std::fs::create_dir(&lock_path).is_err() {
+        return Err("lock contention".to_string());
     }
 
-    fn handle(&mut self, event: &StdoutEvent) -> bool {
-        if self.session_id.is_none() {
-            let event_sid = match event {
-                StdoutEvent::System { session_id, .. } => session_id.as_ref(),
-                StdoutEvent::Result { session_id, .. } => session_id.as_ref(),
-                StdoutEvent::Assistant { session_id, .. } => session_id.as_ref(),
-                StdoutEvent::User { session_id, .. } => session_id.as_ref(),
-                _ => None,
-            };
-            if let Some(id) = event_sid {
-                tracing::info!(session_id = %id, "captured session id");
-                self.session_id = Some(id.clone());
+    let result = (|| -> Result<(), String> {
+        let mut config: Value = match std::fs::read_to_string(config_path) {
+            Ok(content) => serde_json::from_str(&content).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Value::Object(serde_json::Map::new())
             }
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let already = config
+            .get("projects")
+            .and_then(|p| p.get(directory))
+            .and_then(|e| e.get("hasTrustDialogAccepted"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
+
+        if already {
+            return Ok(());
         }
 
-        match event {
-            StdoutEvent::User {
-                is_replay: true, ..
-            } => {
-                self.replayed += 1;
-                tracing::debug!(
-                    sent = self.sent,
-                    replayed = self.replayed,
-                    "user replay, drain gate: {}/{}",
-                    self.replayed,
-                    self.sent
-                );
-            }
-            StdoutEvent::Result { .. } => {
-                tracing::info!(
-                    sent = self.sent,
-                    replayed = self.replayed,
-                    drained = (self.sent == self.replayed),
-                    "result event, drain gate: {}/{}",
-                    self.replayed,
-                    self.sent
-                );
-                if self.sent == self.replayed {
-                    self.drained = true;
-                    return true;
+        let obj = config.as_object_mut().ok_or("config not an object")?;
+        let projects = obj
+            .entry("projects")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let project = projects
+            .as_object_mut()
+            .ok_or("projects not an object")?
+            .entry(directory)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        project
+            .as_object_mut()
+            .ok_or("project entry not an object")?
+            .insert(
+                "hasTrustDialogAccepted".to_string(),
+                Value::Bool(true),
+            );
+
+        let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+        std::fs::write(config_path, &content).map_err(|e| e.to_string())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                config_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+
+        tracing::info!(directory, "trust injected");
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_dir(&lock_path);
+    result
+}
+
+// -- ClaudePrint: round log --
+
+struct RoundLog {
+    dir: PathBuf,
+}
+
+impl RoundLog {
+    fn begin(slug: &str) -> Self {
+        let home = env::var("HOME").unwrap_or_default();
+        let now = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+        let pid = std::process::id();
+        let dir = Path::new(&home)
+            .join(".local/state/easement")
+            .join(slug)
+            .join("rounds")
+            .join(format!("{}-{}", now, pid));
+        let _ = std::fs::create_dir_all(&dir);
+        tracing::info!(round_dir = %dir.display(), "round log started");
+        Self { dir }
+    }
+
+    fn log_sent(&self, entries: &[Value]) {
+        let path = self.dir.join("sent.jsonl");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+        {
+            for entry in entries {
+                if let Ok(mut line) = serde_json::to_string(entry) {
+                    line.push('\n');
+                    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
                 }
             }
-            _ => {}
         }
-        false
     }
 
-    fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+    fn log_stdout(&self, raw_line: &str) {
+        let path = self.dir.join("stdout.jsonl");
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let entry = json!({ "ts": now, "line": raw_line });
+        if let Ok(mut line) = serde_json::to_string(&entry) {
+            line.push('\n');
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+            }
+        }
+    }
+
+    fn copy_transcript(&self, cli_transcript: &Path) {
+        let dest = self.dir.join("transcript.jsonl");
+        if let Err(e) = std::fs::copy(cli_transcript, &dest) {
+            tracing::warn!(error = %e, "failed to copy CLI transcript to round log");
+        }
+    }
+}
+
+// -- ClaudePrint: transcript file discovery --
+
+fn find_transcript_file(session_id: &str) -> Option<PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    let projects_dir = Path::new(&home).join(".claude").join("projects");
+    let target = format!("{}.jsonl", session_id);
+    for entry in std::fs::read_dir(&projects_dir).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_type().ok()?.is_dir() {
+            let candidate = entry.path().join(&target);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+// -- ClaudePrint state --
+
+struct ClaudePrint {
+    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    event_rx: mpsc::Receiver<ClaudeEvent>,
+    session_id: Option<String>,
+    drain_sent: u64,
+    drain_replayed: u64,
+    turn_id: Option<String>,
+    round_log: Arc<RoundLog>,
+}
+
+impl ClaudePrint {
+    fn is_drained(&self) -> bool {
+        self.drain_sent == self.drain_replayed
     }
 }
 
@@ -300,9 +400,9 @@ struct CoordinatorHandle {
 enum CoordMessage {
     ClientConnected {
         id: u64,
-        session_id: Option<String>,
         protocol: String,
         timestamp: Option<String>,
+        host: Option<String>,
         tx: mpsc::UnboundedSender<String>,
     },
     ClientDisconnected {
@@ -312,49 +412,20 @@ enum CoordMessage {
         id: u64,
         envelope: InboundEnvelope,
     },
-    McpApprovalRequest {
-        tool_name: String,
-        input: Value,
-        tool_use_id: Option<String>,
-        reply: oneshot::Sender<Value>,
-    },
-    ServiceRequest {
-        request_type: String,
-        data: Value,
-        reply: oneshot::Sender<ServiceResponse>,
-    },
-    ZshExec {
-        command: String,
-        sandboxed: bool,
-        reply: oneshot::Sender<ZshResult>,
-    },
-    FileOp {
-        op: String,
+    ToolCall {
+        call_id: String,
+        tool: String,
         args: Value,
-        reply: oneshot::Sender<ZshResult>,
-    },
-    SetRemoteHost {
-        host: Option<String>,
-        reply: oneshot::Sender<Option<String>>,
-    },
-    GetRemoteHost {
-        reply: oneshot::Sender<Option<String>>,
+        reply: oneshot::Sender<ToolResult>,
     },
 }
 
-struct ZshResult {
+struct ToolResult {
     output: String,
     exit_code: i32,
 }
 
-// -- Pending approval state --
-
-struct PendingApproval {
-    reply: oneshot::Sender<Value>,
-    original_input: Value,
-}
-
-// -- Service request/response --
+// -- Service request/response (retained for Shotgun) --
 
 struct ServiceResponse {
     content_type: String,
@@ -366,166 +437,38 @@ struct PendingService {
     reply: oneshot::Sender<ServiceResponse>,
 }
 
-// -- Easement state --
+// -- Broadcast helpers --
 
-enum EasementConnection {
-    Disconnected,
-    Spawning,
-    Connected { client_id: u64 },
-    Draining { client_id: u64 },
+fn send_to(clients: &Clients, client_id: u64, stream: &str, data: Value) {
+    if let Some(json) = envelope_json(stream, data) {
+        if let Some(tx) = clients.get(&client_id) {
+            let _ = tx.send(json);
+        }
+    }
 }
 
-struct TurnState {
-    turn_id: String,
-    pending_mcp: Option<oneshot::Sender<ZshResult>>,
-    pending_approval: Option<PendingApproval>,
+fn broadcast(clients: &Clients, stream: &'static str, data: Value) {
+    if let Some(json) = envelope_json(stream, data) {
+        for tx in clients.values() {
+            let _ = tx.send(json.clone());
+        }
+    }
 }
 
-struct Easement {
-    connection: EasementConnection,
-    child: Option<tokio::process::Child>,
-    host: Option<String>,
-    pending_host_switch: Option<String>,
-    notify_on_connect: bool,
-    turn: Option<TurnState>,
-    pending_service: Option<PendingService>,
+fn broadcast_entry(clients: &Clients, entry: &NormalizedEntry) {
+    if let Ok(data) = serde_json::to_value(entry) {
+        broadcast(clients, "entry", data);
+    }
 }
 
-impl Easement {
-    fn new() -> Self {
-        Self {
-            connection: EasementConnection::Disconnected,
-            child: None,
-            host: None,
-            pending_host_switch: None,
-            notify_on_connect: false,
-            turn: None,
-            pending_service: None,
-        }
+fn broadcast_lifecycle(clients: &Clients, event: LifecycleEvent) {
+    if let Ok(data) = serde_json::to_value(&event) {
+        broadcast(clients, "lifecycle", data);
     }
+}
 
-    fn client_id(&self) -> Option<u64> {
-        match &self.connection {
-            EasementConnection::Connected { client_id } => Some(*client_id),
-            EasementConnection::Draining { client_id } => Some(*client_id),
-            _ => None,
-        }
-    }
-
-    fn is_connected(&self) -> bool {
-        matches!(self.connection, EasementConnection::Connected { .. })
-    }
-
-    fn is_idle(&self) -> bool {
-        self.is_connected() && self.turn.is_none()
-    }
-
-    fn is_busy(&self) -> bool {
-        self.turn.is_some()
-    }
-
-    fn needs_spawn(&self) -> bool {
-        matches!(self.connection, EasementConnection::Disconnected)
-    }
-
-    fn on_connected(&mut self, client_id: u64) {
-        self.connection = EasementConnection::Connected { client_id };
-        tracing::info!(client_id, "easement connected");
-    }
-
-    fn on_disconnected(&mut self) {
-        self.connection = EasementConnection::Disconnected;
-        self.child = None;
-        self.error_in_flight("easement disconnected");
-    }
-
-    fn begin_turn(&mut self, turn_id: String) {
-        self.turn = Some(TurnState {
-            turn_id,
-            pending_mcp: None,
-            pending_approval: None,
-        });
-    }
-
-    fn end_turn(&mut self) -> bool {
-        self.turn = None;
-        if self.pending_host_switch.is_some() && matches!(self.connection, EasementConnection::Draining { .. }) {
-            self.pending_host_switch = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn set_pending_mcp(&mut self, reply: oneshot::Sender<ZshResult>) {
-        if let Some(ref mut turn) = self.turn {
-            turn.pending_mcp = Some(reply);
-        }
-    }
-
-    fn resolve_mcp(&mut self, result: ZshResult) {
-        if let Some(ref mut turn) = self.turn {
-            if let Some(reply) = turn.pending_mcp.take() {
-                let _ = reply.send(result);
-            }
-        }
-    }
-
-    fn set_pending_approval(&mut self, pending: PendingApproval) {
-        if let Some(ref mut turn) = self.turn {
-            turn.pending_approval = Some(pending);
-        }
-    }
-
-    fn resolve_approval(&mut self, decision: Value) {
-        if let Some(ref mut turn) = self.turn {
-            if let Some(pending) = turn.pending_approval.take() {
-                let _ = pending.reply.send(decision);
-            }
-        }
-    }
-
-    fn request_host_switch(&mut self, host: Option<String>) {
-        let effective = if host.as_deref() == Some("local") { None } else { host };
-        if self.is_idle() {
-            self.host = effective;
-            self.pending_host_switch = None;
-            self.begin_drain();
-        } else if self.is_busy() {
-            self.pending_host_switch = Some("pending".to_string());
-            self.host = effective;
-        } else {
-            self.host = effective;
-        }
-    }
-
-    fn begin_drain(&mut self) {
-        if let Some(client_id) = self.client_id() {
-            self.connection = EasementConnection::Draining { client_id };
-            tracing::info!(client_id, "easement draining");
-        }
-    }
-
-    fn error_in_flight(&mut self, message: &str) {
-        if let Some(turn) = self.turn.take() {
-            if let Some(reply) = turn.pending_mcp {
-                let _ = reply.send(ZshResult {
-                    output: message.to_string(),
-                    exit_code: 1,
-                });
-            }
-            if let Some(pending) = turn.pending_approval {
-                let _ = pending.reply.send(serde_json::json!({
-                    "behavior": "deny",
-                    "message": message,
-                }));
-            }
-        }
-    }
-
-    fn active_turn_id(&self) -> Option<&str> {
-        self.turn.as_ref().map(|t| t.turn_id.as_str())
-    }
+fn broadcast_error(clients: &Clients, message: &str) {
+    broadcast(clients, "error", json!({ "message": message }));
 }
 
 // -- MCP JSON-RPC types --
@@ -556,12 +499,6 @@ struct JsonRpcError {
     message: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ToolCallParams {
-    name: String,
-    arguments: Value,
-}
-
 fn jsonrpc_response(id: Value, result: Value) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".into(),
@@ -589,69 +526,207 @@ fn make_json_response(resp: JsonRpcResponse) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-// -- Broadcast helpers --
+// -- Spawn ClaudePrint --
 
-fn send_to(clients: &Clients, client_id: u64, stream: &str, data: Value) {
-    if let Some(json) = envelope_json(stream, data) {
-        if let Some(tx) = clients.get(&client_id) {
-            let _ = tx.send(json);
+async fn spawn_claude_print(
+    slug: &str,
+    message: &str,
+    transcript_entries: &[Value],
+) -> Result<ClaudePrint, String> {
+    let home = env::var("HOME").unwrap_or_default();
+
+    let pane_dir = PathBuf::from(&home).join("pane").join(slug);
+    let _ = std::fs::create_dir_all(&pane_dir);
+    if std::env::set_current_dir(&pane_dir).is_err() {
+        return Err(format!("cannot cd to {}", pane_dir.display()));
+    }
+
+    let config_path = PathBuf::from(&home).join(".claude.json");
+    if let Err(e) = ensure_trust(&config_path, pane_dir.to_str().unwrap_or("")) {
+        tracing::warn!("failed to ensure trust: {}", e);
+    }
+
+    let round_log = Arc::new(RoundLog::begin(slug));
+
+    let mut resume_arg: Option<String> = None;
+    if !transcript_entries.is_empty() {
+        round_log.log_sent(transcript_entries);
+        let tmp_path = std::env::temp_dir().join(format!("wicket-{}.jsonl", slug));
+        let mut content = String::new();
+        for entry in transcript_entries {
+            if let Ok(line) = serde_json::to_string(entry) {
+                content.push_str(&line);
+                content.push('\n');
+            }
         }
+        std::fs::write(&tmp_path, &content)
+            .map_err(|e| format!("cannot write transcript temp file: {}", e))?;
+        resume_arg = Some(tmp_path.to_string_lossy().to_string());
     }
-}
 
-fn broadcast(clients: &Clients, stream: &'static str, data: Value) {
-    broadcast_except(clients, None, stream, data);
-}
+    tracing::info!(resume_arg = ?resume_arg, "spawning claude");
 
-fn broadcast_except(clients: &Clients, exclude: Option<u64>, stream: &'static str, data: Value) {
-    if let Some(json) = envelope_json(stream, data) {
-        for (&id, tx) in clients.iter() {
-            if exclude == Some(id) { continue; }
-            let _ = tx.send(json.clone());
+    let mut cmd = Command::new("claude");
+    cmd.env("MCP_TOOL_TIMEOUT", "2147483647");
+    cmd.arg("--print")
+        .arg("--input-format").arg("stream-json")
+        .arg("--output-format").arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--replay-user-messages")
+        .arg("--verbose")
+        .arg("--model").arg("claude-opus-4-6")
+        .arg("--thinking-display").arg("summarized")
+        .arg("--max-thinking-tokens").arg("31999")
+        .arg("--add-dir").arg(format!("{}/code", home));
+
+    let mcp_config_path = std::env::temp_dir()
+        .join(format!("wicket-mcp-{}.json", slug));
+    let mcp_config = json!({
+        "mcpServers": {
+            "wicket": {
+                "type": "http",
+                "url": format!("http://localhost:6502/mcp/{}", slug)
+            }
         }
+    });
+    if let Err(e) = std::fs::write(&mcp_config_path, mcp_config.to_string()) {
+        return Err(format!("cannot write mcp config: {}", e));
     }
-}
+    cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
+        .arg("--mcp-config").arg(&mcp_config_path)
+        .arg("--disallowed-tools").arg("Bash,Write,Edit,Read,Glob,Grep,Skill,ToolSearch,NotebookEdit,WebFetch,WebSearch,CronCreate,CronDelete,CronList,RemoteTrigger,TaskOutput,TaskStop,EnterWorktree,ExitWorktree,ExitPlanMode,Monitor,PushNotification,AskUserQuestion,ScheduleWakeup,ShareOnboardingGuide");
 
-fn broadcast_entry(clients: &Clients, entry: &NormalizedEntry) {
-    if let Ok(data) = serde_json::to_value(entry) {
-        broadcast(clients, "entry", data);
+    if let Some(ref ra) = resume_arg {
+        cmd.arg("--resume").arg(ra);
     }
-}
 
-fn broadcast_lifecycle(clients: &Clients, event: LifecycleEvent) {
-    if let Ok(data) = serde_json::to_value(&event) {
-        broadcast(clients, "lifecycle", data);
-    }
-}
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-fn broadcast_approval(clients: &Clients, data: Value) {
-    broadcast(clients, "approval", data);
-}
+    let mut child = cmd.spawn().map_err(|e| format!("cannot spawn claude: {}", e))?;
 
-fn broadcast_meta(clients: &Clients, data: Value) {
-    broadcast(clients, "meta", data);
-}
+    let mut child_stdin = child.stdin.take().expect("stdin was piped");
+    let child_stdout = child.stdout.take().expect("stdout was piped");
+    let child_stderr = child.stderr.take().expect("stderr was piped");
 
-fn broadcast_error(clients: &Clients, message: &str) {
-    broadcast(clients, "error", json!({ "message": message }));
+    // Stderr logger.
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(child_stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        tracing::warn!(stderr = %trimmed, "claude stderr");
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Send kickoff message.
+    let kickoff = format_user_message(message);
+    child_stdin.write_all(kickoff.as_bytes()).await
+        .map_err(|_| "failed to send kickoff message".to_string())?;
+    let _ = child_stdin.flush().await;
+
+    // Stdout reader task.
+    let (event_tx, event_rx) = mpsc::channel::<ClaudeEvent>(256);
+    let round_log_clone = round_log.clone();
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(child_stdout);
+        let mut line = String::new();
+        let mut session_id_sent = false;
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    let _ = event_tx.send(ClaudeEvent::Eof).await;
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    round_log_clone.log_stdout(trimmed);
+
+                    let data: Value = match serde_json::from_str(trimmed) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    if !session_id_sent {
+                        if let Some(sid) = data.get("session_id").and_then(|v| v.as_str()) {
+                            let _ = event_tx.send(ClaudeEvent::SessionId(sid.to_string())).await;
+                            session_id_sent = true;
+                        }
+                    }
+
+                    let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if event_type == "stream_event" {
+                        if let Some(event) = data.get("event") {
+                            let _ = event_tx.send(ClaudeEvent::Delta(event.clone())).await;
+                        }
+                    } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
+                        match &event {
+                            StdoutEvent::User { is_replay: true, .. } => {
+                                let _ = event_tx.send(ClaudeEvent::Replay).await;
+                            }
+                            StdoutEvent::Result { subtype, .. } => {
+                                let usage = data.get("usage").cloned();
+                                let is_interrupted = subtype.as_deref() == Some("error_during_execution");
+                                let _ = event_tx.send(ClaudeEvent::Result { usage, is_interrupted }).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = event_tx.send(ClaudeEvent::Eof).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(ClaudePrint {
+        child,
+        stdin: Some(child_stdin),
+        event_rx,
+        session_id: None,
+        drain_sent: 1,
+        drain_replayed: 0,
+        turn_id: None,
+        round_log,
+    })
 }
 
 // -- Coordinator (per-slug) --
 
-async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
+async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
     let exchange = ExchangeLog::new(&slug);
     let mut transcript = Transcript::new(&slug, None);
-    let mut sessions = Sessions::new(&slug);
     let history = transcript.load_history();
 
-    // Cache normalized entries for late-connecting clients.
     let mut all_entries: Vec<NormalizedEntry> = history;
-
     let mut clients: Clients = HashMap::new();
-
-    let mut easement = Easement::new();
+    let mut claude: Option<ClaudePrint> = None;
     let mut last_usage: Option<Value> = None;
     let mut current_timestamp: Option<String> = None;
+    let mut pending_service: Option<PendingService> = None;
+    let mut smedly_id: Option<u64> = None;
+    let mut smedly_child: Option<tokio::process::Child> = None;
+    let mut pending_tool: Option<(String, oneshot::Sender<ToolResult>)> = None;
+    let mut pending_tool_envelope: Option<(String, String, Value)> = None;
 
     tracing::info!(
         slug = %slug,
@@ -661,171 +736,110 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
     loop {
         tokio::select! {
-            // Coordinator messages (from WebSocket clients).
             Some(msg) = coord_rx.recv() => {
                 match msg {
-                    CoordMessage::ClientConnected { id, session_id, protocol, timestamp, tx } => {
-                        if protocol == "easement" {
-                            easement.on_connected(id);
-                            easement.notify_on_connect = false;
-                        } else {
-                            if let Some(ref ts) = timestamp {
-                                current_timestamp = Some(ts.clone());
-                                transcript = Transcript::new(&slug, Some(ts));
-                                let history = transcript.load_history();
-                                all_entries = history;
-                                tracing::info!(timestamp = %ts, entries = all_entries.len(), "switched to timestamped transcript");
+                    CoordMessage::ClientConnected { id, protocol, timestamp, host, tx } => {
+                        if protocol == "smedly" {
+                            smedly_id = Some(id);
+                            clients.insert(id, tx);
+                            tracing::info!(client_id = id, host = ?host, "smedly connected");
+                            if let Some((call_id, tool, args)) = pending_tool_envelope.take() {
+                                tracing::info!(call_id = %call_id, tool = %tool, "draining pending tool call to smedly");
+                                send_to(&clients, id, &tool, json!({
+                                    "call_id": call_id,
+                                    "slug": slug,
+                                    "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                    "sandboxed": args.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true),
+                                    "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
+                                    "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                                }));
+                                broadcast(&clients, "tool_start", json!({
+                                    "tool": tool,
+                                    "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                }));
                             }
-                            if let Some(sid) = session_id {
-                                sessions.set_local(sid);
-                            }
-                            for entry in &all_entries {
-                                if let Ok(data) = serde_json::to_value(entry) {
-                                    if let Some(json) = envelope_json("entry", data) {
-                                        let _ = tx.send(json);
-                                    }
-                                }
-                            }
-                            if let Some(ref usage) = last_usage {
-                                if let Some(json) = envelope_json("usage", usage.clone()) {
+                            continue;
+                        }
+                        if let Some(ref ts) = timestamp {
+                            current_timestamp = Some(ts.clone());
+                            transcript = Transcript::new(&slug, Some(ts));
+                            let history = transcript.load_history();
+                            all_entries = history;
+                            tracing::info!(timestamp = %ts, entries = all_entries.len(), "switched to timestamped transcript");
+                        }
+                        for entry in &all_entries {
+                            if let Ok(data) = serde_json::to_value(entry) {
+                                if let Some(json) = envelope_json("entry", data) {
                                     let _ = tx.send(json);
                                 }
                             }
                         }
+                        if let Some(ref usage) = last_usage {
+                            if let Some(json) = envelope_json("usage", usage.clone()) {
+                                let _ = tx.send(json);
+                            }
+                        }
                         clients.insert(id, tx);
-                        tracing::info!(client_id = id, protocol = %protocol, clients = clients.len(), "client connected");
+                        tracing::info!(client_id = id, clients = clients.len(), "client connected");
                     }
                     CoordMessage::ClientDisconnected { id } => {
                         clients.remove(&id);
-                        if easement.client_id() == Some(id) {
-                            easement.on_disconnected();
+                        if smedly_id == Some(id) {
+                            smedly_id = None;
+                            tracing::info!(client_id = id, "smedly disconnected");
+                            if let Some((call_id, reply)) = pending_tool.take() {
+                                let _ = reply.send(ToolResult {
+                                    output: "smedly disconnected".to_string(),
+                                    exit_code: 1,
+                                });
+                            }
                         }
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
-                    CoordMessage::McpApprovalRequest { tool_name, input, tool_use_id, reply } => {
-                        // Auto-approve our own MCP tools. The sandbox is the gate.
-                        // The CLI requires updatedInput as a record in the allow response.
-                        if tool_name.starts_with("mcp__wicket__") {
-                            tracing::info!(tool = %tool_name, "auto-approving wicket MCP tool");
-                            let _ = reply.send(json!({
-                                "behavior": "allow",
-                                "updatedInput": input
+                    CoordMessage::ToolCall { call_id, tool, args, reply } => {
+                        let ensure_smedly = || -> Option<u64> {
+                            // placeholder — smedly_id is captured below
+                            None
+                        };
+                        if let Some(sid) = smedly_id {
+                            tracing::info!(call_id = %call_id, tool = %tool, args = %args, "forwarding tool call to smedly");
+                            pending_tool = Some((call_id.clone(), reply));
+                            send_to(&clients, sid, &tool, json!({
+                                "call_id": call_id,
+                                "slug": slug,
+                                "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                "sandboxed": args.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true),
+                                "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
+                                "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
-                        } else {
-                            tracing::info!(tool = %tool_name, "MCP approval request");
-                            let request_data = json!({
-                                "tool_name": tool_name,
-                                "input": input,
-                                "tool_use_id": tool_use_id,
-                            });
-                            broadcast_approval(&clients, request_data);
-                            easement.set_pending_approval(PendingApproval {
-                                reply,
-                                original_input: input,
-                            });
-                        }
-                    }
-                    CoordMessage::ServiceRequest { request_type, data: req_data, reply } => {
-                        let request_id = uuid::Uuid::new_v4().to_string();
-                        tracing::info!(request_type = %request_type, id = %request_id, "service request");
-                        let mut request_envelope = json!({
-                            "type": request_type,
-                            "id": request_id,
-                        });
-                        if let Some(obj) = req_data.as_object() {
-                            for (k, v) in obj {
-                                request_envelope[k.clone()] = v.clone();
-                            }
-                        }
-                        broadcast(&clients, "request", request_envelope);
-                        let id_for_timeout = request_id.clone();
-                        easement.pending_service = Some(PendingService {
-                            id: request_id,
-                            reply,
-                        });
-                        // Claim timeout — if no client claims within 2 seconds,
-                        // fire the oneshot with a 404-equivalent empty response.
-                        let coord_tx_timeout = coord_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            // Send a synthetic timeout envelope. The coordinator
-                            // checks if the pending service still matches this id.
-                            let _ = coord_tx_timeout.send(CoordMessage::Envelope {
-                                id: 0,
-                                envelope: InboundEnvelope {
-                                    stream: "service_timeout".to_string(),
-                                    data: json!({ "id": id_for_timeout }),
-                                },
-                            });
-                        });
-                    }
-                    CoordMessage::ZshExec { command, sandboxed, reply } => {
-                        tracing::info!(command = %command, sandboxed, "zsh exec request");
-                        if matches!(easement.connection, EasementConnection::Draining { .. }) {
-                            let _ = reply.send(ZshResult {
-                                output: "host switch in progress, no further tool calls available".to_string(),
-                                exit_code: 1,
-                            });
-                        } else if let Some(eid) = easement.client_id() {
                             broadcast(&clients, "tool_start", json!({
-                                "tool": "zsh",
-                                "command": command,
-                                "sandboxed": sandboxed
+                                "tool": tool,
+                                "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
-                            send_to(&clients, eid, "zsh", json!({
-                                "command": command,
-                                "sandboxed": sandboxed
-                            }));
-                            easement.set_pending_mcp(reply);
                         } else {
-                            let _ = reply.send(ZshResult {
-                                output: "no easement connected".to_string(),
-                                exit_code: 1,
-                            });
-                        }
-                    }
-                    CoordMessage::FileOp { op, args, reply } => {
-                        tracing::info!(op = %op, "file op request");
-                        if matches!(easement.connection, EasementConnection::Draining { .. }) {
-                            let _ = reply.send(ZshResult {
-                                output: "host switch in progress, no further tool calls available".to_string(),
-                                exit_code: 1,
-                            });
-                        } else if let Some(eid) = easement.client_id() {
-                            send_to(&clients, eid, &op, args);
-                            easement.set_pending_mcp(reply);
-                        } else {
-                            let _ = reply.send(ZshResult {
-                                output: "no easement connected".to_string(),
-                                exit_code: 1,
-                            });
-                        }
-                    }
-                    CoordMessage::SetRemoteHost { host, reply } => {
-                        let effective = if host.as_deref() == Some("local") { None } else { host };
-                        tracing::info!(remote_host = ?effective, "remote host set");
-                        easement.host = effective.clone();
-
-                        if let Some(eid) = easement.client_id() {
-                            if easement.is_idle() {
-                                send_to(&clients, eid, "shutdown", json!({}));
-                                clients.remove(&eid);
-                                easement.on_disconnected();
-                                easement.notify_on_connect = true;
-                                if let Some(mut child) = easement.child.take() {
-                                    tokio::spawn(async move { let _ = child.wait().await; });
+                            // No smedly connected — spawn one and stash the tool call.
+                            // The select loop will process the connect-back and drain the pending call.
+                            tracing::info!("no smedly connected, spawning localhost");
+                            let mut cmd = tokio::process::Command::new("smedly");
+                            cmd.arg("ws://localhost:6502").arg(&slug);
+                            cmd.stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null());
+                            match cmd.spawn() {
+                                Ok(child) => {
+                                    smedly_child = Some(child);
+                                    tracing::info!(call_id = %call_id, tool = %tool, args = %args, "stashing tool call, waiting for smedly");
+                                    pending_tool = Some((call_id.clone(), reply));
+                                    pending_tool_envelope = Some((call_id, tool, args));
                                 }
-                            } else {
-                                tracing::info!("easement busy, draining before host switch");
-                                easement.pending_host_switch = Some(effective.as_deref().unwrap_or("local").to_string());
-                                easement.begin_drain();
+                                Err(e) => {
+                                    let _ = reply.send(ToolResult {
+                                        output: format!("failed to spawn smedly: {}", e),
+                                        exit_code: 1,
+                                    });
+                                }
                             }
                         }
-
-                        let _ = reply.send(effective);
-                    }
-                    CoordMessage::GetRemoteHost { reply } => {
-                        let _ = reply.send(easement.host.clone());
                     }
                     CoordMessage::Envelope { id, envelope } => {
                         exchange.log("client>wicket", &json!({
@@ -834,372 +848,67 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             "data": &envelope.data,
                         }));
 
-                        if easement.client_id() == Some(id) {
-                            let eid = id;
-                            match envelope.stream.as_str() {
-                                "delta" => {
-                                    broadcast_except(&clients, Some(eid), "delta", envelope.data);
-                                }
-                                "boundary" => {
-                                    tracing::debug!("boundary envelope ignored");
-                                }
-                                "transcript" => {
-                                    let new_entries = transcript.handle_entry(envelope.data);
-                                    for entry in &new_entries {
-                                        broadcast_entry(&clients, entry);
-                                        all_entries.push(entry.clone());
-                                    }
-                                }
-                                "usage" => {
-                                    broadcast_except(&clients, Some(eid), "usage", envelope.data.clone());
-                                    last_usage = Some(envelope.data);
-                                }
-                                "lifecycle" => {
-                                    let name = envelope.data.as_str().unwrap_or("");
-                                    match name {
-                                        "round_started" => {
-                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
-                                        }
-                                        "round_completed" => {
-                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
-                                            if let Some(tid) = easement.active_turn_id() {
-                                                broadcast(&clients, "turn", json!({
-                                                    "event": "completed",
-                                                    "turn_id": tid,
-                                                    "status": "completed",
-                                                }));
-                                            }
-                                            if easement.end_turn() {
-                                                if let Some(eid) = easement.client_id() {
-                                                    send_to(&clients, eid, "shutdown", json!({}));
-                                                    clients.remove(&eid);
-                                                }
-                                                easement.on_disconnected();
-                                                if let Some(mut child) = easement.child.take() {
-                                                    tokio::spawn(async move { let _ = child.wait().await; });
-                                                }
-                                                easement.notify_on_connect = true;
-                                                tracing::info!("easement disconnected after drain for host switch");
-                                                let host_name = easement.host.clone().unwrap_or_else(|| "local".to_string());
-                                                let notify_msg = format!("[notification] You are now on host `{}`.", host_name);
-                                                let coord_tx_notify = coord_tx.clone();
-                                                tokio::spawn(async move {
-                                                    let _ = coord_tx_notify.send(CoordMessage::Envelope {
-                                                        id: 0,
-                                                        envelope: InboundEnvelope {
-                                                            stream: "claude".to_string(),
-                                                            data: json!({ "message": notify_msg }),
-                                                        },
-                                                    });
-                                                });
-                                            }
-                                        }
-                                        "round_interrupted" => {
-                                            tracing::info!("round_interrupted received from easement");
-                                            broadcast_lifecycle(&clients, LifecycleEvent::RoundInterrupted);
-                                            if let Some(tid) = easement.active_turn_id() {
-                                                broadcast(&clients, "turn", json!({
-                                                    "event": "completed",
-                                                    "turn_id": tid,
-                                                    "status": "interrupted",
-                                                }));
-                                            }
-                                            if easement.end_turn() {
-                                                if let Some(eid) = easement.client_id() {
-                                                    send_to(&clients, eid, "shutdown", json!({}));
-                                                    clients.remove(&eid);
-                                                }
-                                                easement.on_disconnected();
-                                                if let Some(mut child) = easement.child.take() {
-                                                    tokio::spawn(async move { let _ = child.wait().await; });
-                                                }
-                                                easement.notify_on_connect = true;
-                                                tracing::info!("easement disconnected after drain for host switch");
-                                                let host_name = easement.host.clone().unwrap_or_else(|| "local".to_string());
-                                                let notify_msg = format!("[notification] You are now on host `{}`.", host_name);
-                                                let coord_tx_notify = coord_tx.clone();
-                                                tokio::spawn(async move {
-                                                    let _ = coord_tx_notify.send(CoordMessage::Envelope {
-                                                        id: 0,
-                                                        envelope: InboundEnvelope {
-                                                            stream: "claude".to_string(),
-                                                            data: json!({ "message": notify_msg }),
-                                                        },
-                                                    });
-                                                });
-                                            }
-                                        }
-                                        _ => {
-                                            tracing::debug!(lifecycle = %name, "unknown easement lifecycle");
-                                        }
-                                    }
-                                }
-                                "zsh_result" => {
-                                    {
-                                        let output = envelope.data.get("output")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let exit_code = envelope.data.get("exit_code")
-                                            .and_then(|v| v.as_i64())
-                                            .unwrap_or(-1) as i32;
-                                        tracing::info!(exit_code, output_len = output.len(), "zsh result received");
-                                        broadcast_except(&clients, Some(eid), "tool_done", json!({
-                                            "tool": "zsh",
-                                            "output": &output,
-                                            "exit_code": exit_code
-                                        }));
-                                        easement.resolve_mcp(ZshResult { output, exit_code });
-                                    }
-                                }
-                                "shell_result" => {
-                                    broadcast_except(&clients, Some(eid), "shell_result", envelope.data);
-                                }
-                                "meta" => {
-                                    if let Some(sid) = envelope.data.get("session_id").and_then(|v| v.as_str()) {
-                                        tracing::info!(session_id = %sid, "easement meta: session id");
-                                    }
-                                    broadcast_meta(&clients, envelope.data);
-                                }
-                                "error" => {
-                                    let msg = envelope.data.get("message")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown error");
-                                    tracing::error!("easement error: {}", msg);
-                                    broadcast_error(&clients, msg);
-                                }
-                                "log" => {
-                                    let level = envelope.data.get("level")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("info");
-                                    let message = envelope.data.get("message")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    let fields = envelope.data.get("fields");
-                                    match level {
-                                        "error" => tracing::error!(slug = %slug, fields = ?fields, "[easement] {}", message),
-                                        "warn" => tracing::warn!(slug = %slug, fields = ?fields, "[easement] {}", message),
-                                        _ => tracing::info!(slug = %slug, fields = ?fields, "[easement] {}", message),
-                                    }
-                                }
-                                _ => {
-                                    tracing::debug!(stream = %envelope.stream, "unknown easement envelope");
-                                }
-                            }
-                            continue;
-                        }
-
                         match envelope.stream.as_str() {
                             "claude" => {
-                                // Spawn Easement if not connected.
-                                if easement.needs_spawn() {
-                                    let effective_remote = easement.host.clone();
-                                    let mut cmd = match &effective_remote {
-                                        None => Command::new("easement"),
-                                        Some(host) => {
-                                            let is_orb = host.contains("orb");
-                                            let mut c = Command::new("ssh");
-                                            if !is_orb {
-                                                c.arg("-R").arg("6502:localhost:6502");
-                                            }
-                                            c.arg(host).arg("easement");
-                                            c
-                                        }
-                                    };
-                                    cmd.stdin(Stdio::piped())
-                                        .stdout(Stdio::null())
-                                        .stderr(Stdio::null());
+                                if claude.is_some() {
+                                    tracing::warn!("claude envelope while ClaudePrint is running, ignoring");
+                                    continue;
+                                }
 
-                                    match cmd.spawn() {
-                                        Ok(mut child) => {
-                                            if let Some(mut stdin) = child.stdin.take() {
-                                                let wicket_url = match easement.host.as_deref() {
-                                                    Some(h) if h.contains("orb") => "ws://host.internal:6502",
-                                                    _ => "ws://localhost:6502",
-                                                };
-                                                let bootstrap = json!({
-                                                    "slug": slug,
-                                                    "timestamp": current_timestamp,
-                                                    "wicket_url": wicket_url
-                                                });
-                                                let mut bootstrap_json = serde_json::to_string(&bootstrap).unwrap();
-                                                bootstrap_json.push('\n');
-                                                let _ = stdin.write_all(bootstrap_json.as_bytes()).await;
-                                                let _ = stdin.flush().await;
-                                                drop(stdin);
-                                            }
-                                            tracing::info!("easement spawned, waiting for WebSocket connect");
-                                            easement.child = Some(child);
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("failed to spawn easement: {}", e);
-                                            broadcast_error(&clients, &format!("failed to spawn easement: {}", e));
-                                            continue;
-                                        }
-                                    }
-
-                                    // Wait for Easement to connect back.
-                                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                                    while !easement.is_connected() {
-                                        if tokio::time::Instant::now() > deadline {
-                                            tracing::error!("timeout waiting for easement to connect");
-                                            broadcast_error(&clients, "timeout waiting for easement to connect");
-                                            break;
-                                        }
-                                        // Process coordinator messages while waiting.
-                                        match tokio::time::timeout(
-                                            std::time::Duration::from_millis(100),
-                                            coord_rx.recv(),
-                                        ).await {
-                                            Ok(Some(CoordMessage::ClientConnected { id: cid, session_id: sid, protocol: proto, timestamp: _, tx })) => {
-                                                if proto == "easement" {
-                                                    easement.on_connected(cid);
-                                                    tracing::info!(client_id = cid, "easement client connected");
-                                                } else {
-                                                    if let Some(sid) = sid {
-                                                        sessions.set_local(sid);
-                                                    }
-                                                    for entry in &all_entries {
-                                                        if let Ok(data) = serde_json::to_value(entry) {
-                                                            if let Some(json) = envelope_json("entry", data) {
-                                                                let _ = tx.send(json);
-                                                            }
-                                                        }
-                                                    }
-                                                    if let Some(ref usage) = last_usage {
-                                                        if let Some(json) = envelope_json("usage", usage.clone()) {
-                                                            let _ = tx.send(json);
-                                                        }
-                                                    }
-                                                }
-                                                clients.insert(cid, tx);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-
-                                    if !easement.is_connected() {
+                                let msg: ClaudeMessage = match serde_json::from_value(envelope.data) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        tracing::warn!("bad claude message: {}", e);
+                                        broadcast_error(&clients, &format!("bad claude message: {}", e));
                                         continue;
                                     }
-                                }
+                                };
 
-                                if let Some(eid) = easement.client_id() {
-                                    let msg: ClaudeMessage = match serde_json::from_value(envelope.data) {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            tracing::warn!("bad claude message: {}", e);
-                                            broadcast_error(&clients, &format!("bad claude message: {}", e));
-                                            continue;
-                                        }
-                                    };
+                                let turn_id = uuid::Uuid::new_v4().to_string();
 
-                                    let turn_id = uuid::Uuid::new_v4().to_string();
-                                    easement.begin_turn(turn_id.clone());
+                                broadcast(&clients, "turn", json!({
+                                    "event": "started",
+                                    "turn_id": turn_id,
+                                    "message": msg.message,
+                                }));
+                                broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
 
-                                    broadcast(&clients, "turn", json!({
-                                        "event": "started",
-                                        "turn_id": turn_id,
-                                        "message": msg.message,
-                                    }));
+                                let entries = transcript.entries().to_vec();
+                                tracing::info!(turn_id = %turn_id, transcript_entries = entries.len(), "spawning ClaudePrint");
 
-                                    let claude_data = json!({
-                                        "message": msg.message,
-                                        "yolo": msg.yolo,
-                                        "transcript": transcript.entries()
-                                    });
-                                    tracing::info!(turn_id = %turn_id, transcript_entries = transcript.entries().len(), "forwarding claude envelope to easement");
-                                    send_to(&clients, eid, "claude", claude_data);
-                                }
-                            }
-                            "shell" => {
-                                // Spawn Easement if not connected (same as claude handler).
-                                if easement.needs_spawn() {
-                                    let effective_remote = easement.host.clone();
-                                    let mut cmd = match &effective_remote {
-                                        None => Command::new("easement"),
-                                        Some(host) => {
-                                            let is_orb = host.contains("orb");
-                                            let mut c = Command::new("ssh");
-                                            if !is_orb {
-                                                c.arg("-R").arg("6502:localhost:6502");
-                                            }
-                                            c.arg(host).arg("easement");
-                                            c
-                                        }
-                                    };
-                                    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
-                                    match cmd.spawn() {
-                                        Ok(mut child) => {
-                                            if let Some(mut stdin) = child.stdin.take() {
-                                                let wicket_url = match easement.host.as_deref() {
-                                                    Some(h) if h.contains("orb") => "ws://host.internal:6502",
-                                                    _ => "ws://localhost:6502",
-                                                };
-                                                let bootstrap = json!({ "slug": slug, "timestamp": current_timestamp, "wicket_url": wicket_url });
-                                                let mut bj = serde_json::to_string(&bootstrap).unwrap();
-                                                bj.push('\n');
-                                                let _ = stdin.write_all(bj.as_bytes()).await;
-                                                let _ = stdin.flush().await;
-                                                drop(stdin);
-                                            }
-                                            easement.child = Some(child);
-                                            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                                            while !easement.is_connected() {
-                                                if tokio::time::Instant::now() > deadline { break; }
-                                                match tokio::time::timeout(std::time::Duration::from_millis(100), coord_rx.recv()).await {
-                                                    Ok(Some(CoordMessage::ClientConnected { id: cid, protocol: proto, timestamp: _, session_id: _, tx })) => {
-                                                        if proto == "easement" { easement.on_connected(cid); }
-                                                        clients.insert(cid, tx);
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            broadcast_error(&clients, &format!("failed to spawn easement: {}", e));
-                                        }
+                                match spawn_claude_print(&slug, &msg.message, &entries).await {
+                                    Ok(mut cp) => {
+                                        cp.turn_id = Some(turn_id);
+                                        claude = Some(cp);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("failed to spawn ClaudePrint: {}", e);
+                                        broadcast_error(&clients, &e);
+                                        broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed { message: e });
                                     }
                                 }
-                                if let Some(eid) = easement.client_id() {
-                                    send_to(&clients, eid, "shell", envelope.data);
-                                    tracing::info!("shell command forwarded to easement");
-                                } else {
-                                    broadcast_error(&clients, "no easement connected for shell command");
-                                }
                             }
-                            "approval" => {
-                                if let Some(pending) = easement.turn.as_mut().and_then(|t| t.pending_approval.take()) {
-                                    let decision: ApprovalDecision = match serde_json::from_value(envelope.data) {
-                                        Ok(d) => d,
-                                        Err(e) => {
-                                            tracing::warn!("bad approval decision: {}", e);
-                                            continue;
-                                        }
-                                    };
-
-                                    let response = if decision.behavior == "allow" {
-                                        json!({
-                                            "behavior": "allow",
-                                            "updatedInput": pending.original_input
-                                        })
-                                    } else {
-                                        json!({
-                                            "behavior": "deny",
-                                            "message": decision.message.unwrap_or_else(|| "User denied permission".to_string())
-                                        })
-                                    };
-
-                                    let _ = pending.reply.send(response);
-                                    tracing::info!("approval decision sent via MCP");
-                                } else {
-                                    tracing::warn!("approval decision with no pending request");
+                            "interrupt" => {
+                                if let Some(ref mut cp) = claude {
+                                    if let Some(ref mut stdin) = cp.stdin {
+                                        let msg = json!({
+                                            "type": "control_request",
+                                            "request_id": uuid::Uuid::new_v4().to_string(),
+                                            "request": { "subtype": "interrupt" }
+                                        });
+                                        let mut line = serde_json::to_string(&msg).unwrap();
+                                        line.push('\n');
+                                        let _ = stdin.write_all(line.as_bytes()).await;
+                                        let _ = stdin.flush().await;
+                                        tracing::info!("interrupt sent to claude");
+                                    }
                                 }
                             }
                             "claim" => {
                                 let claim_id = envelope.data.get("id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                if let Some(ref pending) = easement.pending_service {
+                                if let Some(ref pending) = pending_service {
                                     if pending.id == claim_id {
                                         tracing::info!(id = %claim_id, "service request claimed");
                                     }
@@ -1210,7 +919,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                if let Some(pending) = easement.pending_service.take() {
+                                if let Some(pending) = pending_service.take() {
                                     if pending.id == resp_id {
                                         let content_type = envelope.data.get("content_type")
                                             .and_then(|v| v.as_str())
@@ -1227,7 +936,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         let _ = pending.reply.send(ServiceResponse { content_type, body });
                                     } else {
                                         tracing::warn!(expected = %pending.id, got = %resp_id, "service response id mismatch");
-                                        easement.pending_service = Some(pending);
+                                        pending_service = Some(pending);
                                     }
                                 }
                             }
@@ -1235,21 +944,39 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 let timeout_id = envelope.data.get("id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                if let Some(pending) = easement.pending_service.take() {
+                                if let Some(pending) = pending_service.take() {
                                     if pending.id == timeout_id {
                                         tracing::warn!(id = %timeout_id, "service request timed out (no claim)");
-                                        // Drop the reply sender — the HTTP handler
-                                        // will see the channel close.
                                     } else {
-                                        // Was claimed or fulfilled already, put it back.
-                                        easement.pending_service = Some(pending);
+                                        pending_service = Some(pending);
                                     }
                                 }
                             }
-                            "interrupt" => {
-                                if let Some(eid) = easement.client_id() {
-                                    send_to(&clients, eid, "interrupt", serde_json::json!({}));
-                                    tracing::info!("interrupt forwarded to easement");
+                            "tool_result" => {
+                                tracing::info!(client_id = id, data = %envelope.data, "tool_result envelope received");
+                                let call_id = envelope.data.get("call_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let output = envelope.data.get("output")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let exit_code = envelope.data.get("exit_code")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(-1) as i32;
+                                tracing::info!(call_id = %call_id, exit_code, output_len = output.len(), "tool result from smedly");
+                                broadcast(&clients, "tool_done", json!({
+                                    "tool": "zsh",
+                                    "output": &output,
+                                    "exit_code": exit_code,
+                                }));
+                                if let Some((pending_call_id, reply)) = pending_tool.take() {
+                                    if pending_call_id == call_id {
+                                        let _ = reply.send(ToolResult { output, exit_code });
+                                    } else {
+                                        tracing::warn!(expected = %pending_call_id, got = %call_id, "tool result call_id mismatch");
+                                    }
                                 }
                             }
                             "heartbeat" => {}
@@ -1262,18 +989,9 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     .unwrap_or("");
                                 let fields = envelope.data.get("fields");
                                 match level {
-                                    "error" => tracing::error!(
-                                        client_id = id, slug = %slug,
-                                        fields = ?fields, "[client] {}", message
-                                    ),
-                                    "warn" => tracing::warn!(
-                                        client_id = id, slug = %slug,
-                                        fields = ?fields, "[client] {}", message
-                                    ),
-                                    _ => tracing::info!(
-                                        client_id = id, slug = %slug,
-                                        fields = ?fields, "[client] {}", message
-                                    ),
+                                    "error" => tracing::error!(client_id = id, slug = %slug, fields = ?fields, "[client] {}", message),
+                                    "warn" => tracing::warn!(client_id = id, slug = %slug, fields = ?fields, "[client] {}", message),
+                                    _ => tracing::info!(client_id = id, slug = %slug, fields = ?fields, "[client] {}", message),
                                 }
                             }
                             "exit" => {
@@ -1281,13 +999,151 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 tracing::info!(client_id = id, "client sent exit");
                             }
                             other => {
-                                tracing::warn!("unknown inbound stream: {}", other);
+                                tracing::debug!(stream = %other, "unknown inbound stream");
                             }
                         }
                     }
                 }
             }
 
+            // ClaudePrint stdout events.
+            Some(event) = async {
+                match claude.as_mut() {
+                    Some(cp) => cp.event_rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let cp = claude.as_mut().unwrap();
+                match event {
+                    ClaudeEvent::Delta(delta) => {
+                        broadcast(&clients, "delta", delta);
+                    }
+                    ClaudeEvent::SessionId(sid) => {
+                        tracing::info!(session_id = %sid, "captured session id from claude");
+                        cp.session_id = Some(sid);
+                    }
+                    ClaudeEvent::Replay => {
+                        cp.drain_replayed += 1;
+                        tracing::debug!(
+                            sent = cp.drain_sent,
+                            replayed = cp.drain_replayed,
+                            "drain gate: {}/{}",
+                            cp.drain_replayed,
+                            cp.drain_sent
+                        );
+                    }
+                    ClaudeEvent::Result { usage, is_interrupted } => {
+                        if let Some(ref u) = usage {
+                            broadcast(&clients, "usage", u.clone());
+                            last_usage = usage;
+                        }
+
+                        if is_interrupted {
+                            broadcast_lifecycle(&clients, LifecycleEvent::RoundInterrupted);
+                            if let Some(ref tid) = cp.turn_id {
+                                broadcast(&clients, "turn", json!({
+                                    "event": "completed",
+                                    "turn_id": tid,
+                                    "status": "interrupted",
+                                }));
+                            }
+                        }
+
+                        if cp.is_drained() {
+                            let turn_id = cp.turn_id.clone();
+                            let session_id = cp.session_id.clone();
+                            let round_log = cp.round_log.clone();
+
+                            // Close stdin so Claude exits cleanly.
+                            cp.stdin.take();
+
+                            // Wait for child to exit.
+                            let status = cp.child.wait().await;
+                            match &status {
+                                Ok(s) => tracing::info!(exit_code = ?s.code(), "claude exited"),
+                                Err(e) => tracing::error!(error = %e, "error waiting for claude"),
+                            }
+
+                            // Read the CLI transcript file and feed to our transcript.
+                            if let Some(ref sid) = session_id {
+                                if let Some(path) = find_transcript_file(sid) {
+                                    round_log.copy_transcript(&path);
+                                    if let Ok(content) = std::fs::read_to_string(&path) {
+                                        for line in content.lines() {
+                                            let line = line.trim();
+                                            if line.is_empty() { continue; }
+                                            if let Ok(data) = serde_json::from_str::<Value>(line) {
+                                                let new_entries = transcript.handle_entry(data);
+                                                for entry in &new_entries {
+                                                    broadcast_entry(&clients, entry);
+                                                    all_entries.push(entry.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(session_id = %sid, "CLI transcript file not found");
+                                }
+                            }
+
+                            if !is_interrupted {
+                                broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
+                                if let Some(ref tid) = turn_id {
+                                    broadcast(&clients, "turn", json!({
+                                        "event": "completed",
+                                        "turn_id": tid,
+                                        "status": "completed",
+                                    }));
+                                }
+                            }
+
+                            claude = None;
+                            tracing::info!("round completed");
+                        }
+                    }
+                    ClaudeEvent::Eof => {
+                        tracing::info!("claude stdout EOF");
+                        let turn_id = cp.turn_id.clone();
+                        let session_id = cp.session_id.clone();
+                        let round_log = cp.round_log.clone();
+
+                        cp.stdin.take();
+                        let _ = cp.child.wait().await;
+
+                        if let Some(ref sid) = session_id {
+                            if let Some(path) = find_transcript_file(sid) {
+                                round_log.copy_transcript(&path);
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    for line in content.lines() {
+                                        let line = line.trim();
+                                        if line.is_empty() { continue; }
+                                        if let Ok(data) = serde_json::from_str::<Value>(line) {
+                                            let new_entries = transcript.handle_entry(data);
+                                            for entry in &new_entries {
+                                                broadcast_entry(&clients, entry);
+                                                all_entries.push(entry.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed {
+                            message: "claude exited unexpectedly".to_string(),
+                        });
+                        if let Some(ref tid) = turn_id {
+                            broadcast(&clients, "turn", json!({
+                                "event": "completed",
+                                "turn_id": tid,
+                                "status": "failed",
+                            }));
+                        }
+
+                        claude = None;
+                    }
+                }
+            }
         }
     }
 }
@@ -1308,7 +1164,6 @@ async fn handle_websocket(
 
     let (mut sink, mut stream) = ws_stream.split();
 
-    // Read connect payload (first message).
     let connect_text = match stream.next().await {
         Some(Ok(Message::Text(text))) => text,
         _ => {
@@ -1328,7 +1183,6 @@ async fn handle_websocket(
     let slug = connect.slug.clone();
     tracing::info!(slug = %slug, "websocket client connecting");
 
-    // Get or create coordinator for this slug.
     let (coord_tx, client_id) = {
         let mut state = server.write().await;
         let client_id = state.next_id();
@@ -1336,9 +1190,8 @@ async fn handle_websocket(
         let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             let slug_clone = slug.clone();
-            let tx_clone = tx.clone();
             tokio::spawn(async move {
-                run_coordinator(slug_clone, tx_clone, rx).await;
+                run_coordinator(slug_clone, rx).await;
             });
             CoordinatorHandle { tx }
         });
@@ -1346,21 +1199,18 @@ async fn handle_websocket(
         (handle.tx.clone(), client_id)
     };
 
-    // Channel for outbound messages from coordinator to this client.
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<String>();
 
     let protocol = connect.protocol.unwrap_or_else(|| "wicket".to_string());
 
-    // Register with coordinator.
     let _ = coord_tx.send(CoordMessage::ClientConnected {
         id: client_id,
-        session_id: connect.session_id,
         protocol,
         timestamp: connect.timestamp,
+        host: connect.host,
         tx: client_tx,
     });
 
-    // Writer task: coordinator → WebSocket.
     let write_task = tokio::spawn(async move {
         while let Some(msg) = client_rx.recv().await {
             if sink.send(Message::text(msg)).await.is_err() {
@@ -1369,7 +1219,6 @@ async fn handle_websocket(
         }
     });
 
-    // Reader loop: WebSocket → coordinator.
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
@@ -1394,13 +1243,18 @@ async fn handle_websocket(
         }
     }
 
-    // Client disconnected.
     let _ = coord_tx.send(CoordMessage::ClientDisconnected { id: client_id });
     write_task.abort();
     tracing::info!(client_id, slug = %slug, "websocket client disconnected");
 }
 
 // -- MCP HTTP handler --
+
+#[derive(Debug, serde::Deserialize)]
+struct ToolCallParams {
+    name: String,
+    arguments: Value,
+}
 
 async fn handle_mcp(
     req: Request<Incoming>,
@@ -1494,24 +1348,6 @@ async fn handle_mcp(
                         },
                         "required": ["path"]
                     }
-                }, {
-                    "name": "screenshot",
-                    "description": "Capture a screenshot of the active browser tab. Returns the image inline. The browser companion (Shotgun) must be connected.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                }, {
-                    "name": "javascript",
-                    "description": "Execute JavaScript code in the context of the active browser tab. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression. Do NOT use 'return' statements. Output is sanitized to block credentials, tokens, and cookies.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "code": { "type": "string", "description": "The JavaScript code to execute. The result of the last expression is returned automatically." }
-                        },
-                        "required": ["code"]
-                    }
                 }]
             }),
         ),
@@ -1526,7 +1362,7 @@ async fn handle_mcp(
                     ));
                 }
             };
-            // Find the coordinator for this slug.
+
             let coord_tx = {
                 let state = server.read().await;
                 state.coordinators.get(slug).map(|h| h.tx.clone())
@@ -1535,140 +1371,53 @@ async fn handle_mcp(
             let coord_tx = match coord_tx {
                 Some(tx) => tx,
                 None => {
-                    tracing::warn!(slug, "MCP request for unknown slug");
-                    let deny = json!({
-                        "behavior": "deny",
-                        "message": "No active session for this slug"
-                    });
-                    let text = serde_json::to_string(&deny).unwrap();
-                    return make_json_response(jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": text }] }),
+                    return make_json_response(jsonrpc_error(
+                        id, -32000, "no active session for this slug".to_string(),
                     ));
                 }
             };
 
-            if params.name == "zsh" {
-                let command = params.arguments["command"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let escalate = params.arguments.get("escalate")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let reason = params.arguments.get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+            tracing::info!(tool_name = %params.name, arguments = %params.arguments, "MCP tools/call received");
 
-                if escalate {
-                    // Escalation: ask Puzzle for approval before running unsandboxed.
-                    tracing::info!(command = %command, reason = %reason, "zsh escalation request");
-
-                    let (approval_tx, approval_rx) = oneshot::channel();
-                    let _ = coord_tx.send(CoordMessage::McpApprovalRequest {
-                        tool_name: "zsh (unsandboxed)".to_string(),
-                        input: json!({ "command": command, "reason": reason }),
-                        tool_use_id: None,
-                        reply: approval_tx,
-                    });
-
-                    match approval_rx.await {
-                        Ok(decision) => {
-                            let behavior = decision.get("behavior")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("deny");
-
-                            if behavior == "allow" {
-                                // Run unsandboxed.
-                                tracing::info!(command = %command, "escalation approved, running unsandboxed");
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                let _ = coord_tx.send(CoordMessage::ZshExec {
-                                    command,
-                                    sandboxed: false,
-                                    reply: reply_tx,
-                                });
-                                // For now it runs sandboxed regardless. The sandboxed
-                                // flag on the envelope is the next piece.
-                                match reply_rx.await {
-                                    Ok(result) => {
-                                        let output = if result.exit_code != 0 {
-                                            format!("{}\n[exit code: {}]", result.output, result.exit_code)
-                                        } else {
-                                            result.output
-                                        };
-                                        jsonrpc_response(
-                                            id,
-                                            json!({ "content": [{ "type": "text", "text": output }] }),
-                                        )
-                                    }
-                                    Err(_) => jsonrpc_response(
-                                        id,
-                                        json!({ "content": [{ "type": "text", "text": "execution failed: reply dropped" }], "isError": true }),
-                                    ),
-                                }
-                            } else {
-                                jsonrpc_response(
-                                    id,
-                                    json!({ "content": [{ "type": "text", "text": "escalation denied by operator" }], "isError": true }),
-                                )
-                            }
-                        }
-                        Err(_) => jsonrpc_response(
-                            id,
-                            json!({ "content": [{ "type": "text", "text": "escalation request dropped" }], "isError": true }),
-                        ),
-                    }
-                } else {
-                    // Normal path: sandboxed execution.
-                    tracing::info!(command = %command, "zsh tool call (sandboxed)");
-
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    let _ = coord_tx.send(CoordMessage::ZshExec {
-                        command,
-                        sandboxed: true,
-                        reply: reply_tx,
-                    });
-
-                    match reply_rx.await {
-                        Ok(result) => {
-                            let output = if result.exit_code != 0 {
-                                format!("{}\n[exit code: {}]", result.output, result.exit_code)
-                            } else {
-                                result.output
-                            };
-                            jsonrpc_response(
-                                id,
-                                json!({ "content": [{ "type": "text", "text": output }] }),
-                            )
-                        }
-                        Err(_) => {
-                            tracing::warn!("zsh exec reply channel dropped");
-                            jsonrpc_response(
-                                id,
-                                json!({ "content": [{ "type": "text", "text": "command execution failed: reply dropped" }], "isError": true }),
-                            )
-                        }
-                    }
-                }
-            } else if params.name == "apply_patch" {
-                let patch = params.arguments["patch"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                tracing::info!("apply_patch tool call");
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::FileOp {
-                    op: "apply_patch".to_string(),
-                    args: json!({ "patch": patch }),
-                    reply: reply_tx,
+            if params.name == "wicket_approve" {
+                let updated_input = params.arguments.get("input")
+                    .cloned()
+                    .unwrap_or(params.arguments.clone());
+                let text = json!({
+                    "behavior": "allow",
+                    "updatedInput": updated_input
                 });
+                let text = serde_json::to_string(&text).unwrap();
+                return make_json_response(jsonrpc_response(
+                    id,
+                    json!({ "content": [{ "type": "text", "text": text }] }),
+                ));
+            }
 
-                match reply_rx.await {
-                    Ok(result) => {
+            let tool = params.name.clone();
+            let call_id = uuid::Uuid::new_v4().to_string();
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = coord_tx.send(CoordMessage::ToolCall {
+                call_id,
+                tool,
+                args: params.arguments,
+                reply: reply_tx,
+            });
+
+            match reply_rx.await {
+                Ok(result) => {
+                    if params.name == "view_image" && result.exit_code == 0 {
+                        match serde_json::from_str::<Value>(&result.output) {
+                            Ok(content) => jsonrpc_response(id, json!({ "content": content })),
+                            Err(_) => jsonrpc_response(
+                                id,
+                                json!({ "content": [{ "type": "text", "text": result.output }] }),
+                            ),
+                        }
+                    } else {
                         let output = if result.exit_code != 0 {
-                            format!("{}\n[error]", result.output)
+                            format!("{}\n[exit code: {}]", result.output, result.exit_code)
                         } else {
                             result.output
                         };
@@ -1677,179 +1426,11 @@ async fn handle_mcp(
                             json!({ "content": [{ "type": "text", "text": output }] }),
                         )
                     }
-                    Err(_) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": "apply_patch failed: reply dropped" }], "isError": true }),
-                    ),
                 }
-            } else if params.name == "view_image" {
-                let path = params.arguments["path"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                tracing::info!(path = %path, "view_image tool call");
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::FileOp {
-                    op: "view_image".to_string(),
-                    args: json!({ "path": path }),
-                    reply: reply_tx,
-                });
-
-                match reply_rx.await {
-                    Ok(result) => {
-                        if result.exit_code != 0 {
-                            jsonrpc_response(
-                                id,
-                                json!({ "content": [{ "type": "text", "text": result.output }], "isError": true }),
-                            )
-                        } else {
-                            match serde_json::from_str::<Value>(&result.output) {
-                                Ok(content) => jsonrpc_response(id, json!({ "content": content })),
-                                Err(_) => jsonrpc_response(
-                                    id,
-                                    json!({ "content": [{ "type": "text", "text": result.output }] }),
-                                ),
-                            }
-                        }
-                    }
-                    Err(_) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": "view_image failed: reply dropped" }], "isError": true }),
-                    ),
-                }
-            } else if params.name == "javascript" {
-                let code = params.arguments["code"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                tracing::info!("javascript tool call");
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::ServiceRequest {
-                    request_type: "javascript".to_string(),
-                    data: json!({ "code": code }),
-                    reply: reply_tx,
-                });
-
-                match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-                    Ok(Ok(resp)) => {
-                        use base64::Engine;
-                        let body = base64::engine::general_purpose::STANDARD.decode(&resp.body).unwrap_or_default();
-                        let body_str = String::from_utf8_lossy(&body);
-
-                        match serde_json::from_str::<Value>(&body_str) {
-                            Ok(result) => {
-                                if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
-                                    jsonrpc_response(
-                                        id,
-                                        json!({ "content": [{ "type": "text", "text": error }], "isError": true }),
-                                    )
-                                } else {
-                                    let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
-                                    jsonrpc_response(
-                                        id,
-                                        json!({ "content": [{ "type": "text", "text": output }] }),
-                                    )
-                                }
-                            }
-                            Err(_) => {
-                                jsonrpc_response(
-                                    id,
-                                    json!({ "content": [{ "type": "text", "text": body_str }] }),
-                                )
-                            }
-                        }
-                    }
-                    Ok(Err(_)) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": "javascript failed: no browser companion connected" }], "isError": true }),
-                    ),
-                    Err(_) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": "javascript execution timed out" }], "isError": true }),
-                    ),
-                }
-            } else if params.name == "screenshot" {
-                tracing::info!("screenshot tool call");
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::ServiceRequest {
-                    request_type: "capture".to_string(),
-                    data: json!({}),
-                    reply: reply_tx,
-                });
-
-                match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-                    Ok(Ok(resp)) => {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&resp.body);
-                        let media_type = resp.content_type;
-                        jsonrpc_response(
-                            id,
-                            json!({
-                                "content": [
-                                    { "type": "text", "text": format!("screenshot ({})", media_type) },
-                                    { "type": "image", "data": b64, "mimeType": media_type }
-                                ]
-                            }),
-                        )
-                    }
-                    Ok(Err(_)) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": "screenshot failed: no browser companion connected" }], "isError": true }),
-                    ),
-                    Err(_) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": "screenshot timed out" }], "isError": true }),
-                    ),
-                }
-            } else if params.name == "wicket_approve" {
-                let tool_name = params.arguments["tool_name"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .to_string();
-                let input = params.arguments["input"].clone();
-                let tool_use_id = params.arguments["tool_use_id"]
-                    .as_str()
-                    .map(|s| s.to_string());
-
-                // Send to coordinator and wait for the approval decision.
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::McpApprovalRequest {
-                    tool_name,
-                    input,
-                    tool_use_id,
-                    reply: reply_tx,
-                });
-
-                match reply_rx.await {
-                    Ok(decision) => {
-                        let text = serde_json::to_string(&decision).unwrap();
-                        jsonrpc_response(
-                            id,
-                            json!({ "content": [{ "type": "text", "text": text }] }),
-                        )
-                    }
-                    Err(_) => {
-                        tracing::warn!("approval reply channel dropped");
-                        let deny = json!({
-                            "behavior": "deny",
-                            "message": "Approval request dropped"
-                        });
-                        let text = serde_json::to_string(&deny).unwrap();
-                        jsonrpc_response(
-                            id,
-                            json!({ "content": [{ "type": "text", "text": text }] }),
-                        )
-                    }
-                }
-            } else {
-                return make_json_response(jsonrpc_error(
+                Err(_) => jsonrpc_response(
                     id,
-                    -32601,
-                    format!("Unknown tool: {}", params.name),
-                ));
+                    json!({ "content": [{ "type": "text", "text": "tool execution failed: reply dropped" }], "isError": true }),
+                ),
             }
         }
         "notifications/initialized" => jsonrpc_response(id, json!({})),
@@ -1880,35 +1461,13 @@ async fn handle_capture(
         }
     };
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let _ = coord_tx.send(CoordMessage::ServiceRequest {
-        request_type: "capture".to_string(),
-        data: json!({}),
-        reply: reply_tx,
-    });
-
-    match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-        Ok(Ok(resp)) => {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", resp.content_type)
-                .body(Full::new(Bytes::from(resp.body)))
-                .unwrap()
-        }
-        Ok(Err(_)) => {
-            // Channel dropped — no client claimed or timeout fired.
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("no client handled the request")))
-                .unwrap()
-        }
-        Err(_) => {
-            Response::builder()
-                .status(StatusCode::GATEWAY_TIMEOUT)
-                .body(Full::new(Bytes::from("capture timed out")))
-                .unwrap()
-        }
-    }
+    // Capture not wired for Ping/Pong. Shotgun service requests
+    // will be restored when tools are added back.
+    drop(coord_tx);
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Full::new(Bytes::from("capture not available")))
+        .unwrap()
 }
 
 // -- HTTP/WebSocket connection handler --
@@ -1956,62 +1515,6 @@ async fn handle_request(
             let slug = slug.to_string();
             Ok(handle_mcp(req, &slug, server).await)
         }
-    } else if let Some(slug) = path.strip_prefix("/easement/") {
-        if slug.is_empty() {
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("missing slug in /easement/<slug>")))
-                .unwrap())
-        } else {
-            let slug = slug.to_string();
-            let coord_tx = {
-                let mut state = server.write().await;
-                let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    let slug_clone = slug.clone();
-                    let tx_clone = tx.clone();
-                    tokio::spawn(async move {
-                        run_coordinator(slug_clone, tx_clone, rx).await;
-                    });
-                    CoordinatorHandle { tx }
-                });
-                handle.tx.clone()
-            };
-
-            if req.method() == hyper::Method::POST {
-                let body = req.collect().await
-                    .map(|c| c.to_bytes())
-                    .unwrap_or_default();
-                let host = serde_json::from_slice::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("host").and_then(|h| h.as_str()).map(|s| s.to_string()));
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::SetRemoteHost {
-                    host,
-                    reply: reply_tx,
-                });
-
-                let current = reply_rx.await.unwrap_or(None);
-                let body = json!({ "host": current }).to_string();
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(body)))
-                    .unwrap())
-            } else {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::GetRemoteHost { reply: reply_tx });
-
-                let current = reply_rx.await.unwrap_or(None);
-                let body = json!({ "host": current }).to_string();
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(body)))
-                    .unwrap())
-            }
-        }
     } else if let Some(slug) = path.strip_prefix("/turn/") {
         if slug.is_empty() {
             Ok(Response::builder()
@@ -2046,9 +1549,8 @@ async fn handle_request(
                 let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let slug_clone = slug.clone();
-                    let tx_clone = tx.clone();
                     tokio::spawn(async move {
-                        run_coordinator(slug_clone, tx_clone, rx).await;
+                        run_coordinator(slug_clone, rx).await;
                     });
                     CoordinatorHandle { tx }
                 });
