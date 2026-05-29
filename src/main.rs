@@ -1148,9 +1148,26 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             cp.drain_sent
                         );
                         if is_steer_ack && !message.is_empty() {
-                            broadcast(&clients, "committed_user_message", json!({
-                                "message": message,
-                            }));
+                            tracing::info!(len = message.len(), has_bell = message.contains('\x07'), "steer ack message");
+                            let sentinel = "\n\x07---\n";
+                            let parts: Vec<&str> = message.split(sentinel).collect();
+                            tracing::info!(parts = parts.len(), "steer ack split");
+                            if parts.len() > 1 {
+                                for part in &parts {
+                                    let trimmed = part.trim();
+                                    if !trimmed.is_empty() {
+                                        tracing::info!(steer = %trimmed, "broadcasting committed_user_message");
+                                        broadcast(&clients, "committed_user_message", json!({
+                                            "message": trimmed,
+                                        }));
+                                    }
+                                }
+                            } else {
+                                tracing::info!(steer = %message, clients = clients.len(), "broadcasting single committed_user_message");
+                                broadcast(&clients, "committed_user_message", json!({
+                                    "message": message,
+                                }));
+                            }
                         }
                     }
                     ClaudeEvent::Result { usage, is_interrupted } => {
@@ -1171,6 +1188,33 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         }
 
                         if cp.is_drained() {
+                            // If there are missed steers, join them with the
+                            // bell-byte sentinel and write as one message. The
+                            // model sees newlines and dashes. When the replay
+                            // comes back we split on the sentinel and broadcast
+                            // each piece as an individual committed_user_message.
+                            if !steer_queue.is_empty() {
+                                if let Some(ref mut stdin) = cp.stdin {
+                                    let joined = steer_queue
+                                        .drain(..)
+                                        .collect::<Vec<_>>()
+                                        .join("\n\x07---\n");
+                                    let steer_turn_id = uuid::Uuid::new_v4().to_string();
+                                    cp.turn_id = Some(steer_turn_id.clone());
+                                    broadcast(&clients, "turn", json!({
+                                        "event": "started",
+                                        "turn_id": steer_turn_id,
+                                        "message": joined,
+                                    }));
+                                    let msg = format_user_message(&joined);
+                                    let _ = stdin.write_all(msg.as_bytes()).await;
+                                    let _ = stdin.flush().await;
+                                    cp.drain_sent += 1;
+                                    tracing::info!("wrote missed steers as combined message, started turn");
+                                }
+                                continue;
+                            }
+
                             let turn_id = cp.turn_id.clone();
                             let session_id = cp.session_id.clone();
                             let round_log = cp.round_log.clone();
