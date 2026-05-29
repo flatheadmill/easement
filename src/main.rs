@@ -198,7 +198,7 @@ fn format_user_message(content: &str) -> String {
 
 enum ClaudeEvent {
     Delta(Value),
-    Replay,
+    Replay { message: String },
     Result { usage: Option<Value>, is_interrupted: bool },
     SessionId(String),
     Eof,
@@ -682,8 +682,12 @@ async fn spawn_claude_print(
                         }
                     } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                         match &event {
-                            StdoutEvent::User { is_replay: true, .. } => {
-                                let _ = event_tx.send(ClaudeEvent::Replay).await;
+                            StdoutEvent::User { is_replay: true, message, .. } => {
+                                let text = message.get("content")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let _ = event_tx.send(ClaudeEvent::Replay { message: text }).await;
                             }
                             StdoutEvent::Result { subtype, .. } => {
                                 let usage = data.get("usage").cloned();
@@ -1121,15 +1125,23 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         tracing::info!(session_id = %sid, "captured session id from claude");
                         cp.session_id = Some(sid);
                     }
-                    ClaudeEvent::Replay => {
+                    ClaudeEvent::Replay { message } => {
                         cp.drain_replayed += 1;
+                        let is_steer_ack = cp.drain_replayed > 1;
                         tracing::debug!(
                             sent = cp.drain_sent,
                             replayed = cp.drain_replayed,
+                            is_steer_ack,
+                            message = %message,
                             "drain gate: {}/{}",
                             cp.drain_replayed,
                             cp.drain_sent
                         );
+                        if is_steer_ack && !message.is_empty() {
+                            broadcast(&clients, "committed_user_message", json!({
+                                "message": message,
+                            }));
+                        }
                     }
                     ClaudeEvent::Result { usage, is_interrupted } => {
                         if let Some(ref u) = usage {
