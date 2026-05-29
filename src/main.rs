@@ -422,6 +422,14 @@ enum CoordMessage {
         hostname: String,
         reply: oneshot::Sender<String>,
     },
+    Message {
+        message: String,
+        full: bool,
+        reply: oneshot::Sender<String>,
+    },
+    NewSession {
+        reply: oneshot::Sender<String>,
+    },
 }
 
 struct ToolResult {
@@ -800,6 +808,8 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
     let mut pending_tool_envelope: Option<(String, String, Value)> = None;
     let mut turn_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut pending_message_reply: Option<oneshot::Sender<String>> = None;
+    let mut response_accumulator: String = String::new();
 
     tracing::info!(
         slug = %slug,
@@ -927,6 +937,42 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         tracing::info!(from = %current_host, to = %hostname, "host switch");
                         current_host = hostname.clone();
                         let _ = reply.send(hostname);
+                    }
+                    CoordMessage::Message { message, full, reply } => {
+                        tracing::info!(message = %message, full, "synchronous message");
+                        // Queue the message as a turn with a reply channel.
+                        // When the round completes, we'll extract the assistant
+                        // response and send it back.
+                        if claude.is_some() {
+                            turn_queue.push_back(message);
+                        } else {
+                            let turn_id = uuid::Uuid::new_v4().to_string();
+                            broadcast(&clients, "turn", json!({
+                                "event": "started",
+                                "turn_id": turn_id,
+                            }));
+                            broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
+                            let entries = transcript.entries().to_vec();
+                            match spawn_claude_print(&slug, &message, &entries).await {
+                                Ok(mut cp) => {
+                                    cp.turn_id = Some(turn_id);
+                                    claude = Some(cp);
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(format!("error: {}", e));
+                                    continue;
+                                }
+                            }
+                        }
+                        pending_message_reply = Some(reply);
+                    }
+                    CoordMessage::NewSession { reply } => {
+                        let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+                        tracing::info!(timestamp = %ts, "new session");
+                        current_timestamp = Some(ts.clone());
+                        transcript = Transcript::new(&slug, Some(&ts));
+                        all_entries = vec![];
+                        let _ = reply.send(ts);
                     }
                     CoordMessage::Envelope { id, envelope } => {
                         exchange.log("client>wicket", &json!({
@@ -1147,8 +1193,16 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
             } => {
                 let cp = claude.as_mut().unwrap();
                 match event {
-                    ClaudeEvent::Delta(delta) => {
-                        broadcast(&clients, "delta", delta);
+                    ClaudeEvent::Delta(ref delta) => {
+                        if pending_message_reply.is_some() {
+                            if let Some(text) = delta.get("delta")
+                                .and_then(|d| d.get("text"))
+                                .and_then(|v| v.as_str())
+                            {
+                                response_accumulator.push_str(text);
+                            }
+                        }
+                        broadcast(&clients, "delta", delta.clone());
                     }
                     ClaudeEvent::SessionId(sid) => {
                         tracing::info!(session_id = %sid, "captured session id from claude");
@@ -1282,6 +1336,10 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
 
                             claude = None;
                             steer_queue.clear();
+                            if let Some(reply) = pending_message_reply.take() {
+                                let _ = reply.send(std::mem::take(&mut response_accumulator));
+                            }
+                            response_accumulator.clear();
                             tracing::info!("round completed");
 
                             if let Some(next_message) = turn_queue.pop_front() {
@@ -1348,6 +1406,10 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         claude = None;
                         steer_queue.clear();
                         turn_queue.clear();
+                        if let Some(reply) = pending_message_reply.take() {
+                            let _ = reply.send("error: claude exited unexpectedly".to_string());
+                        }
+                        response_accumulator.clear();
                     }
                 }
             }
@@ -1809,6 +1871,127 @@ async fn handle_request(
                 .header("content-type", "application/json")
                 .body(Full::new(Bytes::from(json!({"status": "ok"}).to_string())))
                 .unwrap())
+        }
+    } else if let Some(raw_slug) = path.strip_prefix("/message/") {
+        if raw_slug.is_empty() {
+            Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("missing slug")))
+                .unwrap())
+        } else if req.method() != hyper::Method::POST {
+            Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        } else {
+            let (slug, full) = if let Some(s) = raw_slug.strip_suffix("@full") {
+                (s.to_string(), true)
+            } else {
+                (raw_slug.to_string(), false)
+            };
+
+            let body = req.collect().await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            let message = payload.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if message.is_empty() {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from("missing message")))
+                    .unwrap());
+            }
+
+            let coord_tx = {
+                let mut state = server.write().await;
+                let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let slug_clone = slug.clone();
+                    tokio::spawn(async move {
+                        run_coordinator(slug_clone, rx).await;
+                    });
+                    CoordinatorHandle { tx }
+                });
+                handle.tx.clone()
+            };
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = coord_tx.send(CoordMessage::Message {
+                message,
+                full,
+                reply: reply_tx,
+            });
+
+            match tokio::time::timeout(std::time::Duration::from_secs(300), reply_rx).await {
+                Ok(Ok(response_text)) => {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/plain; charset=utf-8")
+                        .body(Full::new(Bytes::from(response_text)))
+                        .unwrap())
+                }
+                Ok(Err(_)) => {
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Full::new(Bytes::from("coordinator dropped reply")))
+                        .unwrap())
+                }
+                Err(_) => {
+                    Ok(Response::builder()
+                        .status(StatusCode::GATEWAY_TIMEOUT)
+                        .body(Full::new(Bytes::from("response timeout")))
+                        .unwrap())
+                }
+            }
+        }
+    } else if let Some(slug) = path.strip_prefix("/session/") {
+        if slug.is_empty() {
+            Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("missing slug")))
+                .unwrap())
+        } else if req.method() != hyper::Method::POST {
+            Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        } else {
+            let slug = slug.to_string();
+            let coord_tx = {
+                let mut state = server.write().await;
+                let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let slug_clone = slug.clone();
+                    tokio::spawn(async move {
+                        run_coordinator(slug_clone, rx).await;
+                    });
+                    CoordinatorHandle { tx }
+                });
+                handle.tx.clone()
+            };
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = coord_tx.send(CoordMessage::NewSession { reply: reply_tx });
+
+            match reply_rx.await {
+                Ok(timestamp) => {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from(json!({"timestamp": timestamp}).to_string())))
+                        .unwrap())
+                }
+                Err(_) => {
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Full::new(Bytes::from("failed")))
+                        .unwrap())
+                }
+            }
         }
     } else if path == "/health" {
         Ok(Response::builder()
