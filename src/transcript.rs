@@ -31,7 +31,7 @@ impl Transcript {
         let dir = std::path::Path::new(&home)
             .join(".local")
             .join("state")
-            .join("wicket")
+            .join("easement")
             .join(slug);
         let _ = fs::create_dir_all(&dir);
         let filename = match timestamp {
@@ -222,7 +222,7 @@ impl Sessions {
         let state_dir = std::path::Path::new(&home)
             .join(".local")
             .join("state")
-            .join("wicket");
+            .join("easement");
 
         // Load the most recent local session from disk.
         let local = Self::read_latest(&state_dir, slug);

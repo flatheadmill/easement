@@ -55,7 +55,7 @@ impl ExchangeLog {
     fn new(slug: &str) -> Self {
         let home = env::var("HOME").expect("HOME not set");
         let dir = std::path::Path::new(&home)
-            .join(".local/state/wicket")
+            .join(".local/state/easement")
             .join(slug);
         let _ = std::fs::create_dir_all(&dir);
         Self {
@@ -141,19 +141,19 @@ fn init_tracing() -> WorkerGuard {
     let log_dir = std::path::Path::new(&home)
         .join(".local")
         .join("state")
-        .join("wicket");
+        .join("easement");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("wicket.log"))
-        .expect("failed to open wicket.log");
+        .open(log_dir.join("easement.log"))
+        .expect("failed to open easement.log");
 
     let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("wicket=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("easement=debug"));
 
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
@@ -425,6 +425,7 @@ enum CoordMessage {
     Message {
         message: String,
         full: bool,
+        notification: bool,
         reply: oneshot::Sender<String>,
     },
     NewSession {
@@ -593,7 +594,7 @@ async fn spawn_claude_print(
     let mut resume_arg: Option<String> = None;
     if !transcript_entries.is_empty() {
         round_log.log_sent(transcript_entries);
-        let tmp_path = std::env::temp_dir().join(format!("wicket-{}.jsonl", slug));
+        let tmp_path = std::env::temp_dir().join(format!("easement-{}.jsonl", slug));
         let mut content = String::new();
         for entry in transcript_entries {
             if let Ok(line) = serde_json::to_string(entry) {
@@ -622,7 +623,7 @@ async fn spawn_claude_print(
         .arg("--add-dir").arg(format!("{}/code", home));
 
     let mcp_config_path = std::env::temp_dir()
-        .join(format!("wicket-mcp-{}.json", slug));
+        .join(format!("easement-mcp-{}.json", slug));
     let mcp_config = json!({
         "mcpServers": {
             "wicket": {
@@ -756,9 +757,9 @@ async fn spawn_claude_print(
     })
 }
 
-// -- Smedly spawn --
+// -- Wicket spawn --
 
-fn spawn_smedly(host: &str, slug: &str) -> Result<tokio::process::Child, String> {
+fn spawn_wicket(host: &str, slug: &str) -> Result<tokio::process::Child, String> {
     let is_orb = host.contains("orb");
     let wicket_url = if is_orb {
         "ws://host.internal:6502"
@@ -769,7 +770,7 @@ fn spawn_smedly(host: &str, slug: &str) -> Result<tokio::process::Child, String>
     };
 
     let mut cmd = if host == "localhost" {
-        let mut c = tokio::process::Command::new("smedly");
+        let mut c = tokio::process::Command::new("wicket");
         c.arg(wicket_url).arg(slug).arg("localhost");
         c
     } else {
@@ -777,7 +778,7 @@ fn spawn_smedly(host: &str, slug: &str) -> Result<tokio::process::Child, String>
         if !is_orb {
             c.arg("-R").arg("6502:localhost:6502");
         }
-        c.arg(host).arg("smedly").arg(wicket_url).arg(slug).arg(host);
+        c.arg(host).arg("wicket").arg(wicket_url).arg(slug).arg(host);
         c
     };
 
@@ -785,7 +786,7 @@ fn spawn_smedly(host: &str, slug: &str) -> Result<tokio::process::Child, String>
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    cmd.spawn().map_err(|e| format!("failed to spawn smedly on {}: {}", host, e))
+    cmd.spawn().map_err(|e| format!("failed to spawn wicket on {}: {}", host, e))
 }
 
 // -- Coordinator (per-slug) --
@@ -815,18 +816,34 @@ fn full_slot(transcripts: &mut BTreeMap<String, TranscriptSlot>) -> Option<&mut 
     transcripts.values_mut().rev().nth(1)
 }
 
-async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
+async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
     let exchange = ExchangeLog::new(&slug);
     let mut transcripts: BTreeMap<String, TranscriptSlot> = BTreeMap::new();
-    let default_ts = "default".to_string();
-    transcripts.insert(default_ts.clone(), TranscriptSlot::new(&slug, None));
+
+    let home = env::var("HOME").unwrap_or_default();
+    let state_dir = std::path::Path::new(&home)
+        .join(".local/state/easement")
+        .join(&slug);
+    if let Ok(entries) = std::fs::read_dir(&state_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".jsonl") && name != "exchange.jsonl" {
+                    let ts = name.trim_end_matches(".jsonl").to_string();
+                    transcripts.insert(ts.clone(), TranscriptSlot::new(&slug, Some(&ts)));
+                }
+            }
+        }
+    }
+    if transcripts.is_empty() {
+        transcripts.insert("default".to_string(), TranscriptSlot::new(&slug, None));
+    }
 
     let mut clients: Clients = HashMap::new();
     let mut claude: Option<ClaudePrint> = None;
     let mut last_usage: Option<Value> = None;
     let mut pending_service: Option<PendingService> = None;
-    let mut smedlys: HashMap<String, u64> = HashMap::new();
-    let mut smedly_children: Vec<tokio::process::Child> = Vec::new();
+    let mut wickets: HashMap<String, u64> = HashMap::new();
+    let mut wicket_children: Vec<tokio::process::Child> = Vec::new();
     let mut current_host: String = "localhost".to_string();
     let mut pending_tool: Option<(String, oneshot::Sender<ToolResult>)> = None;
     let mut pending_tool_envelope: Option<(String, String, Value)> = None;
@@ -847,13 +864,13 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
             Some(msg) = coord_rx.recv() => {
                 match msg {
                     CoordMessage::ClientConnected { id, protocol, timestamp, host, tx } => {
-                        if protocol == "smedly" {
-                            let smedly_host = host.clone().unwrap_or_else(|| "localhost".to_string());
-                            smedlys.insert(smedly_host.clone(), id);
+                        if protocol == "wicket" {
+                            let wicket_host = host.clone().unwrap_or_else(|| "localhost".to_string());
+                            wickets.insert(wicket_host.clone(), id);
                             clients.insert(id, tx);
-                            tracing::info!(client_id = id, host = %smedly_host, "smedly connected");
+                            tracing::info!(client_id = id, host = %wicket_host, "wicket connected");
                             if let Some((call_id, tool, args)) = pending_tool_envelope.take() {
-                                tracing::info!(call_id = %call_id, tool = %tool, "draining pending tool call to smedly");
+                                tracing::info!(call_id = %call_id, tool = %tool, "draining pending tool call to wicket");
                                 send_to(&clients, id, &tool, json!({
                                     "call_id": call_id,
                                     "slug": slug,
@@ -869,6 +886,10 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             }
                             continue;
                         }
+                        if protocol != "easement" {
+                            tracing::warn!(client_id = id, protocol = %protocol, "unknown protocol, dropping");
+                            continue;
+                        }
                         if let Some(ref ts) = timestamp {
                             if !transcripts.contains_key(ts) {
                                 transcripts.insert(ts.clone(), TranscriptSlot::new(&slug, Some(ts)));
@@ -877,12 +898,9 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             tracing::info!(timestamp = %ts, entries = slot.entries.len(), "client using timestamped transcript");
                         }
                         if let Some(slot) = current_slot(&mut transcripts) {
+                            let single_client: Clients = [(id, tx.clone())].into();
                             for entry in &slot.entries {
-                                if let Ok(data) = serde_json::to_value(entry) {
-                                    if let Some(json) = envelope_json("entry", data) {
-                                        let _ = tx.send(json);
-                                    }
-                                }
+                                broadcast_entry(&single_client, entry);
                             }
                         }
                         if let Some(ref usage) = last_usage {
@@ -895,15 +913,15 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                     }
                     CoordMessage::ClientDisconnected { id } => {
                         clients.remove(&id);
-                        let was_smedly = smedlys.iter()
+                        let was_wicket = wickets.iter()
                             .find(|&(_, cid)| *cid == id)
                             .map(|(h, _)| h.clone());
-                        if let Some(host) = was_smedly {
-                            smedlys.remove(&host);
-                            tracing::info!(client_id = id, host = %host, "smedly disconnected");
+                        if let Some(host) = was_wicket {
+                            wickets.remove(&host);
+                            tracing::info!(client_id = id, host = %host, "wicket disconnected");
                             if let Some((_call_id, reply)) = pending_tool.take() {
                                 let _ = reply.send(ToolResult {
-                                    output: "smedly disconnected".to_string(),
+                                    output: "wicket disconnected".to_string(),
                                     exit_code: 1,
                                 });
                             }
@@ -927,8 +945,8 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 }
                             }
                         }
-                        if let Some(&sid) = smedlys.get(&current_host) {
-                            tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "forwarding tool call to smedly");
+                        if let Some(&sid) = wickets.get(&current_host) {
+                            tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "forwarding tool call to wicket");
                             pending_tool = Some((call_id.clone(), reply));
                             send_to(&clients, sid, &tool, json!({
                                 "call_id": call_id,
@@ -943,11 +961,11 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
                         } else {
-                            tracing::info!(host = %current_host, "no smedly for host, spawning");
-                            match spawn_smedly(&current_host, &slug) {
+                            tracing::info!(host = %current_host, "no wicket for host, spawning");
+                            match spawn_wicket(&current_host, &slug) {
                                 Ok(child) => {
-                                    smedly_children.push(child);
-                                    tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "stashing tool call, waiting for smedly");
+                                    wicket_children.push(child);
+                                    tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "stashing tool call, waiting for wicket");
                                     pending_tool = Some((call_id.clone(), reply));
                                     pending_tool_envelope = Some((call_id, tool, args));
                                 }
@@ -965,8 +983,13 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         current_host = hostname.clone();
                         let _ = reply.send(hostname);
                     }
-                    CoordMessage::Message { message, full, reply } => {
-                        tracing::info!(message = %message, full, "synchronous message");
+                    CoordMessage::Message { message, full, notification, reply } => {
+                        let message = if notification {
+                            format!("\x07**notification**: {}", message)
+                        } else {
+                            message
+                        };
+                        tracing::info!(message = %message, full, notification, "synchronous message");
                         if claude.is_some() {
                             turn_queue.push_back(message);
                         } else {
@@ -1076,22 +1099,22 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 }
                             }
                             "shell" => {
-                                if !smedlys.contains_key(&current_host) {
-                                    tracing::info!(host = %current_host, "no smedly for host, spawning for shell");
-                                    if let Ok(child) = spawn_smedly(&current_host, &slug) {
-                                        smedly_children.push(child);
+                                if !wickets.contains_key(&current_host) {
+                                    tracing::info!(host = %current_host, "no wicket for host, spawning for shell");
+                                    if let Ok(child) = spawn_wicket(&current_host, &slug) {
+                                        wicket_children.push(child);
                                         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                                        while !smedlys.contains_key(&current_host) {
+                                        while !wickets.contains_key(&current_host) {
                                             if tokio::time::Instant::now() > deadline { break; }
                                             match tokio::time::timeout(
                                                 std::time::Duration::from_millis(100),
                                                 coord_rx.recv(),
                                             ).await {
                                                 Ok(Some(CoordMessage::ClientConnected { id: cid, protocol: proto, host: h, timestamp: _, tx })) => {
-                                                    if proto == "smedly" {
-                                                        let smedly_host = h.unwrap_or_else(|| "localhost".to_string());
-                                                        smedlys.insert(smedly_host.clone(), cid);
-                                                        tracing::info!(client_id = cid, host = %smedly_host, "smedly connected for shell");
+                                                    if proto == "wicket" {
+                                                        let wicket_host = h.unwrap_or_else(|| "localhost".to_string());
+                                                        wickets.insert(wicket_host.clone(), cid);
+                                                        tracing::info!(client_id = cid, host = %wicket_host, "wicket connected for shell");
                                                     }
                                                     clients.insert(cid, tx);
                                                 }
@@ -1100,15 +1123,15 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                         }
                                     }
                                 }
-                                if let Some(&sid) = smedlys.get(&current_host) {
+                                if let Some(&sid) = wickets.get(&current_host) {
                                     let call_id = uuid::Uuid::new_v4().to_string();
                                     send_to(&clients, sid, "shell", json!({
                                         "call_id": call_id,
                                         "command": envelope.data.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                                     }));
-                                    tracing::info!(host = %current_host, "shell command forwarded to smedly");
+                                    tracing::info!(host = %current_host, "shell command forwarded to wicket");
                                 } else {
-                                    broadcast_error(&clients, "smedly failed to connect for shell command");
+                                    broadcast_error(&clients, "wicket failed to connect for shell command");
                                 }
                             }
                             "claim" => {
@@ -1172,7 +1195,7 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 let exit_code = envelope.data.get("exit_code")
                                     .and_then(|v| v.as_i64())
                                     .unwrap_or(-1) as i32;
-                                tracing::info!(call_id = %call_id, exit_code, output_len = output.len(), "tool result from smedly");
+                                tracing::info!(call_id = %call_id, exit_code, output_len = output.len(), "tool result from wicket");
                                 broadcast(&clients, "tool_done", json!({
                                     "tool": "zsh",
                                     "output": &output,
@@ -1188,6 +1211,43 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             }
                             "shell_result" => {
                                 broadcast(&clients, "shell_result", envelope.data);
+                            }
+                            "background_output" => {
+                                let path = envelope.data.get("output_path")
+                                    .and_then(|v| v.as_str()).unwrap_or("");
+                                let line = envelope.data.get("line")
+                                    .and_then(|v| v.as_str()).unwrap_or("");
+                                if !path.is_empty() {
+                                    if let Some(parent) = std::path::Path::new(path).parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true).append(true).open(path)
+                                    {
+                                        let _ = std::io::Write::write_all(&mut f, line.as_bytes());
+                                        let _ = std::io::Write::write_all(&mut f, b"\n");
+                                    }
+                                }
+                            }
+                            "background_done" => {
+                                let task_uuid = envelope.data.get("task_uuid")
+                                    .and_then(|v| v.as_str()).unwrap_or("");
+                                let exit_code = envelope.data.get("exit_code")
+                                    .and_then(|v| v.as_i64()).unwrap_or(-1);
+                                let output_path = envelope.data.get("output_path")
+                                    .and_then(|v| v.as_str()).unwrap_or("");
+                                tracing::info!(task_uuid = %task_uuid, exit_code, output_path = %output_path, "background task done");
+                                let notif_text = format!(
+                                    "background task {} exited with code {}, output at {}",
+                                    task_uuid, exit_code, output_path
+                                );
+                                let (reply_tx, _) = oneshot::channel();
+                                let _ = coord_tx.send(CoordMessage::Message {
+                                    message: notif_text,
+                                    full: false,
+                                    notification: true,
+                                    reply: reply_tx,
+                                });
                             }
                             "heartbeat" => {}
                             "log" => {
@@ -1495,8 +1555,9 @@ async fn handle_websocket(
         let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             let slug_clone = slug.clone();
+            let self_tx = tx.clone();
             tokio::spawn(async move {
-                run_coordinator(slug_clone, rx).await;
+                run_coordinator(slug_clone, self_tx, rx).await;
             });
             CoordinatorHandle { tx }
         });
@@ -1506,7 +1567,13 @@ async fn handle_websocket(
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<String>();
 
-    let protocol = connect.protocol.unwrap_or_else(|| "wicket".to_string());
+    let protocol = match connect.protocol {
+        Some(p) => p,
+        None => {
+            tracing::warn!("client connected without protocol, dropping");
+            return;
+        }
+    };
 
     let _ = coord_tx.send(CoordMessage::ClientConnected {
         id: client_id,
@@ -1603,7 +1670,7 @@ async fn handle_mcp(
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "wicket", "version": "0.1.0" }
+                "serverInfo": { "name": "easement", "version": "0.1.0" }
             }),
         ),
         "tools/list" => jsonrpc_response(
@@ -1884,8 +1951,9 @@ async fn handle_request(
                 let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let slug_clone = slug.clone();
+                    let self_tx = tx.clone();
                     tokio::spawn(async move {
-                        run_coordinator(slug_clone, rx).await;
+                        run_coordinator(slug_clone, self_tx, rx).await;
                     });
                     CoordinatorHandle { tx }
                 });
@@ -1947,18 +2015,24 @@ async fn handle_request(
                 let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let slug_clone = slug.clone();
+                    let self_tx = tx.clone();
                     tokio::spawn(async move {
-                        run_coordinator(slug_clone, rx).await;
+                        run_coordinator(slug_clone, self_tx, rx).await;
                     });
                     CoordinatorHandle { tx }
                 });
                 handle.tx.clone()
             };
 
+            let notification = payload.get("notification")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = coord_tx.send(CoordMessage::Message {
                 message,
                 full,
+                notification,
                 reply: reply_tx,
             });
 
@@ -2002,8 +2076,9 @@ async fn handle_request(
                 let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let slug_clone = slug.clone();
+                    let self_tx = tx.clone();
                     tokio::spawn(async move {
-                        run_coordinator(slug_clone, rx).await;
+                        run_coordinator(slug_clone, self_tx, rx).await;
                     });
                     CoordinatorHandle { tx }
                 });
@@ -2053,7 +2128,7 @@ async fn main() {
 
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
-            tracing::info!("wicket listening on {}", addr);
+            tracing::info!("easement listening on {}", addr);
             l
         }
         Err(e) => {
