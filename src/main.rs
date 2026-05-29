@@ -904,6 +904,44 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                     }
                                 }
                             }
+                            "shell" => {
+                                if smedly_id.is_none() {
+                                    tracing::info!("no smedly connected for shell, spawning localhost");
+                                    let mut cmd = tokio::process::Command::new("smedly");
+                                    cmd.arg("ws://localhost:6502").arg(&slug);
+                                    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                                    if let Ok(child) = cmd.spawn() {
+                                        smedly_child = Some(child);
+                                        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                                        while smedly_id.is_none() {
+                                            if tokio::time::Instant::now() > deadline { break; }
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_millis(100),
+                                                coord_rx.recv(),
+                                            ).await {
+                                                Ok(Some(CoordMessage::ClientConnected { id: cid, protocol: proto, host: h, timestamp: _, tx })) => {
+                                                    if proto == "smedly" {
+                                                        smedly_id = Some(cid);
+                                                        tracing::info!(client_id = cid, host = ?h, "smedly connected for shell");
+                                                    }
+                                                    clients.insert(cid, tx);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(sid) = smedly_id {
+                                    let call_id = uuid::Uuid::new_v4().to_string();
+                                    send_to(&clients, sid, "shell", json!({
+                                        "call_id": call_id,
+                                        "command": envelope.data.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                    }));
+                                    tracing::info!("shell command forwarded to smedly");
+                                } else {
+                                    broadcast_error(&clients, "smedly failed to connect for shell command");
+                                }
+                            }
                             "claim" => {
                                 let claim_id = envelope.data.get("id")
                                     .and_then(|v| v.as_str())
@@ -978,6 +1016,9 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                         tracing::warn!(expected = %pending_call_id, got = %call_id, "tool result call_id mismatch");
                                     }
                                 }
+                            }
+                            "shell_result" => {
+                                broadcast(&clients, "shell_result", envelope.data);
                             }
                             "heartbeat" => {}
                             "log" => {
