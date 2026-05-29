@@ -953,7 +953,6 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 broadcast(&clients, "turn", json!({
                                     "event": "started",
                                     "turn_id": turn_id,
-                                    "message": message,
                                 }));
                                 broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
 
@@ -1178,24 +1177,15 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             cp.drain_sent
                         );
                         if is_steer_ack && !message.is_empty() {
-                            tracing::info!(len = message.len(), has_bell = message.contains('\x07'), "steer ack message");
                             let parts: Vec<&str> = message.split(STEER_SENTINEL).collect();
-                            tracing::info!(parts = parts.len(), "steer ack split");
-                            if parts.len() > 1 {
-                                for part in &parts {
-                                    let trimmed = part.trim();
-                                    if !trimmed.is_empty() {
-                                        tracing::info!(steer = %trimmed, "broadcasting committed_user_message");
-                                        broadcast(&clients, "committed_user_message", json!({
-                                            "message": trimmed,
-                                        }));
-                                    }
+                            for part in &parts {
+                                let trimmed = part.trim();
+                                if !trimmed.is_empty() {
+                                    tracing::info!(steer = %trimmed, "broadcasting user_message");
+                                    broadcast(&clients, "user_message", json!({
+                                        "text": trimmed,
+                                    }));
                                 }
-                            } else {
-                                tracing::info!(steer = %message, clients = clients.len(), "broadcasting single committed_user_message");
-                                broadcast(&clients, "committed_user_message", json!({
-                                    "message": message,
-                                }));
                             }
                         }
                     }
@@ -1233,7 +1223,6 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                     broadcast(&clients, "turn", json!({
                                         "event": "started",
                                         "turn_id": steer_turn_id,
-                                        "message": joined,
                                     }));
                                     let msg = format_user_message(&joined);
                                     let _ = stdin.write_all(msg.as_bytes()).await;
@@ -1301,7 +1290,6 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 broadcast(&clients, "turn", json!({
                                     "event": "started",
                                     "turn_id": turn_id,
-                                    "message": next_message,
                                 }));
                                 broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
                                 let entries = transcript.entries().to_vec();
