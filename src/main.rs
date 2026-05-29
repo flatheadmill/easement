@@ -940,9 +940,6 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                     }
                     CoordMessage::Message { message, full, reply } => {
                         tracing::info!(message = %message, full, "synchronous message");
-                        // Queue the message as a turn with a reply channel.
-                        // When the round completes, we'll extract the assistant
-                        // response and send it back.
                         if claude.is_some() {
                             turn_queue.push_back(message);
                         } else {
@@ -950,6 +947,9 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             broadcast(&clients, "turn", json!({
                                 "event": "started",
                                 "turn_id": turn_id,
+                            }));
+                            broadcast(&clients, "user_message", json!({
+                                "text": message,
                             }));
                             broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
                             let entries = transcript.entries().to_vec();
@@ -999,6 +999,9 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 broadcast(&clients, "turn", json!({
                                     "event": "started",
                                     "turn_id": turn_id,
+                                }));
+                                broadcast(&clients, "user_message", json!({
+                                    "text": message,
                                 }));
                                 broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
 
