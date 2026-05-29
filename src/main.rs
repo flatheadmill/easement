@@ -764,6 +764,8 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
     let mut current_host: String = "localhost".to_string();
     let mut pending_tool: Option<(String, oneshot::Sender<ToolResult>)> = None;
     let mut pending_tool_envelope: Option<(String, String, Value)> = None;
+    let mut turn_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     tracing::info!(
         slug = %slug,
@@ -838,6 +840,22 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
                     CoordMessage::ToolCall { call_id, tool, args, reply } => {
+                        // Flush steers to ClaudePrint stdin before dispatching.
+                        if !steer_queue.is_empty() {
+                            if let Some(ref mut cp) = claude {
+                                if let Some(ref mut stdin) = cp.stdin {
+                                    let count = steer_queue.len();
+                                    while let Some(steer) = steer_queue.pop_front() {
+                                        let msg = format_user_message(&steer);
+                                        let _ = stdin.write_all(msg.as_bytes()).await;
+                                        cp.drain_sent += 1;
+                                    }
+                                    let _ = stdin.flush().await;
+                                    tracing::info!(count, "flushed steers to ClaudePrint stdin");
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                }
+                            }
+                        }
                         if let Some(&sid) = smedlys.get(&current_host) {
                             tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "forwarding tool call to smedly");
                             pending_tool = Some((call_id.clone(), reply));
@@ -884,34 +902,31 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         }));
 
                         match envelope.stream.as_str() {
-                            "claude" => {
+                            "turn" | "claude" => {
+                                let message = envelope.data.get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
                                 if claude.is_some() {
-                                    tracing::warn!("claude envelope while ClaudePrint is running, ignoring");
+                                    tracing::info!(message = %message, "turn queued, ClaudePrint active");
+                                    turn_queue.push_back(message);
                                     continue;
                                 }
-
-                                let msg: ClaudeMessage = match serde_json::from_value(envelope.data) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        tracing::warn!("bad claude message: {}", e);
-                                        broadcast_error(&clients, &format!("bad claude message: {}", e));
-                                        continue;
-                                    }
-                                };
 
                                 let turn_id = uuid::Uuid::new_v4().to_string();
 
                                 broadcast(&clients, "turn", json!({
                                     "event": "started",
                                     "turn_id": turn_id,
-                                    "message": msg.message,
+                                    "message": message,
                                 }));
                                 broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
 
                                 let entries = transcript.entries().to_vec();
                                 tracing::info!(turn_id = %turn_id, transcript_entries = entries.len(), "spawning ClaudePrint");
 
-                                match spawn_claude_print(&slug, &msg.message, &entries).await {
+                                match spawn_claude_print(&slug, &message, &entries).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
@@ -921,6 +936,16 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                         broadcast_error(&clients, &e);
                                         broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed { message: e });
                                     }
+                                }
+                            }
+                            "steer" => {
+                                let message = envelope.data.get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !message.is_empty() {
+                                    tracing::info!(message = %message, "steer queued");
+                                    steer_queue.push_back(message);
                                 }
                             }
                             "interrupt" => {
@@ -1172,7 +1197,30 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                             }
 
                             claude = None;
+                            steer_queue.clear();
                             tracing::info!("round completed");
+
+                            if let Some(next_message) = turn_queue.pop_front() {
+                                tracing::info!(message = %next_message, "dispatching queued turn");
+                                let turn_id = uuid::Uuid::new_v4().to_string();
+                                broadcast(&clients, "turn", json!({
+                                    "event": "started",
+                                    "turn_id": turn_id,
+                                    "message": next_message,
+                                }));
+                                broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
+                                let entries = transcript.entries().to_vec();
+                                match spawn_claude_print(&slug, &next_message, &entries).await {
+                                    Ok(mut cp) => {
+                                        cp.turn_id = Some(turn_id);
+                                        claude = Some(cp);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("failed to spawn ClaudePrint for queued turn: {}", e);
+                                        broadcast_error(&clients, &e);
+                                    }
+                                }
+                            }
                         }
                     }
                     ClaudeEvent::Eof => {
@@ -1215,6 +1263,8 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         }
 
                         claude = None;
+                        steer_queue.clear();
+                        turn_queue.clear();
                     }
                 }
             }
