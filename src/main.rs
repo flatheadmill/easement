@@ -459,8 +459,38 @@ fn broadcast(clients: &Clients, stream: &'static str, data: Value) {
     }
 }
 
+const STEER_SENTINEL: &str = "\n\x07---\n";
+
 fn broadcast_entry(clients: &Clients, entry: &NormalizedEntry) {
-    if let Ok(data) = serde_json::to_value(entry) {
+    if entry.kind == "user" && entry.blocks.iter().any(|b| {
+        matches!(b, crate::protocol::ContentBlock::Text { text } if text.contains(STEER_SENTINEL))
+    }) {
+        for block in &entry.blocks {
+            if let crate::protocol::ContentBlock::Text { text } = block {
+                for part in text.split(STEER_SENTINEL) {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        let split_entry = NormalizedEntry {
+                            kind: entry.kind,
+                            blocks: vec![crate::protocol::ContentBlock::Text {
+                                text: trimmed.to_string(),
+                            }],
+                            uuid: None,
+                            seq: entry.seq,
+                            timestamp: entry.timestamp.clone(),
+                            input_tokens: None,
+                            output_tokens: None,
+                        };
+                        if let Ok(data) = serde_json::to_value(&split_entry) {
+                            broadcast(clients, "entry", data);
+                        }
+                    }
+                }
+            } else if let Ok(data) = serde_json::to_value(entry) {
+                broadcast(clients, "entry", data);
+            }
+        }
+    } else if let Ok(data) = serde_json::to_value(entry) {
         broadcast(clients, "entry", data);
     }
 }
@@ -1149,8 +1179,7 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         );
                         if is_steer_ack && !message.is_empty() {
                             tracing::info!(len = message.len(), has_bell = message.contains('\x07'), "steer ack message");
-                            let sentinel = "\n\x07---\n";
-                            let parts: Vec<&str> = message.split(sentinel).collect();
+                            let parts: Vec<&str> = message.split(STEER_SENTINEL).collect();
                             tracing::info!(parts = parts.len(), "steer ack split");
                             if parts.len() > 1 {
                                 for part in &parts {
@@ -1198,7 +1227,7 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                     let joined = steer_queue
                                         .drain(..)
                                         .collect::<Vec<_>>()
-                                        .join("\n\x07---\n");
+                                        .join(STEER_SENTINEL);
                                     let steer_turn_id = uuid::Uuid::new_v4().to_string();
                                     cp.turn_id = Some(steer_turn_id.clone());
                                     broadcast(&clients, "turn", json!({
