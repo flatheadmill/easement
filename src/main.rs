@@ -418,6 +418,10 @@ enum CoordMessage {
         args: Value,
         reply: oneshot::Sender<ToolResult>,
     },
+    SetHost {
+        hostname: String,
+        reply: oneshot::Sender<String>,
+    },
 }
 
 struct ToolResult {
@@ -710,6 +714,38 @@ async fn spawn_claude_print(
     })
 }
 
+// -- Smedly spawn --
+
+fn spawn_smedly(host: &str, slug: &str) -> Result<tokio::process::Child, String> {
+    let is_orb = host.contains("orb");
+    let wicket_url = if is_orb {
+        "ws://host.internal:6502"
+    } else if host == "localhost" {
+        "ws://localhost:6502"
+    } else {
+        "ws://localhost:6502"
+    };
+
+    let mut cmd = if host == "localhost" {
+        let mut c = tokio::process::Command::new("smedly");
+        c.arg(wicket_url).arg(slug).arg("localhost");
+        c
+    } else {
+        let mut c = tokio::process::Command::new("ssh");
+        if !is_orb {
+            c.arg("-R").arg("6502:localhost:6502");
+        }
+        c.arg(host).arg("smedly").arg(wicket_url).arg(slug).arg(host);
+        c
+    };
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    cmd.spawn().map_err(|e| format!("failed to spawn smedly on {}: {}", host, e))
+}
+
 // -- Coordinator (per-slug) --
 
 async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
@@ -723,8 +759,9 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
     let mut last_usage: Option<Value> = None;
     let mut current_timestamp: Option<String> = None;
     let mut pending_service: Option<PendingService> = None;
-    let mut smedly_id: Option<u64> = None;
-    let mut smedly_child: Option<tokio::process::Child> = None;
+    let mut smedlys: HashMap<String, u64> = HashMap::new();
+    let mut smedly_children: Vec<tokio::process::Child> = Vec::new();
+    let mut current_host: String = "localhost".to_string();
     let mut pending_tool: Option<(String, oneshot::Sender<ToolResult>)> = None;
     let mut pending_tool_envelope: Option<(String, String, Value)> = None;
 
@@ -740,9 +777,10 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                 match msg {
                     CoordMessage::ClientConnected { id, protocol, timestamp, host, tx } => {
                         if protocol == "smedly" {
-                            smedly_id = Some(id);
+                            let smedly_host = host.clone().unwrap_or_else(|| "localhost".to_string());
+                            smedlys.insert(smedly_host.clone(), id);
                             clients.insert(id, tx);
-                            tracing::info!(client_id = id, host = ?host, "smedly connected");
+                            tracing::info!(client_id = id, host = %smedly_host, "smedly connected");
                             if let Some((call_id, tool, args)) = pending_tool_envelope.take() {
                                 tracing::info!(call_id = %call_id, tool = %tool, "draining pending tool call to smedly");
                                 send_to(&clients, id, &tool, json!({
@@ -784,10 +822,13 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                     }
                     CoordMessage::ClientDisconnected { id } => {
                         clients.remove(&id);
-                        if smedly_id == Some(id) {
-                            smedly_id = None;
-                            tracing::info!(client_id = id, "smedly disconnected");
-                            if let Some((call_id, reply)) = pending_tool.take() {
+                        let was_smedly = smedlys.iter()
+                            .find(|&(_, cid)| *cid == id)
+                            .map(|(h, _)| h.clone());
+                        if let Some(host) = was_smedly {
+                            smedlys.remove(&host);
+                            tracing::info!(client_id = id, host = %host, "smedly disconnected");
+                            if let Some((_call_id, reply)) = pending_tool.take() {
                                 let _ = reply.send(ToolResult {
                                     output: "smedly disconnected".to_string(),
                                     exit_code: 1,
@@ -797,12 +838,8 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
                     CoordMessage::ToolCall { call_id, tool, args, reply } => {
-                        let ensure_smedly = || -> Option<u64> {
-                            // placeholder — smedly_id is captured below
-                            None
-                        };
-                        if let Some(sid) = smedly_id {
-                            tracing::info!(call_id = %call_id, tool = %tool, args = %args, "forwarding tool call to smedly");
+                        if let Some(&sid) = smedlys.get(&current_host) {
+                            tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "forwarding tool call to smedly");
                             pending_tool = Some((call_id.clone(), reply));
                             send_to(&clients, sid, &tool, json!({
                                 "call_id": call_id,
@@ -817,29 +854,27 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
                         } else {
-                            // No smedly connected — spawn one and stash the tool call.
-                            // The select loop will process the connect-back and drain the pending call.
-                            tracing::info!("no smedly connected, spawning localhost");
-                            let mut cmd = tokio::process::Command::new("smedly");
-                            cmd.arg("ws://localhost:6502").arg(&slug);
-                            cmd.stdin(Stdio::null())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null());
-                            match cmd.spawn() {
+                            tracing::info!(host = %current_host, "no smedly for host, spawning");
+                            match spawn_smedly(&current_host, &slug) {
                                 Ok(child) => {
-                                    smedly_child = Some(child);
-                                    tracing::info!(call_id = %call_id, tool = %tool, args = %args, "stashing tool call, waiting for smedly");
+                                    smedly_children.push(child);
+                                    tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "stashing tool call, waiting for smedly");
                                     pending_tool = Some((call_id.clone(), reply));
                                     pending_tool_envelope = Some((call_id, tool, args));
                                 }
                                 Err(e) => {
                                     let _ = reply.send(ToolResult {
-                                        output: format!("failed to spawn smedly: {}", e),
+                                        output: e,
                                         exit_code: 1,
                                     });
                                 }
                             }
                         }
+                    }
+                    CoordMessage::SetHost { hostname, reply } => {
+                        tracing::info!(from = %current_host, to = %hostname, "host switch");
+                        current_host = hostname.clone();
+                        let _ = reply.send(hostname);
                     }
                     CoordMessage::Envelope { id, envelope } => {
                         exchange.log("client>wicket", &json!({
@@ -905,15 +940,12 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                 }
                             }
                             "shell" => {
-                                if smedly_id.is_none() {
-                                    tracing::info!("no smedly connected for shell, spawning localhost");
-                                    let mut cmd = tokio::process::Command::new("smedly");
-                                    cmd.arg("ws://localhost:6502").arg(&slug);
-                                    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-                                    if let Ok(child) = cmd.spawn() {
-                                        smedly_child = Some(child);
+                                if !smedlys.contains_key(&current_host) {
+                                    tracing::info!(host = %current_host, "no smedly for host, spawning for shell");
+                                    if let Ok(child) = spawn_smedly(&current_host, &slug) {
+                                        smedly_children.push(child);
                                         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                                        while smedly_id.is_none() {
+                                        while !smedlys.contains_key(&current_host) {
                                             if tokio::time::Instant::now() > deadline { break; }
                                             match tokio::time::timeout(
                                                 std::time::Duration::from_millis(100),
@@ -921,8 +953,9 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                             ).await {
                                                 Ok(Some(CoordMessage::ClientConnected { id: cid, protocol: proto, host: h, timestamp: _, tx })) => {
                                                     if proto == "smedly" {
-                                                        smedly_id = Some(cid);
-                                                        tracing::info!(client_id = cid, host = ?h, "smedly connected for shell");
+                                                        let smedly_host = h.unwrap_or_else(|| "localhost".to_string());
+                                                        smedlys.insert(smedly_host.clone(), cid);
+                                                        tracing::info!(client_id = cid, host = %smedly_host, "smedly connected for shell");
                                                     }
                                                     clients.insert(cid, tx);
                                                 }
@@ -931,13 +964,13 @@ async fn run_coordinator(slug: String, mut coord_rx: mpsc::UnboundedReceiver<Coo
                                         }
                                     }
                                 }
-                                if let Some(sid) = smedly_id {
+                                if let Some(&sid) = smedlys.get(&current_host) {
                                     let call_id = uuid::Uuid::new_v4().to_string();
                                     send_to(&clients, sid, "shell", json!({
                                         "call_id": call_id,
                                         "command": envelope.data.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                                     }));
-                                    tracing::info!("shell command forwarded to smedly");
+                                    tracing::info!(host = %current_host, "shell command forwarded to smedly");
                                 } else {
                                     broadcast_error(&clients, "smedly failed to connect for shell command");
                                 }
@@ -1389,6 +1422,16 @@ async fn handle_mcp(
                         },
                         "required": ["path"]
                     }
+                }, {
+                    "name": "host",
+                    "description": "Switch the execution host. All subsequent tool calls and shell commands will run on this host. Use 'localhost' to return to the local machine.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "hostname": { "type": "string", "description": "The host to switch to, e.g. 'yolo@orb', 'worker.example.com', or 'localhost'." }
+                        },
+                        "required": ["hostname"]
+                    }
                 }]
             }),
         ),
@@ -1420,7 +1463,27 @@ async fn handle_mcp(
 
             tracing::info!(tool_name = %params.name, arguments = %params.arguments, "MCP tools/call received");
 
-            if params.name == "wicket_approve" {
+            if params.name == "host" {
+                let hostname = params.arguments.get("hostname")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("localhost")
+                    .to_string();
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::SetHost {
+                    hostname: hostname.clone(),
+                    reply: reply_tx,
+                });
+                return make_json_response(match reply_rx.await {
+                    Ok(h) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": format!("Host set to {}.", h) }] }),
+                    ),
+                    Err(_) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "failed to set host" }], "isError": true }),
+                    ),
+                });
+            } else if params.name == "wicket_approve" {
                 let updated_input = params.arguments.get("input")
                     .cloned()
                     .unwrap_or(params.arguments.clone());
