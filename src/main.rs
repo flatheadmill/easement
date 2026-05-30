@@ -348,6 +348,43 @@ fn find_transcript_file(session_id: &str) -> Option<PathBuf> {
     None
 }
 
+// -- Emplacement: place our transcript in the CLI's project directory --
+
+fn cli_transcript_path(slug: &str, session_uuid: &str) -> PathBuf {
+    let home = env::var("HOME").unwrap_or_default();
+    let pane_dir = Path::new(&home).join("pane").join(slug);
+    let dir_slug = pane_dir.to_string_lossy().replace('/', "-");
+    Path::new(&home)
+        .join(".claude")
+        .join("projects")
+        .join(&dir_slug)
+        .join(format!("{}.jsonl", session_uuid))
+}
+
+fn emplace_transcript(path: &Path, entries: &[Value]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut content = String::new();
+    for entry in entries {
+        if let Ok(line) = serde_json::to_string(entry) {
+            content.push_str(&line);
+            content.push('\n');
+        }
+    }
+    std::fs::write(path, &content)
+        .map_err(|e| format!("cannot write emplaced transcript: {}", e))
+}
+
+fn extract_session_uuid(entries: &[Value]) -> Option<String> {
+    entries.iter().find_map(|e| {
+        e.get("sessionId")
+            .and_then(|v| v.as_str())
+            .filter(|s| uuid::Uuid::parse_str(s).is_ok())
+            .map(|s| s.to_string())
+    })
+}
+
 // -- ClaudePrint state --
 
 struct ClaudePrint {
@@ -575,6 +612,7 @@ async fn spawn_claude_print(
     slug: &str,
     message: &str,
     transcript_entries: &[Value],
+    session_uuid: Option<&str>,
 ) -> Result<ClaudePrint, String> {
     let home = env::var("HOME").unwrap_or_default();
 
@@ -592,7 +630,15 @@ async fn spawn_claude_print(
     let round_log = Arc::new(RoundLog::begin(slug));
 
     let mut resume_arg: Option<String> = None;
-    if !transcript_entries.is_empty() {
+    if let Some(uuid) = session_uuid {
+        if !transcript_entries.is_empty() {
+            round_log.log_sent(transcript_entries);
+            let cli_path = cli_transcript_path(slug, uuid);
+            emplace_transcript(&cli_path, transcript_entries)?;
+            tracing::info!(uuid = %uuid, path = %cli_path.display(), entries = transcript_entries.len(), "emplaced transcript");
+        }
+        resume_arg = Some(uuid.to_string());
+    } else if !transcript_entries.is_empty() {
         round_log.log_sent(transcript_entries);
         let tmp_path = std::env::temp_dir().join(format!("easement-{}.jsonl", slug));
         let mut content = String::new();
@@ -838,6 +884,13 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
         transcripts.insert("default".to_string(), TranscriptSlot::new(&slug, None));
     }
 
+    let mut session_uuid: Option<String> = current_slot(&mut transcripts)
+        .and_then(|slot| extract_session_uuid(slot.transcript.entries()));
+
+    if let Some(ref uuid) = session_uuid {
+        tracing::info!(session_uuid = %uuid, "restored session uuid from transcript");
+    }
+
     let mut clients: Clients = HashMap::new();
     let mut claude: Option<ClaudePrint> = None;
     let mut last_usage: Option<Value> = None;
@@ -1007,7 +1060,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             } else {
                                 current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default()
                             };
-                            match spawn_claude_print(&slug, &message, &entries).await {
+                            match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref()).await {
                                 Ok(mut cp) => {
                                     cp.turn_id = Some(turn_id);
                                     claude = Some(cp);
@@ -1060,7 +1113,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 let entries = current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default();
                                 tracing::info!(turn_id = %turn_id, transcript_entries = entries.len(), "spawning ClaudePrint");
 
-                                match spawn_claude_print(&slug, &message, &entries).await {
+                                match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref()).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
@@ -1298,7 +1351,15 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     ClaudeEvent::SessionId(sid) => {
                         tracing::info!(session_id = %sid, "captured session id from claude");
-                        cp.session_id = Some(sid);
+                        cp.session_id = Some(sid.clone());
+                        if session_uuid.is_none() {
+                            if uuid::Uuid::parse_str(&sid).is_ok() {
+                                session_uuid = Some(sid.clone());
+                                tracing::info!(session_uuid = %sid, "captured session uuid for emplacement");
+                            } else {
+                                tracing::warn!(session_id = %sid, "first session id is not a uuid, emplacement deferred");
+                            }
+                        }
                     }
                     // The CLI echoes every user message we wrote to stdin as a
                     // replay event. The first replay is the kickoff message
@@ -1394,27 +1455,32 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             }
 
                             // Read the CLI transcript file and feed to our transcript.
-                            if let Some(ref sid) = session_id {
-                                if let Some(path) = find_transcript_file(sid) {
-                                    round_log.copy_transcript(&path);
-                                    if let Ok(content) = std::fs::read_to_string(&path) {
-                                        for line in content.lines() {
-                                            let line = line.trim();
-                                            if line.is_empty() { continue; }
-                                            if let Ok(data) = serde_json::from_str::<Value>(line) {
-                                                if let Some(slot) = current_slot(&mut transcripts) {
-                                                    let new_entries = slot.transcript.handle_entry(data);
-                                                    for entry in &new_entries {
-                                                        broadcast_entry(&clients, entry);
-                                                        slot.entries.push(entry.clone());
-                                                    }
+                            let cli_path = if let Some(ref uuid) = session_uuid {
+                                Some(cli_transcript_path(&slug, uuid))
+                            } else if let Some(ref sid) = session_id {
+                                find_transcript_file(sid)
+                            } else {
+                                None
+                            };
+                            if let Some(path) = cli_path {
+                                round_log.copy_transcript(&path);
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    for line in content.lines() {
+                                        let line = line.trim();
+                                        if line.is_empty() { continue; }
+                                        if let Ok(data) = serde_json::from_str::<Value>(line) {
+                                            if let Some(slot) = current_slot(&mut transcripts) {
+                                                let new_entries = slot.transcript.handle_entry(data);
+                                                for entry in &new_entries {
+                                                    broadcast_entry(&clients, entry);
+                                                    slot.entries.push(entry.clone());
                                                 }
                                             }
                                         }
                                     }
-                                } else {
-                                    tracing::warn!(session_id = %sid, "CLI transcript file not found");
                                 }
+                            } else {
+                                tracing::warn!("CLI transcript file not found");
                             }
 
                             if !is_interrupted {
@@ -1445,7 +1511,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 }));
                                 broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
                                 let entries = current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default();
-                                match spawn_claude_print(&slug, &next_message, &entries).await {
+                                match spawn_claude_print(&slug, &next_message, &entries, session_uuid.as_deref()).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
@@ -1467,20 +1533,25 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                         cp.stdin.take();
                         let _ = cp.child.wait().await;
 
-                        if let Some(ref sid) = session_id {
-                            if let Some(path) = find_transcript_file(sid) {
-                                round_log.copy_transcript(&path);
-                                if let Ok(content) = std::fs::read_to_string(&path) {
-                                    for line in content.lines() {
-                                        let line = line.trim();
-                                        if line.is_empty() { continue; }
-                                        if let Ok(data) = serde_json::from_str::<Value>(line) {
-                                            if let Some(slot) = current_slot(&mut transcripts) {
-                                                let new_entries = slot.transcript.handle_entry(data);
-                                                for entry in &new_entries {
-                                                    broadcast_entry(&clients, entry);
-                                                    slot.entries.push(entry.clone());
-                                                }
+                        let cli_path = if let Some(ref uuid) = session_uuid {
+                            Some(cli_transcript_path(&slug, uuid))
+                        } else if let Some(ref sid) = session_id {
+                            find_transcript_file(sid)
+                        } else {
+                            None
+                        };
+                        if let Some(path) = cli_path {
+                            round_log.copy_transcript(&path);
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                for line in content.lines() {
+                                    let line = line.trim();
+                                    if line.is_empty() { continue; }
+                                    if let Ok(data) = serde_json::from_str::<Value>(line) {
+                                        if let Some(slot) = current_slot(&mut transcripts) {
+                                            let new_entries = slot.transcript.handle_entry(data);
+                                            for entry in &new_entries {
+                                                broadcast_entry(&clients, entry);
+                                                slot.entries.push(entry.clone());
                                             }
                                         }
                                     }
