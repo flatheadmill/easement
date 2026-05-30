@@ -900,6 +900,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
     let mut current_host: String = "localhost".to_string();
     let mut pending_tool: Option<(String, oneshot::Sender<ToolResult>)> = None;
     let mut pending_tool_envelope: Option<(String, String, Value)> = None;
+    let mut pending_escalation: Option<(String, String, Value)> = None;
     let mut turn_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut pending_message_reply: Option<oneshot::Sender<String>> = None;
@@ -928,7 +929,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     "call_id": call_id,
                                     "slug": slug,
                                     "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                    "sandboxed": args.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true),
+                                    "sandboxed": !args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false),
                                     "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                     "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                                 }));
@@ -998,14 +999,25 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 }
                             }
                         }
-                        if let Some(&sid) = wickets.get(&current_host) {
+                        let escalate = args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let sandboxed = !escalate;
+
+                        if escalate {
+                            tracing::info!(call_id = %call_id, tool = %tool, "escalation requested, sending approval to clients");
+                            pending_tool = Some((call_id.clone(), reply));
+                            pending_escalation = Some((call_id.clone(), tool.clone(), args.clone()));
+                            broadcast(&clients, "approval", json!({
+                                "tool_name": tool,
+                                "input": args,
+                            }));
+                        } else if let Some(&sid) = wickets.get(&current_host) {
                             tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "forwarding tool call to wicket");
                             pending_tool = Some((call_id.clone(), reply));
                             send_to(&clients, sid, &tool, json!({
                                 "call_id": call_id,
                                 "slug": slug,
                                 "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                "sandboxed": args.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true),
+                                "sandboxed": sandboxed,
                                 "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                 "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
@@ -1301,6 +1313,48 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     notification: true,
                                     reply: reply_tx,
                                 });
+                            }
+                            "approval" => {
+                                let behavior = envelope.data.get("behavior")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("deny");
+                                tracing::info!(behavior = %behavior, "approval response from client");
+
+                                if let Some((esc_call_id, esc_tool, esc_args)) = pending_escalation.take() {
+                                    if behavior == "allow" {
+                                        if let Some(&sid) = wickets.get(&current_host) {
+                                            tracing::info!(call_id = %esc_call_id, tool = %esc_tool, "escalation approved, forwarding unsandboxed");
+                                            send_to(&clients, sid, &esc_tool, json!({
+                                                "call_id": esc_call_id,
+                                                "slug": slug,
+                                                "command": esc_args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                                "sandboxed": false,
+                                                "patch": esc_args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
+                                                "path": esc_args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                                            }));
+                                            broadcast(&clients, "tool_start", json!({
+                                                "tool": esc_tool,
+                                                "command": esc_args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                            }));
+                                        } else {
+                                            tracing::warn!("escalation approved but no wicket connected");
+                                            if let Some((_call_id, reply)) = pending_tool.take() {
+                                                let _ = reply.send(ToolResult {
+                                                    output: "escalation approved but no executor connected".to_string(),
+                                                    exit_code: 1,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        tracing::info!(call_id = %esc_call_id, "escalation denied");
+                                        if let Some((_call_id, reply)) = pending_tool.take() {
+                                            let _ = reply.send(ToolResult {
+                                                output: "escalation denied by operator".to_string(),
+                                                exit_code: 1,
+                                            });
+                                        }
+                                    }
+                                }
                             }
                             "heartbeat" => {}
                             "log" => {
