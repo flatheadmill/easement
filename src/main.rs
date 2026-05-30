@@ -617,7 +617,7 @@ async fn spawn_claude_print(
         .arg("--include-partial-messages")
         .arg("--replay-user-messages")
         .arg("--verbose")
-        .arg("--model").arg("claude-opus-4-6")
+        .arg("--model").arg("claude-opus-4-6[1m]")
         .arg("--thinking-display").arg("summarized")
         .arg("--max-thinking-tokens").arg("31999")
         .arg("--add-dir").arg(format!("{}/code", home));
