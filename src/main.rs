@@ -34,13 +34,13 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::protocol::{
-    ClaudeMessage, ConnectPayload, InboundEnvelope, LifecycleEvent,
+    InboundEnvelope, LifecycleEvent,
     NormalizedEntry,
 };
 use crate::transcript::Transcript;
@@ -411,13 +411,16 @@ type Clients = HashMap<u64, mpsc::UnboundedSender<String>>;
 struct ServerState {
     coordinators: HashMap<String, CoordinatorHandle>,
     next_client_id: u64,
+    bus_tx: broadcast::Sender<String>,
 }
 
 impl ServerState {
     fn new() -> Self {
+        let (bus_tx, _) = broadcast::channel(65536);
         Self {
             coordinators: HashMap::new(),
             next_client_id: 0,
+            bus_tx,
         }
     }
 
@@ -489,6 +492,31 @@ struct PendingService {
 
 // -- Broadcast helpers --
 
+fn bus_publish(bus_tx: &broadcast::Sender<String>, stream: &str, slug: &str, timestamp: &str, data: Value) {
+    let msg = json!({
+        "stream": stream,
+        "slug": slug,
+        "timestamp": timestamp,
+        "data": data,
+    });
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = bus_tx.send(json);
+    }
+}
+
+fn bus_publish_replay(bus_tx: &broadcast::Sender<String>, stream: &str, slug: &str, timestamp: &str, replay_id: &str, data: Value) {
+    let msg = json!({
+        "stream": stream,
+        "slug": slug,
+        "timestamp": timestamp,
+        "replay_id": replay_id,
+        "data": data,
+    });
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = bus_tx.send(json);
+    }
+}
+
 fn send_to(clients: &Clients, client_id: u64, stream: &str, data: Value) {
     if let Some(json) = envelope_json(stream, data) {
         if let Some(tx) = clients.get(&client_id) {
@@ -497,59 +525,7 @@ fn send_to(clients: &Clients, client_id: u64, stream: &str, data: Value) {
     }
 }
 
-fn broadcast(clients: &Clients, stream: &'static str, data: Value) {
-    if let Some(json) = envelope_json(stream, data) {
-        for tx in clients.values() {
-            let _ = tx.send(json.clone());
-        }
-    }
-}
-
 const STEER_SENTINEL: &str = "\n\x07---\n";
-
-fn broadcast_entry(clients: &Clients, entry: &NormalizedEntry) {
-    if entry.kind == "user" && entry.blocks.iter().any(|b| {
-        matches!(b, crate::protocol::ContentBlock::Text { text } if text.contains(STEER_SENTINEL))
-    }) {
-        for block in &entry.blocks {
-            if let crate::protocol::ContentBlock::Text { text } = block {
-                for part in text.split(STEER_SENTINEL) {
-                    let trimmed = part.trim();
-                    if !trimmed.is_empty() {
-                        let split_entry = NormalizedEntry {
-                            kind: entry.kind,
-                            blocks: vec![crate::protocol::ContentBlock::Text {
-                                text: trimmed.to_string(),
-                            }],
-                            uuid: None,
-                            seq: entry.seq,
-                            timestamp: entry.timestamp.clone(),
-                            input_tokens: None,
-                            output_tokens: None,
-                        };
-                        if let Ok(data) = serde_json::to_value(&split_entry) {
-                            broadcast(clients, "entry", data);
-                        }
-                    }
-                }
-            } else if let Ok(data) = serde_json::to_value(entry) {
-                broadcast(clients, "entry", data);
-            }
-        }
-    } else if let Ok(data) = serde_json::to_value(entry) {
-        broadcast(clients, "entry", data);
-    }
-}
-
-fn broadcast_lifecycle(clients: &Clients, event: LifecycleEvent) {
-    if let Ok(data) = serde_json::to_value(&event) {
-        broadcast(clients, "lifecycle", data);
-    }
-}
-
-fn broadcast_error(clients: &Clients, message: &str) {
-    broadcast(clients, "error", json!({ "message": message }));
-}
 
 // -- MCP JSON-RPC types --
 
@@ -613,6 +589,7 @@ async fn spawn_claude_print(
     message: &str,
     transcript_entries: &[Value],
     session_uuid: Option<&str>,
+    timestamp: &str,
 ) -> Result<ClaudePrint, String> {
     let home = env::var("HOME").unwrap_or_default();
 
@@ -674,7 +651,7 @@ async fn spawn_claude_print(
         "mcpServers": {
             "wicket": {
                 "type": "http",
-                "url": format!("http://localhost:6502/mcp/{}", slug)
+                "url": format!("http://localhost:6502/mcp/{}/{}", slug, timestamp)
             }
         }
     });
@@ -856,13 +833,17 @@ fn current_slot(transcripts: &mut BTreeMap<String, TranscriptSlot>) -> Option<&m
     transcripts.values_mut().last()
 }
 
+fn current_timestamp(transcripts: &BTreeMap<String, TranscriptSlot>) -> String {
+    transcripts.keys().last().cloned().unwrap_or_else(|| "default".to_string())
+}
+
 fn full_slot(transcripts: &mut BTreeMap<String, TranscriptSlot>) -> Option<&mut TranscriptSlot> {
     let len = transcripts.len();
     if len < 2 { return None; }
     transcripts.values_mut().rev().nth(1)
 }
 
-async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>) {
+async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>, bus_tx: broadcast::Sender<String>) {
     let exchange = ExchangeLog::new(&slug);
     let mut transcripts: BTreeMap<String, TranscriptSlot> = BTreeMap::new();
 
@@ -933,34 +914,16 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                     "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                                 }));
-                                broadcast(&clients, "tool_start", json!({
+                                bus_publish(&bus_tx, "tool_start", &slug, &current_timestamp(&transcripts), json!({
                                     "tool": tool,
                                     "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                                 }));
                             }
-                            continue;
+                           continue;
                         }
                         if protocol != "easement" {
                             tracing::warn!(client_id = id, protocol = %protocol, "unknown protocol, dropping");
                             continue;
-                        }
-                        if let Some(ref ts) = timestamp {
-                            if !transcripts.contains_key(ts) {
-                                transcripts.insert(ts.clone(), TranscriptSlot::new(&slug, Some(ts)));
-                            }
-                            let slot = transcripts.get(ts).unwrap();
-                            tracing::info!(timestamp = %ts, entries = slot.entries.len(), "client using timestamped transcript");
-                        }
-                        if let Some(slot) = current_slot(&mut transcripts) {
-                            let single_client: Clients = [(id, tx.clone())].into();
-                            for entry in &slot.entries {
-                                broadcast_entry(&single_client, entry);
-                            }
-                        }
-                        if let Some(ref usage) = last_usage {
-                            if let Some(json) = envelope_json("usage", usage.clone()) {
-                                let _ = tx.send(json);
-                            }
                         }
                         clients.insert(id, tx);
                         tracing::info!(client_id = id, clients = clients.len(), "client connected");
@@ -1006,9 +969,26 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             tracing::info!(call_id = %call_id, tool = %tool, "escalation requested, sending approval to clients");
                             pending_tool = Some((call_id.clone(), reply));
                             pending_escalation = Some((call_id.clone(), tool.clone(), args.clone()));
-                            broadcast(&clients, "approval", json!({
+                            bus_publish(&bus_tx, "approval", &slug, &current_timestamp(&transcripts), json!({
                                 "tool_name": tool,
                                 "input": args,
+                            }));
+                        } else if matches!(tool.as_str(), "screenshot" | "javascript" | "tabs_context" | "tabs_create" | "navigate") {
+                            let request_type = match tool.as_str() {
+                                "screenshot" => "capture",
+                                _ => tool.as_str(),
+                            };
+                            tracing::info!(call_id = %call_id, tool = %tool, "broadcasting browser tool call");
+                            pending_tool = Some((call_id.clone(), reply));
+                            bus_publish(&bus_tx, "request", &slug, &current_timestamp(&transcripts), json!({
+                                "type": request_type,
+                                "id": call_id,
+                                "tabId": args.get("tabId").and_then(|v| v.as_i64()),
+                                "code": args.get("code").and_then(|v| v.as_str()).unwrap_or(""),
+                                "url": args.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                            }));
+                            bus_publish(&bus_tx, "tool_start", &slug, &current_timestamp(&transcripts), json!({
+                                "tool": tool,
                             }));
                         } else if let Some(&sid) = wickets.get(&current_host) {
                             tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "forwarding tool call to wicket");
@@ -1021,7 +1001,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                 "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
-                            broadcast(&clients, "tool_start", json!({
+                            bus_publish(&bus_tx, "tool_start", &slug, &current_timestamp(&transcripts), json!({
                                 "tool": tool,
                                 "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
@@ -1059,20 +1039,20 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             turn_queue.push_back(message);
                         } else {
                             let turn_id = uuid::Uuid::new_v4().to_string();
-                            broadcast(&clients, "turn", json!({
+                            bus_publish(&bus_tx, "turn", &slug, &current_timestamp(&transcripts), json!({
                                 "event": "started",
                                 "turn_id": turn_id,
                             }));
-                            broadcast(&clients, "user_message", json!({
+                            bus_publish(&bus_tx, "user_message", &slug, &current_timestamp(&transcripts), json!({
                                 "text": message,
                             }));
-                            broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
+                            if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundStarted) { bus_publish(&bus_tx, "lifecycle", &slug, &current_timestamp(&transcripts), __lc_data); }
                             let entries = if full {
                                 full_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default()
                             } else {
                                 current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default()
                             };
-                            match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref()).await {
+                            match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref(), &current_timestamp(&transcripts)).await {
                                 Ok(mut cp) => {
                                     cp.turn_id = Some(turn_id);
                                     claude = Some(cp);
@@ -1113,27 +1093,27 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
 
                                 let turn_id = uuid::Uuid::new_v4().to_string();
 
-                                broadcast(&clients, "turn", json!({
+                                bus_publish(&bus_tx, "turn", &slug, &current_timestamp(&transcripts), json!({
                                     "event": "started",
                                     "turn_id": turn_id,
                                 }));
-                                broadcast(&clients, "user_message", json!({
+                                bus_publish(&bus_tx, "user_message", &slug, &current_timestamp(&transcripts), json!({
                                     "text": message,
                                 }));
-                                broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
+                                if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundStarted) { bus_publish(&bus_tx, "lifecycle", &slug, &current_timestamp(&transcripts), __lc_data); }
 
                                 let entries = current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default();
                                 tracing::info!(turn_id = %turn_id, transcript_entries = entries.len(), "spawning ClaudePrint");
 
-                                match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref()).await {
+                                match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref(), &current_timestamp(&transcripts)).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
                                     }
                                     Err(e) => {
                                         tracing::error!("failed to spawn ClaudePrint: {}", e);
-                                        broadcast_error(&clients, &e);
-                                        broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed { message: e });
+                                        bus_publish(&bus_tx, "error", &slug, &current_timestamp(&transcripts), json!({ "message": &e }));
+                                        if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundFailed { message: e }) { bus_publish(&bus_tx, "lifecycle", &slug, &current_timestamp(&transcripts), __lc_data); }
                                     }
                                 }
                             }
@@ -1196,7 +1176,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     }));
                                     tracing::info!(host = %current_host, "shell command forwarded to wicket");
                                 } else {
-                                    broadcast_error(&clients, "wicket failed to connect for shell command");
+                                    bus_publish(&bus_tx, "error", &slug, &current_timestamp(&transcripts), json!({ "message": "wicket failed to connect for shell command" }));
                                 }
                             }
                             "claim" => {
@@ -1214,6 +1194,39 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                if let Some((pending_call_id, reply)) = pending_tool.take() {
+                                    if pending_call_id == resp_id {
+                                        let content_type = envelope.data.get("content_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("text/plain")
+                                            .to_string();
+                                        let body_b64 = envelope.data.get("body")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let output = if content_type == "image/jpeg" || content_type == "image/png" {
+                                            use base64::Engine;
+                                            let content = json!([
+                                                { "type": "text", "text": format!("screenshot ({})", content_type) },
+                                                { "type": "image", "data": body_b64, "mimeType": content_type }
+                                            ]);
+                                            serde_json::to_string(&content).unwrap_or_default()
+                                        } else {
+                                            use base64::Engine;
+                                            let decoded = base64::engine::general_purpose::STANDARD.decode(body_b64).unwrap_or_default();
+                                            String::from_utf8_lossy(&decoded).to_string()
+                                        };
+                                        tracing::info!(id = %resp_id, content_type = %content_type, "shotgun response received");
+                                        bus_publish(&bus_tx, "tool_done", &slug, &current_timestamp(&transcripts), json!({
+                                            "tool": "shotgun",
+                                            "output": &output,
+                                            "exit_code": 0,
+                                        }));
+                                        let _ = reply.send(ToolResult { output, exit_code: 0 });
+                                    } else {
+                                        pending_tool = Some((pending_call_id, reply));
+                                        // Fall through to pending_service check.
+                                    }
+                                }
                                 if let Some(pending) = pending_service.take() {
                                     if pending.id == resp_id {
                                         let content_type = envelope.data.get("content_type")
@@ -1261,7 +1274,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     .and_then(|v| v.as_i64())
                                     .unwrap_or(-1) as i32;
                                 tracing::info!(call_id = %call_id, exit_code, output_len = output.len(), "tool result from wicket");
-                                broadcast(&clients, "tool_done", json!({
+                                bus_publish(&bus_tx, "tool_done", &slug, &current_timestamp(&transcripts), json!({
                                     "tool": "zsh",
                                     "output": &output,
                                     "exit_code": exit_code,
@@ -1275,7 +1288,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 }
                             }
                             "shell_result" => {
-                                broadcast(&clients, "shell_result", envelope.data);
+                                bus_publish(&bus_tx, "shell_result", &slug, &current_timestamp(&transcripts), envelope.data);
                             }
                             "background_output" => {
                                 let path = envelope.data.get("output_path")
@@ -1332,7 +1345,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                                 "patch": esc_args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                                 "path": esc_args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                                             }));
-                                            broadcast(&clients, "tool_start", json!({
+                                            bus_publish(&bus_tx, "tool_start", &slug, &current_timestamp(&transcripts), json!({
                                                 "tool": esc_tool,
                                                 "command": esc_args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                                             }));
@@ -1354,6 +1367,31 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                             });
                                         }
                                     }
+                                }
+                            }
+                            "history_request" => {
+                                let replay_id = envelope.data.get("replay_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let intent = envelope.data.get("intent")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("latest");
+                                let ts = current_timestamp(&transcripts);
+                                let slot = if intent == "full" {
+                                    full_slot(&mut transcripts)
+                                } else {
+                                    current_slot(&mut transcripts)
+                                };
+                                if let Some(slot) = slot {
+                                    tracing::info!(replay_id = %replay_id, entries = slot.entries.len(), "history replay starting");
+                                    for entry in &slot.entries {
+                                        if let Ok(data) = serde_json::to_value(entry) {
+                                            bus_publish_replay(&bus_tx, "entry", &slug, &ts, &replay_id, data);
+                                        }
+                                    }
+                                    bus_publish_replay(&bus_tx, "history_terminate", &slug, &ts, &replay_id, json!({}));
+                                    tracing::info!(replay_id = %replay_id, "history replay complete");
                                 }
                             }
                             "heartbeat" => {}
@@ -1401,7 +1439,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 response_accumulator.push_str(text);
                             }
                         }
-                        broadcast(&clients, "delta", delta.clone());
+                        bus_publish(&bus_tx, "delta", &slug, &current_timestamp(&transcripts), delta.clone());
                     }
                     ClaudeEvent::SessionId(sid) => {
                         tracing::info!(session_id = %sid, "captured session id from claude");
@@ -1443,7 +1481,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                 let trimmed = part.trim();
                                 if !trimmed.is_empty() {
                                     tracing::info!(steer = %trimmed, "broadcasting user_message");
-                                    broadcast(&clients, "user_message", json!({
+                                    bus_publish(&bus_tx, "user_message", &slug, &current_timestamp(&transcripts), json!({
                                         "text": trimmed,
                                     }));
                                 }
@@ -1452,14 +1490,14 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                     }
                     ClaudeEvent::Result { usage, is_interrupted } => {
                         if let Some(ref u) = usage {
-                            broadcast(&clients, "usage", u.clone());
+                            bus_publish(&bus_tx, "usage", &slug, &current_timestamp(&transcripts), u.clone());
                             last_usage = usage;
                         }
 
                         if is_interrupted {
-                            broadcast_lifecycle(&clients, LifecycleEvent::RoundInterrupted);
+                            if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundInterrupted) { bus_publish(&bus_tx, "lifecycle", &slug, &current_timestamp(&transcripts), __lc_data); }
                             if let Some(ref tid) = cp.turn_id {
-                                broadcast(&clients, "turn", json!({
+                                bus_publish(&bus_tx, "turn", &slug, &current_timestamp(&transcripts), json!({
                                     "event": "completed",
                                     "turn_id": tid,
                                     "status": "interrupted",
@@ -1481,7 +1519,7 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         .join(STEER_SENTINEL);
                                     let steer_turn_id = uuid::Uuid::new_v4().to_string();
                                     cp.turn_id = Some(steer_turn_id.clone());
-                                    broadcast(&clients, "turn", json!({
+                                    bus_publish(&bus_tx, "turn", &slug, &current_timestamp(&transcripts), json!({
                                         "event": "started",
                                         "turn_id": steer_turn_id,
                                     }));
@@ -1523,10 +1561,13 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                         let line = line.trim();
                                         if line.is_empty() { continue; }
                                         if let Ok(data) = serde_json::from_str::<Value>(line) {
+                                            let ts = current_timestamp(&transcripts);
                                             if let Some(slot) = current_slot(&mut transcripts) {
                                                 let new_entries = slot.transcript.handle_entry(data);
                                                 for entry in &new_entries {
-                                                    broadcast_entry(&clients, entry);
+                                                    if let Ok(data) = serde_json::to_value(entry) {
+                                                        bus_publish(&bus_tx, "entry", &slug, &ts, data);
+                                                    }
                                                     slot.entries.push(entry.clone());
                                                 }
                                             }
@@ -1538,9 +1579,9 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             }
 
                             if !is_interrupted {
-                                broadcast_lifecycle(&clients, LifecycleEvent::RoundCompleted);
+                                if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundCompleted) { bus_publish(&bus_tx, "lifecycle", &slug, &current_timestamp(&transcripts), __lc_data); }
                                 if let Some(ref tid) = turn_id {
-                                    broadcast(&clients, "turn", json!({
+                                    bus_publish(&bus_tx, "turn", &slug, &current_timestamp(&transcripts), json!({
                                         "event": "completed",
                                         "turn_id": tid,
                                         "status": "completed",
@@ -1559,20 +1600,20 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             if let Some(next_message) = turn_queue.pop_front() {
                                 tracing::info!(message = %next_message, "dispatching queued turn");
                                 let turn_id = uuid::Uuid::new_v4().to_string();
-                                broadcast(&clients, "turn", json!({
+                                bus_publish(&bus_tx, "turn", &slug, &current_timestamp(&transcripts), json!({
                                     "event": "started",
                                     "turn_id": turn_id,
                                 }));
-                                broadcast_lifecycle(&clients, LifecycleEvent::RoundStarted);
+                                if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundStarted) { bus_publish(&bus_tx, "lifecycle", &slug, &current_timestamp(&transcripts), __lc_data); }
                                 let entries = current_slot(&mut transcripts).map(|s| s.transcript.entries().to_vec()).unwrap_or_default();
-                                match spawn_claude_print(&slug, &next_message, &entries, session_uuid.as_deref()).await {
+                                match spawn_claude_print(&slug, &next_message, &entries, session_uuid.as_deref(), &current_timestamp(&transcripts)).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
                                     }
                                     Err(e) => {
                                         tracing::error!("failed to spawn ClaudePrint for queued turn: {}", e);
-                                        broadcast_error(&clients, &e);
+                                        bus_publish(&bus_tx, "error", &slug, &current_timestamp(&transcripts), json!({ "message": &e }));
                                     }
                                 }
                             }
@@ -1601,10 +1642,13 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                                     let line = line.trim();
                                     if line.is_empty() { continue; }
                                     if let Ok(data) = serde_json::from_str::<Value>(line) {
+                                        let ts = current_timestamp(&transcripts);
                                         if let Some(slot) = current_slot(&mut transcripts) {
                                             let new_entries = slot.transcript.handle_entry(data);
                                             for entry in &new_entries {
-                                                broadcast_entry(&clients, entry);
+                                                if let Ok(data) = serde_json::to_value(entry) {
+                                                    bus_publish(&bus_tx, "entry", &slug, &ts, data);
+                                                }
                                                 slot.entries.push(entry.clone());
                                             }
                                         }
@@ -1613,11 +1657,9 @@ async fn run_coordinator(slug: String, coord_tx: mpsc::UnboundedSender<CoordMess
                             }
                         }
 
-                        broadcast_lifecycle(&clients, LifecycleEvent::RoundFailed {
-                            message: "claude exited unexpectedly".to_string(),
-                        });
+                        if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundFailed { message: "claude exited unexpectedly".to_string() }) { bus_publish(&bus_tx, "lifecycle", &slug, &current_timestamp(&transcripts), __lc_data); }
                         if let Some(ref tid) = turn_id {
-                            broadcast(&clients, "turn", json!({
+                            bus_publish(&bus_tx, "turn", &slug, &current_timestamp(&transcripts), json!({
                                 "event": "completed",
                                 "turn_id": tid,
                                 "status": "failed",
@@ -1654,95 +1696,110 @@ async fn handle_websocket(
 
     let (mut sink, mut stream) = ws_stream.split();
 
-    let connect_text = match stream.next().await {
-        Some(Ok(Message::Text(text))) => text,
-        _ => {
-            tracing::warn!("expected text connect payload as first message");
-            return;
-        }
-    };
-
-    let connect: ConnectPayload = match serde_json::from_str(&connect_text) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("invalid connect payload: {}", e);
-            return;
-        }
-    };
-
-    let slug = connect.slug.clone();
-    tracing::info!(slug = %slug, "websocket client connecting");
-
-    let (coord_tx, client_id) = {
-        let mut state = server.write().await;
-        let client_id = state.next_id();
-
-        let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let slug_clone = slug.clone();
-            let self_tx = tx.clone();
-            tokio::spawn(async move {
-                run_coordinator(slug_clone, self_tx, rx).await;
-            });
-            CoordinatorHandle { tx }
-        });
-
-        (handle.tx.clone(), client_id)
-    };
-
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<String>();
-
-    let protocol = match connect.protocol {
-        Some(p) => p,
-        None => {
-            tracing::warn!("client connected without protocol, dropping");
-            return;
-        }
+    let (client_id, mut bus_rx) = {
+        let mut state = server.write().await;
+        let id = state.next_id();
+        let rx = state.bus_tx.subscribe();
+        (id, rx)
     };
-
-    let _ = coord_tx.send(CoordMessage::ClientConnected {
-        id: client_id,
-        protocol,
-        timestamp: connect.timestamp,
-        host: connect.host,
-        tx: client_tx,
-    });
 
     let write_task = tokio::spawn(async move {
-        while let Some(msg) = client_rx.recv().await {
-            if sink.send(Message::text(msg)).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                Some(msg) = client_rx.recv() => {
+                    if sink.send(Message::text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(msg) = bus_rx.recv() => {
+                    if sink.send(Message::text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                else => break,
             }
         }
     });
+
+    tracing::info!(client_id, "websocket connected");
+
+    let mut coord_tx: Option<mpsc::UnboundedSender<CoordMessage>> = None;
+    let mut slug: Option<String> = None;
 
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                match serde_json::from_str::<InboundEnvelope>(&text) {
-                    Ok(env) => {
-                        let _ = coord_tx.send(CoordMessage::Envelope {
-                            id: client_id,
-                            envelope: env,
+                let data: Value = match serde_json::from_str(&text) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                if data.get("stream").is_some() {
+                    let stream_name = data.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+                    if stream_name == "heartbeat" {
+                        continue;
+                    }
+                    if let Some(ref tx) = coord_tx {
+                        if let Ok(env) = serde_json::from_value::<InboundEnvelope>(data) {
+                            let _ = tx.send(CoordMessage::Envelope {
+                                id: client_id,
+                                envelope: env,
+                            });
+                        }
+                    }
+                } else if let Some(connect_slug) = data.get("slug").and_then(|v| v.as_str()) {
+                    if connect_slug.is_empty() {
+                        continue;
+                    }
+                    tracing::info!(client_id, slug = %connect_slug, "client associating with slug");
+
+                    let tx = {
+                        let mut state = server.write().await;
+                        let connect_slug = connect_slug.to_string();
+                        let bus = state.bus_tx.clone();
+                        let handle = state.coordinators.entry(connect_slug.clone()).or_insert_with(|| {
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            let slug_clone = connect_slug.clone();
+                            let self_tx = tx.clone();
+                            tokio::spawn(async move {
+                                run_coordinator(slug_clone, self_tx, rx, bus).await;
+                            });
+                            CoordinatorHandle { tx }
                         });
-                    }
-                    Err(e) => {
-                        tracing::warn!("bad inbound envelope: {}", e);
-                    }
+                        handle.tx.clone()
+                    };
+
+                    let protocol = data.get("protocol").and_then(|v| v.as_str()).unwrap_or("easement").to_string();
+                    let timestamp = data.get("timestamp").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let host = data.get("host").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                    let _ = tx.send(CoordMessage::ClientConnected {
+                        id: client_id,
+                        protocol,
+                        timestamp,
+                        host,
+                        tx: client_tx.clone(),
+                    });
+
+                    slug = Some(connect_slug.to_string());
+                    coord_tx = Some(tx);
                 }
             }
             Ok(Message::Close(_)) => break,
             Err(e) => {
-                tracing::warn!("websocket error: {}", e);
+                tracing::warn!(client_id, "websocket error: {}", e);
                 break;
             }
             _ => {}
         }
     }
 
-    let _ = coord_tx.send(CoordMessage::ClientDisconnected { id: client_id });
+    if let Some(ref tx) = coord_tx {
+        let _ = tx.send(CoordMessage::ClientDisconnected { id: client_id });
+    }
     write_task.abort();
-    tracing::info!(client_id, slug = %slug, "websocket client disconnected");
+    tracing::info!(client_id, slug = ?slug, "websocket disconnected");
 }
 
 // -- MCP HTTP handler --
@@ -1756,6 +1813,7 @@ struct ToolCallParams {
 async fn handle_mcp(
     req: Request<Incoming>,
     slug: &str,
+    timestamp: Option<&str>,
     server: Arc<RwLock<ServerState>>,
 ) -> Response<Full<Bytes>> {
     if req.method() != hyper::Method::POST {
@@ -1855,6 +1913,54 @@ async fn handle_mcp(
                         },
                         "required": ["hostname"]
                     }
+                }, {
+                    "name": "tabs_context",
+                    "description": "Get information about the browser tab group. Returns tab IDs, titles, and URLs. Call this before using other browser tools to know what tabs exist.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }, {
+                    "name": "tabs_create",
+                    "description": "Create a new empty tab in the browser tab group.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }, {
+                    "name": "navigate",
+                    "description": "Navigate a browser tab to a URL.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tabId": { "type": "integer", "description": "The tab ID to navigate." },
+                            "url": { "type": "string", "description": "The URL to navigate to." }
+                        },
+                        "required": ["tabId", "url"]
+                    }
+                }, {
+                    "name": "screenshot",
+                    "description": "Capture a screenshot of a browser tab. Returns the image inline. If tabId is omitted, captures the first tab in the group.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tabId": { "type": "integer", "description": "The tab ID to capture. Omit for the first tab in the group." }
+                        },
+                        "required": []
+                    }
+                }, {
+                    "name": "javascript",
+                    "description": "Execute JavaScript code in a browser tab. Returns the result of the last expression. Do NOT use return statements. Output is sanitized to block credentials, tokens, and cookies. If tabId is omitted, executes in the first tab in the group.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tabId": { "type": "integer", "description": "The tab ID to execute in. Omit for the first tab in the group." },
+                            "code": { "type": "string", "description": "The JavaScript code to execute." }
+                        },
+                        "required": ["code"]
+                    }
                 }]
             }),
         ),
@@ -1934,7 +2040,7 @@ async fn handle_mcp(
 
             match reply_rx.await {
                 Ok(result) => {
-                    if params.name == "view_image" && result.exit_code == 0 {
+                    if (params.name == "view_image" || params.name == "screenshot") && result.exit_code == 0 {
                         match serde_json::from_str::<Value>(&result.output) {
                             Ok(content) => jsonrpc_response(id, json!({ "content": content })),
                             Err(_) => jsonrpc_response(
@@ -2032,15 +2138,17 @@ async fn handle_request(
             let slug = slug.to_string();
             Ok(handle_capture(&slug, server).await)
         }
-    } else if let Some(slug) = path.strip_prefix("/mcp/") {
-        if slug.is_empty() {
+    } else if let Some(rest) = path.strip_prefix("/mcp/") {
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.is_empty() || parts[0].is_empty() {
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("missing slug in /mcp/<slug>")))
+                .body(Full::new(Bytes::from("missing slug in /mcp/<slug>/<timestamp>")))
                 .unwrap())
         } else {
-            let slug = slug.to_string();
-            Ok(handle_mcp(req, &slug, server).await)
+            let slug = parts[0].to_string();
+            let timestamp = parts.get(1).map(|s| s.to_string());
+            Ok(handle_mcp(req, &slug, timestamp.as_deref(), server).await)
         }
     } else if let Some(slug) = path.strip_prefix("/turn/") {
         if slug.is_empty() {
@@ -2073,12 +2181,13 @@ async fn handle_request(
 
             let coord_tx = {
                 let mut state = server.write().await;
+                let bus = state.bus_tx.clone();
                 let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let slug_clone = slug.clone();
                     let self_tx = tx.clone();
                     tokio::spawn(async move {
-                        run_coordinator(slug_clone, self_tx, rx).await;
+                        run_coordinator(slug_clone, self_tx, rx, bus).await;
                     });
                     CoordinatorHandle { tx }
                 });
@@ -2137,12 +2246,13 @@ async fn handle_request(
 
             let coord_tx = {
                 let mut state = server.write().await;
+                let bus = state.bus_tx.clone();
                 let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let slug_clone = slug.clone();
                     let self_tx = tx.clone();
                     tokio::spawn(async move {
-                        run_coordinator(slug_clone, self_tx, rx).await;
+                        run_coordinator(slug_clone, self_tx, rx, bus).await;
                     });
                     CoordinatorHandle { tx }
                 });
@@ -2198,12 +2308,13 @@ async fn handle_request(
             let slug = slug.to_string();
             let coord_tx = {
                 let mut state = server.write().await;
+                let bus = state.bus_tx.clone();
                 let handle = state.coordinators.entry(slug.clone()).or_insert_with(|| {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let slug_clone = slug.clone();
                     let self_tx = tx.clone();
                     tokio::spawn(async move {
-                        run_coordinator(slug_clone, self_tx, rx).await;
+                        run_coordinator(slug_clone, self_tx, rx, bus).await;
                     });
                     CoordinatorHandle { tx }
                 });

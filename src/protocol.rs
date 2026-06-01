@@ -56,18 +56,6 @@ pub struct InboundEnvelope {
     pub data: Value,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ConnectPayload {
-    pub slug: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub protocol: Option<String>,
-    #[serde(default)]
-    pub timestamp: Option<String>,
-    #[serde(default)]
-    pub host: Option<String>,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct ClaudeMessage {
