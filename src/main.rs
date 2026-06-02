@@ -1382,6 +1382,9 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                     }
                                 }
                                 bus_publish_replay(&bus_tx, "history_terminate", &slug, &timestamp, &replay_id, json!({}));
+                                if let Some(ref usage) = last_usage {
+                                    bus_publish(&bus_tx, "usage", &slug, &timestamp, usage.clone());
+                                }
                                 tracing::info!(replay_id = %replay_id, "history replay complete");
                             }
                             "heartbeat" => {}
