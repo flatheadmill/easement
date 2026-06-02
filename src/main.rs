@@ -1977,10 +1977,12 @@ async fn handle_mcp(
                     }
                 }, {
                     "name": "tabs_create",
-                    "description": "Create a new empty tab in the browser tab group.",
+                    "description": "Open a new tab in the browser tab group. Optionally navigate to a URL.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "url": { "type": "string", "description": "URL to open. Omit for a blank tab." }
+                        },
                         "required": []
                     }
                 }, {
