@@ -701,7 +701,7 @@ async fn spawn_claude_print(
         .join(format!("easement-mcp-{}.json", slug));
     let mcp_config = json!({
         "mcpServers": {
-            "wicket": {
+            "o": {
                 "type": "http",
                 "url": format!("http://localhost:6502/mcp/{}/{}", slug, timestamp)
             }
@@ -710,7 +710,7 @@ async fn spawn_claude_print(
     if let Err(e) = std::fs::write(&mcp_config_path, mcp_config.to_string()) {
         return Err(format!("cannot write mcp config: {}", e));
     }
-    cmd.arg("--permission-prompt-tool").arg("mcp__wicket__wicket_approve")
+    cmd.arg("--permission-prompt-tool").arg("mcp__o__approve")
         .arg("--mcp-config").arg(&mcp_config_path)
         .arg("--disallowed-tools").arg("Bash,Write,Edit,Read,Glob,Grep,Skill,ToolSearch,NotebookEdit,WebFetch,WebSearch,CronCreate,CronDelete,CronList,RemoteTrigger,TaskOutput,TaskStop,EnterWorktree,ExitWorktree,ExitPlanMode,Monitor,PushNotification,AskUserQuestion,ScheduleWakeup,ShareOnboardingGuide");
 
@@ -882,11 +882,7 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
     let mut claude: Option<ClaudePrint> = None;
     let mut last_usage: Option<Value> = None;
     let mut pending_service: Option<PendingService> = None;
-    let mut wickets: HashMap<String, u64> = HashMap::new();
-    let mut wicket_children: Vec<tokio::process::Child> = Vec::new();
-    let mut current_host: String = "localhost".to_string();
     let mut pending_tool: Option<(String, oneshot::Sender<ToolResult>)> = None;
-    let mut pending_tool_envelope: Option<(String, String, Value)> = None;
     let mut pending_escalation: Option<(String, String, Value)> = None;
     let mut turn_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -906,30 +902,9 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                 match msg {
                     CoordMessage::ClientConnected { id, protocol, timestamp: _connect_ts, host, tx } => {
                         if protocol == "wicket" {
-                            let wicket_host = host.clone().unwrap_or_else(|| "localhost".to_string());
-                            wickets.insert(wicket_host.clone(), id);
                             clients.insert(id, tx);
-                            tracing::info!(client_id = id, host = %wicket_host, "wicket connected");
-                            if let Some((call_id, tool, args)) = pending_tool_envelope.take() {
-                                tracing::info!(call_id = %call_id, tool = %tool, "draining pending tool call to wicket");
-                                send_to(&clients, id, &tool, json!({
-                                    "call_id": call_id,
-                                    "slug": slug,
-                                    "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                    "sandboxed": !args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false),
-                                    "run_in_background": args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false),
-                                    "timeout": args.get("timeout").and_then(|v| v.as_i64()),
-                                    "task_uuid": call_id,
-                                    "timestamp": timestamp,
-                                    "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
-                                    "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
-                                }));
-                                bus_publish(&bus_tx, "tool_start", &slug, &timestamp, json!({
-                                    "tool": tool,
-                                    "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                }));
-                            }
-                           continue;
+                            tracing::info!(client_id = id, "wicket connected");
+                            continue;
                         }
                         if protocol != "easement" {
                             tracing::warn!(client_id = id, protocol = %protocol, "unknown protocol, dropping");
@@ -940,19 +915,6 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                     }
                     CoordMessage::ClientDisconnected { id } => {
                         clients.remove(&id);
-                        let was_wicket = wickets.iter()
-                            .find(|&(_, cid)| *cid == id)
-                            .map(|(h, _)| h.clone());
-                        if let Some(host) = was_wicket {
-                            wickets.remove(&host);
-                            tracing::info!(client_id = id, host = %host, "wicket disconnected");
-                            if let Some((_call_id, reply)) = pending_tool.take() {
-                                let _ = reply.send(ToolResult {
-                                    output: "wicket disconnected".to_string(),
-                                    exit_code: 1,
-                                });
-                            }
-                        }
                         tracing::info!(client_id = id, clients = clients.len(), "client disconnected");
                     }
                     CoordMessage::ToolCall { call_id, tool, args, reply } => {
@@ -972,74 +934,73 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                 }
                             }
                         }
-                        let escalate = args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let sandboxed = !escalate;
+
+                        // Scatter/gather for tool discovery.
+                        if tool == "tools" {
+                            tracing::info!(call_id = %call_id, "tools discovery query");
+                            bus_publish(&bus_tx, "tools_query", &slug, &timestamp, json!({ "id": call_id }));
+                            let bus_rx_gather = bus_tx.subscribe();
+                            let gather_result = tokio::time::timeout(
+                                std::time::Duration::from_millis(500),
+                                async {
+                                    let mut rx = bus_rx_gather;
+                                    let mut tools: Vec<Value> = Vec::new();
+                                    while let Ok(msg) = rx.recv().await {
+                                        if let Ok(parsed) = serde_json::from_str::<Value>(&msg) {
+                                            if parsed.get("stream").and_then(|v| v.as_str()) == Some("tools_response") {
+                                                if let Some(id) = parsed.get("data").and_then(|d| d.get("id")).and_then(|v| v.as_str()) {
+                                                    if id == call_id {
+                                                        if let Some(manifest) = parsed.get("data").and_then(|d| d.get("tools")).and_then(|v| v.as_array()) {
+                                                            tools.extend(manifest.iter().cloned());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    tools
+                                }
+                            ).await;
+                            let tools = gather_result.unwrap_or_default();
+                            tracing::info!(count = tools.len(), "tools discovery complete");
+                            let _ = reply.send(ToolResult {
+                                output: serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()),
+                                exit_code: 0,
+                            });
+                            continue;
+                        }
+
+                        // Check escalation from args.
+                        let inner_args = args.get("args").cloned().unwrap_or(json!({}));
+                        let escalate = inner_args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false);
 
                         if escalate {
-                            tracing::info!(call_id = %call_id, tool = %tool, "escalation requested, sending approval to clients");
+                            let who = args.get("who").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let f = args.get("f").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            tracing::info!(call_id = %call_id, who = %who, f = %f, "escalation requested");
                             pending_tool = Some((call_id.clone(), reply));
                             pending_escalation = Some((call_id.clone(), tool.clone(), args.clone()));
                             bus_publish(&bus_tx, "approval", &slug, &timestamp, json!({
-                                "tool_name": tool,
-                                "input": args,
-                            }));
-                        } else if matches!(tool.as_str(), "screenshot" | "javascript" | "tabs_context" | "tabs_create" | "navigate") {
-                            let request_type = match tool.as_str() {
-                                "screenshot" => "capture",
-                                _ => tool.as_str(),
-                            };
-                            tracing::info!(call_id = %call_id, tool = %tool, "broadcasting browser tool call");
-                            pending_tool = Some((call_id.clone(), reply));
-                            bus_publish(&bus_tx, "request", &slug, &timestamp, json!({
-                                "type": request_type,
-                                "id": call_id,
-                                "tabId": args.get("tabId").and_then(|v| v.as_i64()),
-                                "code": args.get("code").and_then(|v| v.as_str()).unwrap_or(""),
-                                "url": args.get("url").and_then(|v| v.as_str()).unwrap_or(""),
-                            }));
-                            bus_publish(&bus_tx, "tool_start", &slug, &timestamp, json!({
-                                "tool": tool,
-                            }));
-                        } else if let Some(&sid) = wickets.get(&current_host) {
-                            tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "forwarding tool call to wicket");
-                            pending_tool = Some((call_id.clone(), reply));
-                            send_to(&clients, sid, &tool, json!({
-                                "call_id": call_id,
-                                "slug": slug,
-                                "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                "sandboxed": sandboxed,
-                                "run_in_background": args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false),
-                                "timeout": args.get("timeout").and_then(|v| v.as_i64()),
-                                "task_uuid": call_id,
-                                "timestamp": timestamp,
-                                "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
-                                "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
-                            }));
-                            bus_publish(&bus_tx, "tool_start", &slug, &timestamp, json!({
-                                "tool": tool,
-                                "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                "tool_name": f,
+                                "input": inner_args,
                             }));
                         } else {
-                            tracing::info!(host = %current_host, "no wicket for host, spawning");
-                            match spawn_wicket(&current_host, &slug) {
-                                Ok(child) => {
-                                    wicket_children.push(child);
-                                    tracing::info!(call_id = %call_id, tool = %tool, host = %current_host, "stashing tool call, waiting for wicket");
-                                    pending_tool = Some((call_id.clone(), reply));
-                                    pending_tool_envelope = Some((call_id, tool, args));
-                                }
-                                Err(e) => {
-                                    let _ = reply.send(ToolResult {
-                                        output: e,
-                                        exit_code: 1,
-                                    });
-                                }
-                            }
+                            // Generic broadcast/claim dispatch.
+                            tracing::info!(call_id = %call_id, tool = %tool, "broadcasting call");
+                            pending_tool = Some((call_id.clone(), reply));
+                            bus_publish(&bus_tx, "call", &slug, &timestamp, json!({
+                                "id": call_id,
+                                "who": args.get("who").and_then(|v| v.as_str()).unwrap_or(""),
+                                "f": args.get("f").and_then(|v| v.as_str()).unwrap_or(""),
+                                "args": inner_args,
+                            }));
+                            bus_publish(&bus_tx, "tool_start", &slug, &timestamp, json!({
+                                "tool": tool,
+                            }));
                         }
                     }
                     CoordMessage::SetHost { hostname, reply } => {
-                        tracing::info!(from = %current_host, to = %hostname, "host switch");
-                        current_host = hostname.clone();
+                        tracing::info!(to = %hostname, "host switch (no-op, host is in args)");
                         let _ = reply.send(hostname);
                     }
                     CoordMessage::Message { message, full, notification, reply } => {
@@ -1153,40 +1114,16 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                 }
                             }
                             "shell" => {
-                                if !wickets.contains_key(&current_host) {
-                                    tracing::info!(host = %current_host, "no wicket for host, spawning for shell");
-                                    if let Ok(child) = spawn_wicket(&current_host, &slug) {
-                                        wicket_children.push(child);
-                                        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                                        while !wickets.contains_key(&current_host) {
-                                            if tokio::time::Instant::now() > deadline { break; }
-                                            match tokio::time::timeout(
-                                                std::time::Duration::from_millis(100),
-                                                coord_rx.recv(),
-                                            ).await {
-                                                Ok(Some(CoordMessage::ClientConnected { id: cid, protocol: proto, host: h, timestamp: _, tx })) => {
-                                                    if proto == "wicket" {
-                                                        let wicket_host = h.unwrap_or_else(|| "localhost".to_string());
-                                                        wickets.insert(wicket_host.clone(), cid);
-                                                        tracing::info!(client_id = cid, host = %wicket_host, "wicket connected for shell");
-                                                    }
-                                                    clients.insert(cid, tx);
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(&sid) = wickets.get(&current_host) {
-                                    let call_id = uuid::Uuid::new_v4().to_string();
-                                    send_to(&clients, sid, "shell", json!({
-                                        "call_id": call_id,
+                                let call_id = uuid::Uuid::new_v4().to_string();
+                                bus_publish(&bus_tx, "call", &slug, &timestamp, json!({
+                                    "id": call_id,
+                                    "who": "wicket",
+                                    "f": "shell",
+                                    "args": {
                                         "command": envelope.data.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                    }));
-                                    tracing::info!(host = %current_host, "shell command forwarded to wicket");
-                                } else {
-                                    bus_publish(&bus_tx, "error", &slug, &timestamp, json!({ "message": "wicket failed to connect for shell command" }));
-                                }
+                                    },
+                                }));
+                                tracing::info!("shell command broadcast on bus");
                             }
                             "claim" => {
                                 let claim_id = envelope.data.get("id")
@@ -1342,31 +1279,20 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                     .unwrap_or("deny");
                                 tracing::info!(behavior = %behavior, "approval response from client");
 
-                                if let Some((esc_call_id, esc_tool, esc_args)) = pending_escalation.take() {
+                                if let Some((esc_call_id, _esc_tool, esc_args)) = pending_escalation.take() {
                                     if behavior == "allow" {
-                                        if let Some(&sid) = wickets.get(&current_host) {
-                                            tracing::info!(call_id = %esc_call_id, tool = %esc_tool, "escalation approved, forwarding unsandboxed");
-                                            send_to(&clients, sid, &esc_tool, json!({
-                                                "call_id": esc_call_id,
-                                                "slug": slug,
-                                                "command": esc_args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                                "sandboxed": false,
-                                                "patch": esc_args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
-                                                "path": esc_args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
-                                            }));
-                                            bus_publish(&bus_tx, "tool_start", &slug, &timestamp, json!({
-                                                "tool": esc_tool,
-                                                "command": esc_args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                            }));
-                                        } else {
-                                            tracing::warn!("escalation approved but no wicket connected");
-                                            if let Some((_call_id, reply)) = pending_tool.take() {
-                                                let _ = reply.send(ToolResult {
-                                                    output: "escalation approved but no executor connected".to_string(),
-                                                    exit_code: 1,
-                                                });
-                                            }
-                                        }
+                                        let inner_args = esc_args.get("args").cloned().unwrap_or(json!({}));
+                                        tracing::info!(call_id = %esc_call_id, "escalation approved, broadcasting unsandboxed");
+                                        bus_publish(&bus_tx, "call", &slug, &timestamp, json!({
+                                            "id": esc_call_id,
+                                            "who": esc_args.get("who").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "f": esc_args.get("f").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "args": inner_args,
+                                            "escalated": true,
+                                        }));
+                                        bus_publish(&bus_tx, "tool_start", &slug, &timestamp, json!({
+                                            "tool": esc_args.get("f").and_then(|v| v.as_str()).unwrap_or(""),
+                                        }));
                                     } else {
                                         tracing::info!(call_id = %esc_call_id, "escalation denied");
                                         if let Some((_call_id, reply)) = pending_tool.take() {
@@ -1925,7 +1851,7 @@ async fn handle_mcp(
             id,
             json!({
                 "tools": [{
-                    "name": "wicket_approve",
+                    "name": "approve",
                     "description": "Request human approval for a tool call",
                     "inputSchema": {
                         "type": "object",
@@ -1937,98 +1863,24 @@ async fn handle_mcp(
                         "required": ["tool_name", "input"]
                     }
                 }, {
-                    "name": "zsh",
-                    "description": "Execute a command in a sandboxed Zsh shell. The command runs in a sandbox that restricts filesystem writes to the project directory. Use this for all shell commands. If a command fails with a permission error, you may retry with escalate: true to request approval to run outside the sandbox. Use run_in_background: true for long-running commands like listeners or servers — the command runs asynchronously and you receive a notification when it completes.",
+                    "name": "call",
+                    "description": "Call a function on a connected client. Use tools() first to discover available functions. The function is identified by who (the client) and f (the function name). Arguments are passed as args.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "command": { "type": "string", "description": "The Zsh command to execute" },
-                            "run_in_background": { "type": "boolean", "description": "Run the command in the background. Returns immediately with a task ID. Output is written to a file. A notification is sent when the command completes." },
-                            "timeout": { "type": "integer", "description": "Timeout in milliseconds. The command is killed if it exceeds this limit. Default: no timeout." },
-                            "escalate": { "type": "boolean", "description": "Request approval to run outside the sandbox. Only use after a sandboxed attempt failed with a permission error." },
-                            "reason": { "type": "string", "description": "Why the command needs to run outside the sandbox." }
+                            "who": { "type": "string", "description": "The client to call (e.g. wicket, shotgun)." },
+                            "f": { "type": "string", "description": "The function name (e.g. zsh, screenshot, tabs_create)." },
+                            "args": { "type": "object", "description": "Arguments to pass to the function." }
                         },
-                        "required": ["command"]
+                        "required": ["who", "f"]
                     }
                 }, {
-                    "name": "apply_patch",
-                    "description": "Apply a patch to create, update, or delete files. The patch uses a structured diff format with context lines for updates. Files must be inside the sandbox writable roots.\n\nFormat:\n*** Begin Patch\n*** Add File: <path>\n+<line>\n*** Update File: <path>\n@@ <optional context header>\n <context line>\n-<removed line>\n+<added line>\n <context line>\n*** Delete File: <path>\n*** End Patch\n\nPaths are relative to the working directory. Context lines (prefixed with space) locate where changes apply. Include 3 lines of context before and after each change.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "patch": { "type": "string", "description": "The patch to apply in the structured diff format" }
-                        },
-                        "required": ["patch"]
-                    }
-                }, {
-                    "name": "view_image",
-                    "description": "View an image file. Returns the image inline so you can see it. Use this to view screenshots, diagrams, photos, or any image file.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string", "description": "Path to the image file" }
-                        },
-                        "required": ["path"]
-                    }
-                }, {
-                    "name": "host",
-                    "description": "Switch the execution host. All subsequent tool calls and shell commands will run on this host. Use 'localhost' to return to the local machine.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "hostname": { "type": "string", "description": "The host to switch to, e.g. 'yolo@orb', 'worker.example.com', or 'localhost'." }
-                        },
-                        "required": ["hostname"]
-                    }
-                }, {
-                    "name": "tabs_context",
-                    "description": "Get information about the browser tab group. Returns tab IDs, titles, and URLs. Call this before using other browser tools to know what tabs exist.",
+                    "name": "tools",
+                    "description": "Discover available functions from all connected clients. Returns a list of { who, f, description } for every function that can be called right now.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
                         "required": []
-                    }
-                }, {
-                    "name": "tabs_create",
-                    "description": "Open a new tab in the browser tab group. Optionally navigate to a URL.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "url": { "type": "string", "description": "URL to open. Omit for a blank tab." }
-                        },
-                        "required": []
-                    }
-                }, {
-                    "name": "navigate",
-                    "description": "Navigate a browser tab to a URL.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "tabId": { "type": "integer", "description": "The tab ID to navigate." },
-                            "url": { "type": "string", "description": "The URL to navigate to." }
-                        },
-                        "required": ["tabId", "url"]
-                    }
-                }, {
-                    "name": "screenshot",
-                    "description": "Capture a screenshot of a browser tab. Returns the image inline. If tabId is omitted, captures the first tab in the group.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "tabId": { "type": "integer", "description": "The tab ID to capture. Omit for the first tab in the group." }
-                        },
-                        "required": []
-                    }
-                }, {
-                    "name": "javascript",
-                    "description": "Execute JavaScript code in a browser tab. Returns the result of the last expression. Do NOT use return statements. Output is sanitized to block credentials, tokens, and cookies. If tabId is omitted, executes in the first tab in the group.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "tabId": { "type": "integer", "description": "The tab ID to execute in. Omit for the first tab in the group." },
-                            "code": { "type": "string", "description": "The JavaScript code to execute." }
-                        },
-                        "required": ["code"]
                     }
                 }]
             }),
@@ -2062,27 +1914,7 @@ async fn handle_mcp(
 
             tracing::info!(tool_name = %params.name, arguments = %params.arguments, "MCP tools/call received");
 
-            if params.name == "host" {
-                let hostname = params.arguments.get("hostname")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("localhost")
-                    .to_string();
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = coord_tx.send(CoordMessage::SetHost {
-                    hostname: hostname.clone(),
-                    reply: reply_tx,
-                });
-                return make_json_response(match reply_rx.await {
-                    Ok(h) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": format!("Host set to {}.", h) }] }),
-                    ),
-                    Err(_) => jsonrpc_response(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": "failed to set host" }], "isError": true }),
-                    ),
-                });
-            } else if params.name == "wicket_approve" {
+            if params.name == "approve" {
                 let updated_input = params.arguments.get("input")
                     .cloned()
                     .unwrap_or(params.arguments.clone());
@@ -2097,20 +1929,49 @@ async fn handle_mcp(
                 ));
             }
 
-            let tool = params.name.clone();
-            let call_id = uuid::Uuid::new_v4().to_string();
+            if params.name == "tools" {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let _ = coord_tx.send(CoordMessage::ToolCall {
+                    call_id: uuid::Uuid::new_v4().to_string(),
+                    tool: "tools".to_string(),
+                    args: json!({}),
+                    reply: reply_tx,
+                });
+                return make_json_response(match reply_rx.await {
+                    Ok(result) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": result.output }] }),
+                    ),
+                    Err(_) => jsonrpc_response(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": "tool discovery failed" }], "isError": true }),
+                    ),
+                });
+            }
 
+            // mcp__o__call — generic dispatch
+            let who = params.arguments.get("who").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let f = params.arguments.get("f").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let args = params.arguments.get("args").cloned().unwrap_or(json!({}));
+
+            if who.is_empty() || f.is_empty() {
+                return make_json_response(jsonrpc_error(
+                    id, -32602, "call requires who and f".to_string(),
+                ));
+            }
+
+            let call_id = uuid::Uuid::new_v4().to_string();
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = coord_tx.send(CoordMessage::ToolCall {
                 call_id,
-                tool,
-                args: params.arguments,
+                tool: f.clone(),
+                args: json!({ "who": who, "f": f, "args": args }),
                 reply: reply_tx,
             });
 
             match reply_rx.await {
                 Ok(result) => {
-                    if (params.name == "view_image" || params.name == "screenshot") && result.exit_code == 0 {
+                    if (f == "view_image" || f == "screenshot") && result.exit_code == 0 {
                         match serde_json::from_str::<Value>(&result.output) {
                             Ok(content) => jsonrpc_response(id, json!({ "content": content })),
                             Err(_) => jsonrpc_response(
