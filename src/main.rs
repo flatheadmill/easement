@@ -2280,6 +2280,12 @@ async fn main() {
         }
     };
 
+    // Spawn localhost Wicket at startup.
+    if let Ok(child) = spawn_wicket("localhost", "localhost") {
+        tracing::info!("localhost wicket spawned");
+        std::mem::forget(child);
+    }
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(s) => s,
