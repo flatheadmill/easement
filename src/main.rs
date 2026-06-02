@@ -917,6 +917,10 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                     "slug": slug,
                                     "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                                     "sandboxed": !args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false),
+                                    "run_in_background": args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false),
+                                    "timeout": args.get("timeout").and_then(|v| v.as_i64()),
+                                    "task_uuid": call_id,
+                                    "timestamp": timestamp,
                                     "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                     "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                                 }));
@@ -1004,6 +1008,10 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                 "slug": slug,
                                 "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                                 "sandboxed": sandboxed,
+                                "run_in_background": args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false),
+                                "timeout": args.get("timeout").and_then(|v| v.as_i64()),
+                                "task_uuid": call_id,
+                                "timestamp": timestamp,
                                 "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                 "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                             }));
@@ -1930,11 +1938,13 @@ async fn handle_mcp(
                     }
                 }, {
                     "name": "zsh",
-                    "description": "Execute a command in a sandboxed Zsh shell. The command runs in a sandbox that restricts filesystem writes to the project directory. Use this for all shell commands. If a command fails with a permission error, you may retry with escalate: true to request approval to run outside the sandbox.",
+                    "description": "Execute a command in a sandboxed Zsh shell. The command runs in a sandbox that restricts filesystem writes to the project directory. Use this for all shell commands. If a command fails with a permission error, you may retry with escalate: true to request approval to run outside the sandbox. Use run_in_background: true for long-running commands like listeners or servers — the command runs asynchronously and you receive a notification when it completes.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "command": { "type": "string", "description": "The Zsh command to execute" },
+                            "run_in_background": { "type": "boolean", "description": "Run the command in the background. Returns immediately with a task ID. Output is written to a file. A notification is sent when the command completes." },
+                            "timeout": { "type": "integer", "description": "Timeout in milliseconds. The command is killed if it exceeds this limit. Default: no timeout." },
                             "escalate": { "type": "boolean", "description": "Request approval to run outside the sandbox. Only use after a sandboxed attempt failed with a permission error." },
                             "reason": { "type": "string", "description": "Why the command needs to run outside the sandbox." }
                         },
