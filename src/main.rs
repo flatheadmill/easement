@@ -1709,11 +1709,21 @@ async fn handle_websocket(
                     }
 
                     // Response with slug: route to the coordinator by (slug, timestamp).
-                    if stream_name == "response" {
-                        let resp_data = data.get("data").cloned().unwrap_or_default();
-                        let resp_slug = resp_data.get("slug").or_else(|| data.get("slug"))
+                    if stream_name == "tools_response" {
+                        let bus_tx = {
+                            let state = server.read().await;
+                            state.bus_tx.clone()
+                        };
+                        if let Ok(json) = serde_json::to_string(&data) {
+                            let _ = bus_tx.send(json);
+                        }
+                        continue;
+                    }
+
+                    if stream_name == "response" || stream_name == "tool_result" || stream_name == "shell_result" || stream_name == "background_done" || stream_name == "background_output" {
+                        let resp_slug = data.get("slug")
                             .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let resp_ts = resp_data.get("timestamp").or_else(|| data.get("timestamp"))
+                        let resp_ts = data.get("timestamp")
                             .and_then(|v| v.as_str()).unwrap_or("").to_string();
 
                         if !resp_slug.is_empty() && !resp_ts.is_empty() {
