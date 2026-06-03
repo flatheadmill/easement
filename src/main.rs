@@ -2533,7 +2533,7 @@ async fn main() {
     };
 
     // Spawn localhost Wicket at startup.
-    {
+    tokio::spawn(async move {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = wicket_mgr_tx.send(WicketManagerMsg::Ensure {
             host: "localhost".to_string(),
@@ -2542,10 +2542,16 @@ async fn main() {
         });
         match reply_rx.await {
             Ok(Ok(host)) => tracing::info!(host = %host, "localhost wicket ready"),
-            Ok(Err(e)) => tracing::error!(error = %e, "localhost wicket failed"),
-            Err(_) => tracing::error!("localhost wicket ensure: manager dropped reply"),
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "localhost wicket failed, aborting");
+                std::process::exit(1);
+            }
+            Err(_) => {
+                tracing::error!("localhost wicket ensure: manager dropped reply, aborting");
+                std::process::exit(1);
+            }
         }
-    }
+    });
 
     loop {
         let (stream, peer) = match listener.accept().await {
