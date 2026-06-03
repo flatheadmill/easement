@@ -1096,6 +1096,38 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
 
                         // Check escalation from args.
                         let inner_args = args.get("args").cloned().unwrap_or(json!({}));
+
+                        // Ensure a Wicket is available on the target host.
+                        let host = inner_args.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
+                        if host != "localhost" {
+                            let (ensure_tx, ensure_rx) = oneshot::channel();
+                            let _ = wicket_mgr_tx.send(WicketManagerMsg::Ensure {
+                                host: host.to_string(),
+                                slug: slug.clone(),
+                                reply: ensure_tx,
+                            });
+                            match ensure_rx.await {
+                                Ok(Ok(h)) => {
+                                    tracing::info!(host = %h, "wicket ensured for tool call");
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(host = %host, error = %e, "cannot ensure wicket");
+                                    let _ = reply.send(ToolResult {
+                                        output: format!("no wicket on {}: {}", host, e),
+                                        exit_code: 1,
+                                    });
+                                    continue;
+                                }
+                                Err(_) => {
+                                    let _ = reply.send(ToolResult {
+                                        output: "wicket manager unavailable".to_string(),
+                                        exit_code: 1,
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+
                         let escalate = inner_args.get("escalate").and_then(|v| v.as_bool()).unwrap_or(false);
 
                         if escalate {
@@ -1239,6 +1271,36 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                             }
                             "shell" => {
                                 let call_id = uuid::Uuid::new_v4().to_string();
+                                if shell_host != "localhost" {
+                                    let (ensure_tx, ensure_rx) = oneshot::channel();
+                                    let _ = wicket_mgr_tx.send(WicketManagerMsg::Ensure {
+                                        host: shell_host.clone(),
+                                        slug: slug.clone(),
+                                        reply: ensure_tx,
+                                    });
+                                    match ensure_rx.await {
+                                        Ok(Ok(h)) => {
+                                            tracing::info!(host = %h, "wicket ensured for shell command");
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::warn!(host = %shell_host, error = %e, "cannot ensure wicket for shell");
+                                            bus_publish(&bus_tx, "shell_result", &slug, &timestamp, json!({
+                                                "call_id": call_id,
+                                                "output": format!("no wicket on {}: {}", shell_host, e),
+                                                "exit_code": 1,
+                                            }));
+                                            continue;
+                                        }
+                                        Err(_) => {
+                                            bus_publish(&bus_tx, "shell_result", &slug, &timestamp, json!({
+                                                "call_id": call_id,
+                                                "output": "wicket manager unavailable",
+                                                "exit_code": 1,
+                                            }));
+                                            continue;
+                                        }
+                                    }
+                                }
                                 bus_publish(&bus_tx, "call", &slug, &timestamp, json!({
                                     "id": call_id,
                                     "who": "wicket",
