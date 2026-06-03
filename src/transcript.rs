@@ -1,20 +1,18 @@
-// Transcript authority. Wicket owns the canonical transcript as a Vec in
-// memory with a UUID index. Persistence is append-only to a JSONL file.
+// Transcript authority. Easement owns the canonical transcript as a Vec
+// in memory with a UUID index. Persistence is append-only to a JSONL file.
 //
-// Easement streams the entire CLI transcript from the first line. For each
-// entry: if its UUID is in our index, it is replay — skip. If its UUID is
-// not in our index, assert that its parentUuid is the UUID of the last
-// chained entry in our Vec. If it is, append. If it is not, crash.
+// On load, the chain is validated. If our own file has a broken chain,
+// that is a fatal error.
 //
-// Entries without UUIDs (queue-operation, last-prompt) do not participate
-// in the chain. They are accepted silently.
+// After each round, the CLI's transcript file is reconciled against ours.
+// The CLI gets one chance to prune — its cleanup transforms may shorten
+// the chain. We accept the pruning, log the cut, and continue from the
+// CLI's chain point. After reconciliation, any chain break is fatal.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
-
-use serde_json::json;
+use std::path::{Path, PathBuf};
 
 use crate::normalize::try_normalize;
 use crate::parser::parse_line;
@@ -57,19 +55,45 @@ impl Transcript {
         };
 
         let mut results = vec![];
+        let mut prev_uuid: Option<String> = None;
+
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<serde_json::Value>(line) {
-                Ok(data) => {
-                    self.index_entry(&data);
-                    results.extend(self.ingest(data));
-                }
+            let data: serde_json::Value = match serde_json::from_str(line) {
+                Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("transcript line parse error: {}", e);
+                    continue;
                 }
+            };
+
+            let uuid = data.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let parent = data.get("parentUuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            if let Some(ref u) = uuid {
+                match (&parent, &prev_uuid) {
+                    (Some(p), Some(prev)) if p != prev => {
+                        panic!(
+                            "transcript file corrupt: entry {} parentUuid {} does not follow {}",
+                            u, p, prev
+                        );
+                    }
+                    (Some(_), None) if self.entries.is_empty() => {
+                        // First entry with a parentUuid but no previous — could be
+                        // a transcript that was trimmed. Accept it.
+                    }
+                    _ => {}
+                }
+            }
+
+            self.index_entry(&data);
+            results.extend(self.ingest(data));
+
+            if uuid.is_some() {
+                prev_uuid = uuid;
             }
         }
 
@@ -80,12 +104,115 @@ impl Transcript {
             "transcript loaded from disk"
         );
 
-        let fixup = self.close_orphaned_tool_calls();
-        results.extend(fixup);
+        results
+    }
+
+    /// Reconcile the CLI's transcript against ours after a round. The CLI
+    /// may have pruned entries from the tail (cleanup transforms). We accept
+    /// the pruning, back up what was cut, and append the genuinely new entries.
+    pub fn reconcile_cli_file(&mut self, cli_path: &Path, backup_dir: &Path) -> Vec<NormalizedEntry> {
+        let content = match fs::read_to_string(cli_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read CLI transcript");
+                return vec![];
+            }
+        };
+
+        // Back up our transcript before reconciliation.
+        let backup_path = backup_dir.join("pre-reconcile.jsonl");
+        if let Err(e) = fs::copy(&self.path, &backup_path) {
+            tracing::warn!(error = %e, "cannot back up transcript");
+        }
+
+        // Collect new entries from the CLI file — entries not in our UUID index.
+        let mut new_entries: Vec<serde_json::Value> = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let data: serde_json::Value = match serde_json::from_str(line) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let uuid = data.get("uuid").and_then(|v| v.as_str());
+            match uuid {
+                Some(u) if self.uuid_index.contains_key(u) => continue,
+                Some(_) => new_entries.push(data),
+                None => continue,
+            }
+        }
+
+        if new_entries.is_empty() {
+            return vec![];
+        }
+
+        // Find where the first new entry chains from.
+        let first_parent = new_entries[0]
+            .get("parentUuid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let chain_head = self.chain_head().unwrap_or("");
+
+        let results = if first_parent == chain_head {
+            // Clean append — CLI's new entries chain from our head.
+            let mut results = vec![];
+            for data in new_entries {
+                self.index_entry(&data);
+                self.persist(&data);
+                results.extend(self.ingest(data));
+            }
+            results
+        } else if let Some(rewind_pos) = self.uuid_index.get(first_parent).copied() {
+            // The CLI pruned entries from our tail. The new entries chain
+            // from an earlier point in our transcript.
+            let cut_count = self.entries.len() - rewind_pos - 1;
+            tracing::warn!(
+                rewind_to = %first_parent,
+                cut_count,
+                "CLI pruned entries, rewinding transcript"
+            );
+
+            // Truncate our in-memory state back to the rewind point.
+            let cut_entries: Vec<serde_json::Value> = self.entries.drain(rewind_pos + 1..).collect();
+            for entry in &cut_entries {
+                if let Some(u) = entry.get("uuid").and_then(|v| v.as_str()) {
+                    self.uuid_index.remove(u);
+                }
+            }
+
+            // Save the cut entries.
+            let cut_path = backup_dir.join("cut-entries.jsonl");
+            if let Ok(mut file) = fs::File::create(&cut_path) {
+                for entry in &cut_entries {
+                    if let Ok(line) = serde_json::to_string(entry) {
+                        let _ = writeln!(file, "{}", line);
+                    }
+                }
+            }
+
+            // Rewrite our transcript file from the rewound state.
+            self.rewrite_file();
+
+            // Now append the new entries.
+            let mut results = vec![];
+            for data in new_entries {
+                self.index_entry(&data);
+                self.persist(&data);
+                results.extend(self.ingest(data));
+            }
+            results
+        } else {
+            // The first new entry chains from a UUID we've never seen.
+            panic!(
+                "CLI transcript has entries from unknown provenance: parentUuid {}",
+                first_parent
+            );
+        };
 
         results
     }
 
+    /// Strict entry handler for live operation. Any chain break is fatal.
     pub fn handle_entry(&mut self, data: serde_json::Value) -> Vec<NormalizedEntry> {
         let entry_uuid = data.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
         let entry_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -153,89 +280,6 @@ impl Transcript {
         &self.entries
     }
 
-    pub fn close_orphaned_tool_calls(&mut self) -> Vec<NormalizedEntry> {
-        let mut tool_use_ids: Vec<String> = Vec::new();
-        let mut tool_result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for entry in self.entries.iter().rev() {
-            let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let content = entry.get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array());
-            let Some(content) = content else { break };
-
-            match entry_type {
-                "assistant" => {
-                    for block in content {
-                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                            if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
-                                tool_use_ids.push(id.to_string());
-                            }
-                        }
-                    }
-                }
-                "user" => {
-                    let has_tool_result = content.iter()
-                        .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"));
-                    if has_tool_result {
-                        for block in content {
-                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                                if let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) {
-                                    tool_result_ids.insert(id.to_string());
-                                }
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        let orphaned: Vec<String> = tool_use_ids.into_iter()
-            .filter(|id| !tool_result_ids.contains(id))
-            .collect();
-
-        if orphaned.is_empty() {
-            return vec![];
-        }
-
-        let chain_head_uuid = self.chain_head().unwrap_or("").to_string();
-        let session_id = self.entries.iter().rev().find_map(|e| {
-            e.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string())
-        });
-
-        let tool_results: Vec<serde_json::Value> = orphaned.iter().map(|id| {
-            serde_json::json!({
-                "type": "tool_result",
-                "tool_use_id": id,
-                "content": "Request interrupted by user.",
-                "is_error": true
-            })
-        }).collect();
-
-        let new_uuid = uuid::Uuid::new_v4().to_string();
-        let mut synthetic = serde_json::json!({
-            "type": "user",
-            "uuid": new_uuid,
-            "parentUuid": chain_head_uuid,
-            "message": {
-                "role": "user",
-                "content": tool_results
-            },
-            "isSidechain": false
-        });
-
-        if let Some(sid) = session_id {
-            synthetic.as_object_mut().unwrap()
-                .insert("sessionId".to_string(), serde_json::json!(sid));
-        }
-
-        tracing::info!(count = orphaned.len(), ids = ?orphaned, "closing orphaned tool calls");
-        self.handle_entry(synthetic)
-    }
-
     fn chain_head(&self) -> Option<&str> {
         self.entries.iter().rev().find_map(|e| {
             e.get("uuid").and_then(|v| v.as_str())
@@ -291,12 +335,28 @@ impl Transcript {
             }
         }
     }
+
+    fn rewrite_file(&self) {
+        let tmp = self.path.with_extension("jsonl.tmp");
+        match fs::File::create(&tmp) {
+            Ok(mut file) => {
+                for entry in &self.entries {
+                    if let Ok(line) = serde_json::to_string(entry) {
+                        let _ = writeln!(file, "{}", line);
+                    }
+                }
+                if let Err(e) = fs::rename(&tmp, &self.path) {
+                    tracing::warn!(error = %e, "cannot rename rewritten transcript");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot create temp file for transcript rewrite");
+            }
+        }
+    }
 }
 
 // -- Session tracking --
-//
-// Sessions are keyed by target type: local sessions persist to disk, remote
-// sessions are held in memory for the Wicket process lifetime.
 
 pub struct Sessions {
     local: Option<String>,
@@ -313,7 +373,6 @@ impl Sessions {
             .join("state")
             .join("easement");
 
-        // Load the most recent local session from disk.
         let local = Self::read_latest(&state_dir, slug);
 
         Self {
@@ -354,7 +413,10 @@ impl Sessions {
 
         let entry = serde_json::json!({
             "session_id": session_id,
-            "timestamp": timestamp()
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
         });
 
         let mut line = serde_json::to_string(&entry).unwrap();
@@ -384,11 +446,4 @@ impl Sessions {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
-}
-
-fn timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }

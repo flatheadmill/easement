@@ -1707,22 +1707,12 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                             };
                             if let Some(path) = cli_path {
                                 round_log.copy_transcript(&path);
-                                if let Ok(content) = std::fs::read_to_string(&path) {
-                                    for line in content.lines() {
-                                        let line = line.trim();
-                                        if line.is_empty() { continue; }
-                                        if let Ok(data) = serde_json::from_str::<Value>(line) {
-                                            {
-                                                let new_entries = transcript.handle_entry(data);
-                                                for entry in &new_entries {
-                                                    if let Ok(data) = serde_json::to_value(entry) {
-                                                        bus_publish(&bus_tx, "entry", &slug, &timestamp, data);
-                                                    }
-                                                    entries.push(entry.clone());
-                                                }
-                                            }
-                                        }
+                                let new_entries = transcript.reconcile_cli_file(&path, &round_log.dir);
+                                for entry in &new_entries {
+                                    if let Ok(data) = serde_json::to_value(entry) {
+                                        bus_publish(&bus_tx, "entry", &slug, &timestamp, data);
                                     }
+                                    entries.push(entry.clone());
                                 }
                             } else {
                                 tracing::warn!("CLI transcript file not found");
@@ -1787,22 +1777,12 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                         };
                         if let Some(path) = cli_path {
                             round_log.copy_transcript(&path);
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                for line in content.lines() {
-                                    let line = line.trim();
-                                    if line.is_empty() { continue; }
-                                    if let Ok(data) = serde_json::from_str::<Value>(line) {
-                                        {
-                                            let new_entries = transcript.handle_entry(data);
-                                            for entry in &new_entries {
-                                                if let Ok(data) = serde_json::to_value(entry) {
-                                                    bus_publish(&bus_tx, "entry", &slug, &timestamp, data);
-                                                }
-                                                entries.push(entry.clone());
-                                            }
-                                        }
-                                    }
+                            let new_entries = transcript.reconcile_cli_file(&path, &round_log.dir);
+                            for entry in &new_entries {
+                                if let Ok(data) = serde_json::to_value(entry) {
+                                    bus_publish(&bus_tx, "entry", &slug, &timestamp, data);
                                 }
+                                entries.push(entry.clone());
                             }
                         }
 
