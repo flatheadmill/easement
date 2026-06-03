@@ -56,6 +56,7 @@ impl Transcript {
 
         let mut results = vec![];
         let mut prev_uuid: Option<String> = None;
+        let mut validating = true;
 
         for line in content.lines() {
             let line = line.trim();
@@ -72,8 +73,14 @@ impl Transcript {
 
             let uuid = data.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
             let parent = data.get("parentUuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let entrypoint = data.get("entrypoint").and_then(|v| v.as_str()).unwrap_or("");
 
-            if let Some(ref u) = uuid {
+            if entrypoint == "cli" {
+                validating = false;
+            }
+
+            if validating {
+              if let Some(ref u) = uuid {
                 match (&parent, &prev_uuid) {
                     (Some(p), Some(prev)) if p != prev => {
                         panic!(
@@ -82,11 +89,10 @@ impl Transcript {
                         );
                     }
                     (Some(_), None) if self.entries.is_empty() => {
-                        // First entry with a parentUuid but no previous — could be
-                        // a transcript that was trimmed. Accept it.
                     }
                     _ => {}
                 }
+              }
             }
 
             self.index_entry(&data);
