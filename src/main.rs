@@ -703,7 +703,7 @@ async fn spawn_claude_print(
         "mcpServers": {
             "o": {
                 "type": "http",
-                "url": format!("http://localhost:6502/mcp/{}/{}", slug, timestamp)
+                "url": format!("http://localhost:{}/mcp/{}/{}", easement_port(), slug, timestamp)
             }
         }
     });
@@ -832,28 +832,34 @@ async fn spawn_claude_print(
     })
 }
 
+fn easement_port() -> u16 {
+    env::var("EASEMENT_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6502)
+}
+
 // -- Wicket spawn --
 
 fn spawn_wicket(host: &str, slug: &str) -> Result<tokio::process::Child, String> {
+    let port = easement_port();
     let is_orb = host.contains("orb");
     let wicket_url = if is_orb {
-        "ws://host.internal:6502"
-    } else if host == "localhost" {
-        "ws://localhost:6502"
+        format!("ws://host.internal:{}", port)
     } else {
-        "ws://localhost:6502"
+        format!("ws://localhost:{}", port)
     };
 
     let mut cmd = if host == "localhost" {
         let mut c = tokio::process::Command::new("wicket");
-        c.arg(wicket_url).arg(slug).arg("localhost");
+        c.arg(&wicket_url).arg(slug).arg("localhost");
         c
     } else {
         let mut c = tokio::process::Command::new("ssh");
         if !is_orb {
-            c.arg("-R").arg("6502:localhost:6502");
+            c.arg("-R").arg(format!("{}:localhost:{}", port, port));
         }
-        c.arg(host).arg("wicket").arg(wicket_url).arg(slug).arg(host);
+        c.arg(host).arg("wicket").arg(&wicket_url).arg(slug).arg(host);
         c
     };
 
@@ -2278,7 +2284,7 @@ async fn main() {
     let _guard = init_tracing();
 
     let server = Arc::new(RwLock::new(ServerState::new()));
-    let addr = SocketAddr::from(([127, 0, 0, 1], 6502));
+    let addr = SocketAddr::from(([127, 0, 0, 1], easement_port()));
 
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
