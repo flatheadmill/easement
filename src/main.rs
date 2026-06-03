@@ -901,6 +901,7 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
     let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut pending_message_reply: Option<oneshot::Sender<String>> = None;
     let mut response_accumulator: String = String::new();
+    let mut shell_host: String = "localhost".to_string();
 
     tracing::info!(
         slug = %slug,
@@ -1136,9 +1137,18 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                     "f": "shell",
                                     "args": {
                                         "command": envelope.data.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                        "host": &shell_host,
                                     },
                                 }));
                                 tracing::info!("shell command broadcast on bus");
+                            }
+                            "host" => {
+                                let hostname = envelope.data.get("hostname")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("localhost")
+                                    .to_string();
+                                tracing::info!(to = %hostname, "shell host switched");
+                                shell_host = hostname;
                             }
                             "claim" => {
                                 let claim_id = envelope.data.get("id")
