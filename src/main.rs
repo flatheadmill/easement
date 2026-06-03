@@ -1818,6 +1818,7 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                         claude = None;
                         steer_queue.clear();
                         turn_queue.clear();
+
                         if let Some(reply) = pending_message_reply.take() {
                             let _ = reply.send("error: claude exited unexpectedly".to_string());
                         }

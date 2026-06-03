@@ -14,6 +14,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use serde_json::json;
+
 use crate::normalize::try_normalize;
 use crate::parser::parse_line;
 use crate::protocol::NormalizedEntry;
@@ -77,6 +79,10 @@ impl Transcript {
             normalized = results.len(),
             "transcript loaded from disk"
         );
+
+        let fixup = self.close_orphaned_tool_calls();
+        results.extend(fixup);
+
         results
     }
 
@@ -145,6 +151,89 @@ impl Transcript {
 
     pub fn entries(&self) -> &[serde_json::Value] {
         &self.entries
+    }
+
+    pub fn close_orphaned_tool_calls(&mut self) -> Vec<NormalizedEntry> {
+        let mut tool_use_ids: Vec<String> = Vec::new();
+        let mut tool_result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for entry in self.entries.iter().rev() {
+            let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let content = entry.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array());
+            let Some(content) = content else { break };
+
+            match entry_type {
+                "assistant" => {
+                    for block in content {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                            if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                                tool_use_ids.push(id.to_string());
+                            }
+                        }
+                    }
+                }
+                "user" => {
+                    let has_tool_result = content.iter()
+                        .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"));
+                    if has_tool_result {
+                        for block in content {
+                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                                if let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) {
+                                    tool_result_ids.insert(id.to_string());
+                                }
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let orphaned: Vec<String> = tool_use_ids.into_iter()
+            .filter(|id| !tool_result_ids.contains(id))
+            .collect();
+
+        if orphaned.is_empty() {
+            return vec![];
+        }
+
+        let chain_head_uuid = self.chain_head().unwrap_or("").to_string();
+        let session_id = self.entries.iter().rev().find_map(|e| {
+            e.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string())
+        });
+
+        let tool_results: Vec<serde_json::Value> = orphaned.iter().map(|id| {
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "Request interrupted by user.",
+                "is_error": true
+            })
+        }).collect();
+
+        let new_uuid = uuid::Uuid::new_v4().to_string();
+        let mut synthetic = serde_json::json!({
+            "type": "user",
+            "uuid": new_uuid,
+            "parentUuid": chain_head_uuid,
+            "message": {
+                "role": "user",
+                "content": tool_results
+            },
+            "isSidechain": false
+        });
+
+        if let Some(sid) = session_id {
+            synthetic.as_object_mut().unwrap()
+                .insert("sessionId".to_string(), serde_json::json!(sid));
+        }
+
+        tracing::info!(count = orphaned.len(), ids = ?orphaned, "closing orphaned tool calls");
+        self.handle_entry(synthetic)
     }
 
     fn chain_head(&self) -> Option<&str> {
