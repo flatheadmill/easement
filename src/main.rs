@@ -144,11 +144,18 @@ fn init_tracing() -> WorkerGuard {
         .join("easement");
     let _ = std::fs::create_dir_all(&log_dir);
 
+    let port = easement_port();
+    let log_name = if port == 6502 {
+        "easement.log".to_string()
+    } else {
+        format!("easement-{}.log", port)
+    };
+
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("easement.log"))
-        .expect("failed to open easement.log");
+        .open(log_dir.join(&log_name))
+        .expect("failed to open log file");
 
     let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
 
