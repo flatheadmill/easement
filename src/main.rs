@@ -419,15 +419,17 @@ struct ServerState {
     coordinators: HashMap<(String, String), CoordinatorHandle>,
     next_client_id: u64,
     bus_tx: broadcast::Sender<String>,
+    wicket_mgr_tx: mpsc::UnboundedSender<WicketManagerMsg>,
 }
 
 impl ServerState {
-    fn new() -> Self {
+    fn new(wicket_mgr_tx: mpsc::UnboundedSender<WicketManagerMsg>) -> Self {
         let (bus_tx, _) = broadcast::channel(65536);
         Self {
             coordinators: HashMap::new(),
             next_client_id: 0,
             bus_tx,
+            wicket_mgr_tx,
         }
     }
 
@@ -476,13 +478,14 @@ impl ServerState {
     fn find_or_create_coordinator(&mut self, slug: &str, timestamp: &str) -> mpsc::UnboundedSender<CoordMessage> {
         let key = (slug.to_string(), timestamp.to_string());
         let bus = self.bus_tx.clone();
+        let wmgr = self.wicket_mgr_tx.clone();
         let handle = self.coordinators.entry(key).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             let slug_clone = slug.to_string();
             let ts_clone = timestamp.to_string();
             let self_tx = tx.clone();
             tokio::spawn(async move {
-                run_coordinator(slug_clone, ts_clone, self_tx, rx, bus).await;
+                run_coordinator(slug_clone, ts_clone, self_tx, rx, bus, wmgr).await;
             });
             CoordinatorHandle { tx }
         });
@@ -547,6 +550,30 @@ struct ServiceResponse {
 struct PendingService {
     id: String,
     reply: oneshot::Sender<ServiceResponse>,
+}
+
+// -- Wicket manager --
+
+enum WicketManagerMsg {
+    Ensure {
+        host: String,
+        slug: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    Connected {
+        host: String,
+        client_id: u64,
+    },
+    Disconnected {
+        client_id: u64,
+    },
+}
+
+struct PendingSpawn {
+    host: String,
+    child: tokio::process::Child,
+    reply: oneshot::Sender<Result<String, String>>,
+    deadline: tokio::time::Instant,
 }
 
 // -- Broadcast helpers --
@@ -877,9 +904,89 @@ fn spawn_wicket(host: &str, slug: &str) -> Result<tokio::process::Child, String>
     cmd.spawn().map_err(|e| format!("failed to spawn wicket on {}: {}", host, e))
 }
 
+async fn run_wicket_manager(mut rx: mpsc::UnboundedReceiver<WicketManagerMsg>) {
+    let mut hosts: HashMap<String, u64> = HashMap::new();
+    let mut pending: Option<PendingSpawn> = None;
+
+    loop {
+        let deadline = pending.as_ref().map(|p| p.deadline);
+
+        tokio::select! {
+            Some(msg) = rx.recv() => {
+                match msg {
+                    WicketManagerMsg::Connected { host, client_id } => {
+                        tracing::info!(host = %host, client_id, "wicket connected");
+                        hosts.insert(host.clone(), client_id);
+                        if let Some(ref p) = pending {
+                            if p.host == host {
+                                let p = pending.take().unwrap();
+                                let _ = p.reply.send(Ok(host));
+                            }
+                        }
+                    }
+                    WicketManagerMsg::Disconnected { client_id } => {
+                        let removed: Vec<String> = hosts.iter()
+                            .filter(|(_, v)| **v == client_id)
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        for host in &removed {
+                            tracing::info!(host = %host, client_id, "wicket disconnected");
+                        }
+                        hosts.retain(|_, v| *v != client_id);
+                    }
+                    WicketManagerMsg::Ensure { host, slug, reply } => {
+                        if hosts.contains_key(&host) {
+                            tracing::info!(host = %host, "wicket already connected");
+                            let _ = reply.send(Ok(host));
+                        } else {
+                            tracing::info!(host = %host, "spawning wicket");
+                            match spawn_wicket(&host, &slug) {
+                                Ok(child) => {
+                                    pending = Some(PendingSpawn {
+                                        host,
+                                        child,
+                                        reply,
+                                        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            status = async {
+                match pending.as_mut() {
+                    Some(p) => p.child.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(p) = pending.take() {
+                    let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                    tracing::warn!(host = %p.host, exit_code = code, "wicket exited before connecting");
+                    let _ = p.reply.send(Err(format!("wicket exited with code {}", code)));
+                }
+            }
+            _ = async {
+                match deadline {
+                    Some(dl) => tokio::time::sleep_until(dl).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(p) = pending.take() {
+                    tracing::warn!(host = %p.host, "wicket spawn timed out");
+                    let _ = p.reply.send(Err("timeout waiting for wicket to connect".to_string()));
+                }
+            }
+        }
+    }
+}
+
 // -- Coordinator (per window: slug + timestamp) --
 
-async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>, bus_tx: broadcast::Sender<String>) {
+async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>, bus_tx: broadcast::Sender<String>, wicket_mgr_tx: mpsc::UnboundedSender<WicketManagerMsg>) {
     let exchange = ExchangeLog::new(&slug);
 
     let mut transcript = Transcript::new(&slug, Some(&timestamp));
@@ -902,6 +1009,7 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
     let mut pending_message_reply: Option<oneshot::Sender<String>> = None;
     let mut response_accumulator: String = String::new();
     let mut shell_host: String = "localhost".to_string();
+    let mut pending_ensure: Option<oneshot::Receiver<Result<String, String>>> = None;
 
     tracing::info!(
         slug = %slug,
@@ -1147,8 +1255,14 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("localhost")
                                     .to_string();
-                                tracing::info!(to = %hostname, "shell host switched");
-                                shell_host = hostname;
+                                tracing::info!(to = %hostname, "ensuring wicket for host switch");
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                let _ = wicket_mgr_tx.send(WicketManagerMsg::Ensure {
+                                    host: hostname,
+                                    slug: slug.clone(),
+                                    reply: reply_tx,
+                                });
+                                pending_ensure = Some(reply_rx);
                             }
                             "claim" => {
                                 let claim_id = envelope.data.get("id")
@@ -1373,6 +1487,29 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                 }
             }
 
+
+            // Wicket manager ensure reply.
+            result = async {
+                match pending_ensure.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                pending_ensure = None;
+                match result {
+                    Ok(Ok(host)) => {
+                        tracing::info!(host = %host, "host switch confirmed");
+                        shell_host = host;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "host switch failed");
+                        bus_publish(&bus_tx, "error", &slug, &timestamp, json!({ "message": format!("host switch failed: {}", e) }));
+                    }
+                    Err(_) => {
+                        tracing::warn!("host switch failed: manager dropped reply");
+                    }
+                }
+            }
             // ClaudePrint stdout events.
             Some(event) = async {
                 match claude.as_mut() {
@@ -1676,6 +1813,7 @@ async fn handle_websocket(
 
     let mut coord_tx: Option<mpsc::UnboundedSender<CoordMessage>> = None;
     let mut slug: Option<String> = None;
+    let mut wicket_host: Option<String> = None;
 
     while let Some(result) = stream.next().await {
         match result {
@@ -1789,6 +1927,15 @@ async fn handle_websocket(
 
                     if protocol == "wicket" {
                         tracing::info!(client_id, slug = %connect_slug, host = ?host, "wicket associating");
+                        if let Some(ref h) = host {
+                            wicket_host = Some(h.clone());
+                            let state_r = server.read().await;
+                            let _ = state_r.wicket_mgr_tx.send(WicketManagerMsg::Connected {
+                                host: h.clone(),
+                                client_id,
+                            });
+                            drop(state_r);
+                        }
                         let state = server.read().await;
                         let mut first_tx = None;
                         for ((s, _), handle) in state.coordinators.iter() {
@@ -1823,6 +1970,10 @@ async fn handle_websocket(
 
     if let Some(ref tx) = coord_tx {
         let _ = tx.send(CoordMessage::ClientDisconnected { id: client_id });
+    }
+    if wicket_host.is_some() {
+        let state = server.read().await;
+        let _ = state.wicket_mgr_tx.send(WicketManagerMsg::Disconnected { client_id });
     }
     write_task.abort();
     tracing::info!(client_id, slug = ?slug, "websocket disconnected");
@@ -2300,7 +2451,10 @@ async fn handle_request(
 async fn main() {
     let _guard = init_tracing();
 
-    let server = Arc::new(RwLock::new(ServerState::new()));
+    let (wicket_mgr_tx, wicket_mgr_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_wicket_manager(wicket_mgr_rx));
+
+    let server = Arc::new(RwLock::new(ServerState::new(wicket_mgr_tx.clone())));
     let addr = SocketAddr::from(([127, 0, 0, 1], easement_port()));
 
     let listener = match TcpListener::bind(addr).await {
@@ -2316,9 +2470,18 @@ async fn main() {
     };
 
     // Spawn localhost Wicket at startup.
-    if let Ok(child) = spawn_wicket("localhost", "localhost") {
-        tracing::info!("localhost wicket spawned");
-        std::mem::forget(child);
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = wicket_mgr_tx.send(WicketManagerMsg::Ensure {
+            host: "localhost".to_string(),
+            slug: "localhost".to_string(),
+            reply: reply_tx,
+        });
+        match reply_rx.await {
+            Ok(Ok(host)) => tracing::info!(host = %host, "localhost wicket ready"),
+            Ok(Err(e)) => tracing::error!(error = %e, "localhost wicket failed"),
+            Err(_) => tracing::error!("localhost wicket ensure: manager dropped reply"),
+        }
     }
 
     loop {
