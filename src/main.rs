@@ -938,30 +938,32 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                         // Scatter/gather for tool discovery.
                         if tool == "tools" {
                             tracing::info!(call_id = %call_id, "tools discovery query");
+                            let mut bus_rx_gather = bus_tx.subscribe();
                             bus_publish(&bus_tx, "tools_query", &slug, &timestamp, json!({ "id": call_id }));
-                            let bus_rx_gather = bus_tx.subscribe();
-                            let gather_result = tokio::time::timeout(
-                                std::time::Duration::from_millis(500),
-                                async {
-                                    let mut rx = bus_rx_gather;
-                                    let mut tools: Vec<Value> = Vec::new();
-                                    while let Ok(msg) = rx.recv().await {
-                                        if let Ok(parsed) = serde_json::from_str::<Value>(&msg) {
-                                            if parsed.get("stream").and_then(|v| v.as_str()) == Some("tools_response") {
-                                                if let Some(id) = parsed.get("data").and_then(|d| d.get("id")).and_then(|v| v.as_str()) {
-                                                    if id == call_id {
-                                                        if let Some(manifest) = parsed.get("data").and_then(|d| d.get("tools")).and_then(|v| v.as_array()) {
-                                                            tools.extend(manifest.iter().cloned());
+                            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+                            let mut tools: Vec<Value> = Vec::new();
+                            loop {
+                                tokio::select! {
+                                    result = bus_rx_gather.recv() => {
+                                        if let Ok(msg) = result {
+                                            if let Ok(parsed) = serde_json::from_str::<Value>(&msg) {
+                                                if parsed.get("stream").and_then(|v| v.as_str()) == Some("tools_response") {
+                                                    if let Some(id) = parsed.get("data").and_then(|d| d.get("id")).and_then(|v| v.as_str()) {
+                                                        if id == call_id {
+                                                            if let Some(manifest) = parsed.get("data").and_then(|d| d.get("tools")).and_then(|v| v.as_array()) {
+                                                                tools.extend(manifest.iter().cloned());
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    tools
+                                    _ = tokio::time::sleep_until(deadline) => {
+                                        break;
+                                    }
                                 }
-                            ).await;
-                            let tools = gather_result.unwrap_or_default();
+                            }
                             tracing::info!(count = tools.len(), "tools discovery complete");
                             let _ = reply.send(ToolResult {
                                 output: serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()),
