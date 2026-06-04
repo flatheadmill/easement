@@ -69,28 +69,36 @@ impl Transcript {
                 }
             };
 
-            let uuid = data.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let parent = data.get("parentUuid").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let entrypoint = data.get("entrypoint").and_then(|v| v.as_str()).unwrap_or("");
+            let uuid = data
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let parent = data
+                .get("parentUuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let entrypoint = data
+                .get("entrypoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             if entrypoint == "cli" {
                 validating = false;
             }
 
             if validating {
-              if let Some(ref u) = uuid {
-                match (&parent, &prev_uuid) {
-                    (Some(p), Some(prev)) if p != prev => {
-                        panic!(
-                            "transcript file corrupt: entry {} parentUuid {} does not follow {}",
-                            u, p, prev
-                        );
+                if let Some(ref u) = uuid {
+                    match (&parent, &prev_uuid) {
+                        (Some(p), Some(prev)) if p != prev => {
+                            panic!(
+                                "transcript file corrupt: entry {} parentUuid {} does not follow {}",
+                                u, p, prev
+                            );
+                        }
+                        (Some(_), None) if self.entries.is_empty() => {}
+                        _ => {}
                     }
-                    (Some(_), None) if self.entries.is_empty() => {
-                    }
-                    _ => {}
                 }
-              }
             }
 
             self.index_entry(&data);
@@ -114,7 +122,11 @@ impl Transcript {
     /// Reconcile the CLI's transcript against ours after a round. The CLI
     /// may have pruned entries from the tail (cleanup transforms). We accept
     /// the pruning, back up what was cut, and append the genuinely new entries.
-    pub fn reconcile_cli_file(&mut self, cli_path: &Path, backup_dir: &Path) -> Vec<NormalizedEntry> {
+    pub fn reconcile_cli_file(
+        &mut self,
+        cli_path: &Path,
+        backup_dir: &Path,
+    ) -> Vec<NormalizedEntry> {
         let content = match fs::read_to_string(cli_path) {
             Ok(c) => c,
             Err(e) => {
@@ -133,7 +145,9 @@ impl Transcript {
         let mut new_entries: Vec<serde_json::Value> = Vec::new();
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let data: serde_json::Value = match serde_json::from_str(line) {
                 Ok(d) => d,
                 Err(_) => continue,
@@ -177,7 +191,8 @@ impl Transcript {
             );
 
             // Truncate our in-memory state back to the rewind point.
-            let cut_entries: Vec<serde_json::Value> = self.entries.drain(rewind_pos + 1..).collect();
+            let cut_entries: Vec<serde_json::Value> =
+                self.entries.drain(rewind_pos + 1..).collect();
             for entry in &cut_entries {
                 if let Some(u) = entry.get("uuid").and_then(|v| v.as_str()) {
                     self.uuid_index.remove(u);
@@ -219,8 +234,14 @@ impl Transcript {
     /// Strict entry handler for live operation. Any chain break is fatal.
     #[allow(dead_code)]
     pub fn handle_entry(&mut self, data: serde_json::Value) -> Vec<NormalizedEntry> {
-        let entry_uuid = data.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let entry_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let entry_uuid = data
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let entry_type = data
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
 
         match &entry_uuid {
             Some(uuid) if self.uuid_index.contains_key(uuid) => {
@@ -286,9 +307,10 @@ impl Transcript {
     }
 
     fn chain_head(&self) -> Option<&str> {
-        self.entries.iter().rev().find_map(|e| {
-            e.get("uuid").and_then(|v| v.as_str())
-        })
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|e| e.get("uuid").and_then(|v| v.as_str()))
     }
 
     fn index_entry(&mut self, data: &serde_json::Value) {

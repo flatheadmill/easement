@@ -3,9 +3,8 @@
 // NormalizedEntry.
 
 use crate::parser::{
-    AssistantContentBlock, AssistantEntry, Entry, TextBlock, ThinkingBlock,
-    ToolResultBlock, ToolResultContent, ToolUseBlock, UserContent,
-    UserContentBlock, UserEntry,
+    AssistantContentBlock, AssistantEntry, Entry, TextBlock, ThinkingBlock, ToolResultBlock,
+    ToolResultContent, ToolUseBlock, UserContent, UserContentBlock, UserEntry,
 };
 use crate::protocol::{ContentBlock, NormalizedEntry};
 
@@ -30,21 +29,19 @@ fn normalize_user(entry: UserEntry, seq: u64) -> Option<NormalizedEntry> {
             for block in content_blocks {
                 match block {
                     UserContentBlock::ToolResult(ToolResultBlock {
-                        content,
-                        is_error,
-                        ..
+                        content, is_error, ..
                     }) => {
                         let text = match content {
                             Some(ToolResultContent::Text(s)) => s,
-                            Some(ToolResultContent::Blocks(blocks)) => {
-                                blocks
-                                    .iter()
-                                    .filter_map(|b| {
-                                        b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            }
+                            Some(ToolResultContent::Blocks(blocks)) => blocks
+                                .iter()
+                                .filter_map(|b| {
+                                    b.get("text")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
                             None => String::new(),
                         };
                         blocks.push(ContentBlock::ToolResult {

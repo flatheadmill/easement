@@ -25,8 +25,12 @@ pub struct NormalizedEntry {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ContentBlock {
-    Thinking { text: String },
-    Text { text: String },
+    Thinking {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
     ToolUse {
         name: String,
         input_summary: String,

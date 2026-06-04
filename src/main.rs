@@ -30,19 +30,16 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-use crate::protocol::{
-    InboundEnvelope, LifecycleEvent,
-    NormalizedEntry,
-};
+use crate::protocol::{InboundEnvelope, LifecycleEvent, NormalizedEntry};
 use crate::transcript::Transcript;
 
 // -- Exchange log --
@@ -147,8 +144,8 @@ fn init_tracing() -> WorkerGuard {
 
     let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("easement=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("easement=debug"));
 
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
@@ -193,8 +190,13 @@ fn format_user_message(content: &str) -> String {
 
 enum ClaudeEvent {
     Delta(Value),
-    Replay { message: String },
-    Result { usage: Option<Value>, is_interrupted: bool },
+    Replay {
+        message: String,
+    },
+    Result {
+        usage: Option<Value>,
+        is_interrupted: bool,
+    },
     SessionId(String),
     Eof,
 }
@@ -239,10 +241,7 @@ fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
         project
             .as_object_mut()
             .ok_or("project entry not an object")?
-            .insert(
-                "hasTrustDialogAccepted".to_string(),
-                Value::Bool(true),
-            );
+            .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
 
         let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
         std::fs::write(config_path, &content).map_err(|e| e.to_string())?;
@@ -250,10 +249,7 @@ fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                config_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600));
         }
 
         tracing::info!(directory, "trust injected");
@@ -367,8 +363,7 @@ fn emplace_transcript(path: &Path, entries: &[Value]) -> Result<(), String> {
             content.push('\n');
         }
     }
-    std::fs::write(path, &content)
-        .map_err(|e| format!("cannot write emplaced transcript: {}", e))
+    std::fs::write(path, &content).map_err(|e| format!("cannot write emplaced transcript: {}", e))
 }
 
 fn extract_session_uuid(entries: &[Value]) -> Option<String> {
@@ -429,9 +424,7 @@ impl ServerState {
 
     fn resolve_timestamp(slug: &str, intent: &str) -> Option<String> {
         let home = env::var("HOME").unwrap_or_default();
-        let dir = Path::new(&home)
-            .join(".local/state/easement")
-            .join(slug);
+        let dir = Path::new(&home).join(".local/state/easement").join(slug);
         let ts_pattern = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.jsonl$").ok()?;
         let mut timestamps: Vec<String> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -463,7 +456,11 @@ impl ServerState {
         }
     }
 
-    fn find_or_create_coordinator(&mut self, slug: &str, timestamp: &str) -> mpsc::UnboundedSender<CoordMessage> {
+    fn find_or_create_coordinator(
+        &mut self,
+        slug: &str,
+        timestamp: &str,
+    ) -> mpsc::UnboundedSender<CoordMessage> {
         let key = (slug.to_string(), timestamp.to_string());
         let bus = self.bus_tx.clone();
         let wmgr = self.wicket_mgr_tx.clone();
@@ -487,7 +484,8 @@ struct CoordinatorHandle {
 
 // -- Messages to coordinator --
 
-#[allow(dead_code)]enum CoordMessage {
+#[allow(dead_code)]
+enum CoordMessage {
     ClientConnected {
         id: u64,
         protocol: String,
@@ -526,7 +524,8 @@ struct ToolResult {
 
 // -- Service request/response (retained for Shotgun) --
 
-#[allow(dead_code)]struct ServiceResponse {
+#[allow(dead_code)]
+struct ServiceResponse {
     content_type: String,
     body: Vec<u8>,
 }
@@ -562,7 +561,13 @@ struct PendingSpawn {
 
 // -- Broadcast helpers --
 
-fn bus_publish(bus_tx: &broadcast::Sender<String>, stream: &str, slug: &str, timestamp: &str, data: Value) {
+fn bus_publish(
+    bus_tx: &broadcast::Sender<String>,
+    stream: &str,
+    slug: &str,
+    timestamp: &str,
+    data: Value,
+) {
     let msg = json!({
         "stream": stream,
         "slug": slug,
@@ -574,7 +579,14 @@ fn bus_publish(bus_tx: &broadcast::Sender<String>, stream: &str, slug: &str, tim
     }
 }
 
-fn bus_publish_replay(bus_tx: &broadcast::Sender<String>, stream: &str, slug: &str, timestamp: &str, replay_id: &str, data: Value) {
+fn bus_publish_replay(
+    bus_tx: &broadcast::Sender<String>,
+    stream: &str,
+    slug: &str,
+    timestamp: &str,
+    replay_id: &str,
+    data: Value,
+) {
     let msg = json!({
         "stream": stream,
         "slug": slug,
@@ -586,7 +598,6 @@ fn bus_publish_replay(bus_tx: &broadcast::Sender<String>, stream: &str, slug: &s
         let _ = bus_tx.send(json);
     }
 }
-
 
 const STEER_SENTINEL: &str = "\n\x07---\n";
 
@@ -698,18 +709,23 @@ async fn spawn_claude_print(
     let mut cmd = Command::new("claude");
     cmd.env("MCP_TOOL_TIMEOUT", "2147483647");
     cmd.arg("--print")
-        .arg("--input-format").arg("stream-json")
-        .arg("--output-format").arg("stream-json")
+        .arg("--input-format")
+        .arg("stream-json")
+        .arg("--output-format")
+        .arg("stream-json")
         .arg("--include-partial-messages")
         .arg("--replay-user-messages")
         .arg("--verbose")
-        .arg("--model").arg("claude-opus-4-6[1m]")
-        .arg("--thinking-display").arg("summarized")
-        .arg("--max-thinking-tokens").arg("31999")
-        .arg("--add-dir").arg(format!("{}/code", home));
+        .arg("--model")
+        .arg("claude-opus-4-6[1m]")
+        .arg("--thinking-display")
+        .arg("summarized")
+        .arg("--max-thinking-tokens")
+        .arg("31999")
+        .arg("--add-dir")
+        .arg(format!("{}/code", home));
 
-    let mcp_config_path = std::env::temp_dir()
-        .join(format!("easement-mcp-{}.json", slug));
+    let mcp_config_path = std::env::temp_dir().join(format!("easement-mcp-{}.json", slug));
     let mcp_config = json!({
         "mcpServers": {
             "o": {
@@ -733,7 +749,9 @@ async fn spawn_claude_print(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("cannot spawn claude: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot spawn claude: {}", e))?;
 
     let mut child_stdin = child.stdin.take().expect("stdin was piped");
     let child_stdout = child.stdout.take().expect("stdout was piped");
@@ -760,7 +778,9 @@ async fn spawn_claude_print(
 
     // Send kickoff message.
     let kickoff = format_user_message(message);
-    child_stdin.write_all(kickoff.as_bytes()).await
+    child_stdin
+        .write_all(kickoff.as_bytes())
+        .await
         .map_err(|_| "failed to send kickoff message".to_string())?;
     let _ = child_stdin.flush().await;
 
@@ -807,8 +827,13 @@ async fn spawn_claude_print(
                         }
                     } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                         match &event {
-                            StdoutEvent::User { is_replay: true, message, .. } => {
-                                let text = message.get("content")
+                            StdoutEvent::User {
+                                is_replay: true,
+                                message,
+                                ..
+                            } => {
+                                let text = message
+                                    .get("content")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
@@ -816,8 +841,14 @@ async fn spawn_claude_print(
                             }
                             StdoutEvent::Result { subtype, .. } => {
                                 let usage = data.get("usage").cloned();
-                                let is_interrupted = subtype.as_deref() == Some("error_during_execution");
-                                let _ = event_tx.send(ClaudeEvent::Result { usage, is_interrupted }).await;
+                                let is_interrupted =
+                                    subtype.as_deref() == Some("error_during_execution");
+                                let _ = event_tx
+                                    .send(ClaudeEvent::Result {
+                                        usage,
+                                        is_interrupted,
+                                    })
+                                    .await;
                             }
                             _ => {}
                         }
@@ -870,7 +901,11 @@ fn spawn_wicket(host: &str, slug: &str) -> Result<tokio::process::Child, String>
         if !is_orb {
             c.arg("-R").arg(format!("{}:localhost:{}", port, port));
         }
-        c.arg(host).arg("wicket").arg(&wicket_url).arg(slug).arg(host);
+        c.arg(host)
+            .arg("wicket")
+            .arg(&wicket_url)
+            .arg(slug)
+            .arg(host);
         c
     };
 
@@ -878,7 +913,8 @@ fn spawn_wicket(host: &str, slug: &str) -> Result<tokio::process::Child, String>
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    cmd.spawn().map_err(|e| format!("failed to spawn wicket on {}: {}", host, e))
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn wicket on {}: {}", host, e))
 }
 
 async fn run_wicket_manager(mut rx: mpsc::UnboundedReceiver<WicketManagerMsg>) {
@@ -963,7 +999,14 @@ async fn run_wicket_manager(mut rx: mpsc::UnboundedReceiver<WicketManagerMsg>) {
 
 // -- Coordinator (per window: slug + timestamp) --
 
-async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::UnboundedSender<CoordMessage>, mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>, bus_tx: broadcast::Sender<String>, wicket_mgr_tx: mpsc::UnboundedSender<WicketManagerMsg>) {
+async fn run_coordinator(
+    slug: String,
+    timestamp: String,
+    coord_tx: mpsc::UnboundedSender<CoordMessage>,
+    mut coord_rx: mpsc::UnboundedReceiver<CoordMessage>,
+    bus_tx: broadcast::Sender<String>,
+    wicket_mgr_tx: mpsc::UnboundedSender<WicketManagerMsg>,
+) {
     let exchange = ExchangeLog::new(&slug);
 
     let mut transcript = Transcript::new(&slug, Some(&timestamp));
@@ -1784,10 +1827,7 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
 
 // -- WebSocket handler --
 
-async fn handle_websocket(
-    ws: hyper_tungstenite::HyperWebsocket,
-    server: Arc<RwLock<ServerState>>,
-) {
+async fn handle_websocket(ws: hyper_tungstenite::HyperWebsocket, server: Arc<RwLock<ServerState>>) {
     let ws_stream = match ws.await {
         Ok(s) => s,
         Err(e) => {
@@ -1846,9 +1886,20 @@ async fn handle_websocket(
                     // History request: resolve timestamp, create coordinator, associate.
                     if stream_name == "history_request" {
                         let req_data = data.get("data").cloned().unwrap_or_default();
-                        let req_slug = req_data.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let intent = req_data.get("intent").and_then(|v| v.as_str()).unwrap_or("latest");
-                        let replay_id = req_data.get("replay_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let req_slug = req_data
+                            .get("slug")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let intent = req_data
+                            .get("intent")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("latest");
+                        let replay_id = req_data
+                            .get("replay_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
 
                         if req_slug.is_empty() {
                             continue;
@@ -1898,16 +1949,29 @@ async fn handle_websocket(
                         continue;
                     }
 
-                    if stream_name == "response" || stream_name == "tool_result" || stream_name == "shell_result" || stream_name == "background_done" || stream_name == "background_output" {
-                        let resp_slug = data.get("slug")
-                            .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let resp_ts = data.get("timestamp")
-                            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if stream_name == "response"
+                        || stream_name == "tool_result"
+                        || stream_name == "shell_result"
+                        || stream_name == "background_done"
+                        || stream_name == "background_output"
+                    {
+                        let resp_slug = data
+                            .get("slug")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let resp_ts = data
+                            .get("timestamp")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
 
                         if !resp_slug.is_empty() && !resp_ts.is_empty() {
                             let tx = {
                                 let state = server.read().await;
-                                state.coordinators.get(&(resp_slug.clone(), resp_ts.clone()))
+                                state
+                                    .coordinators
+                                    .get(&(resp_slug.clone(), resp_ts.clone()))
                                     .map(|h| h.tx.clone())
                             };
                             if let Some(tx) = tx {
@@ -1937,8 +2001,15 @@ async fn handle_websocket(
                     if connect_slug.is_empty() {
                         continue;
                     }
-                    let protocol = data.get("protocol").and_then(|v| v.as_str()).unwrap_or("easement").to_string();
-                    let host = data.get("host").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let protocol = data
+                        .get("protocol")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("easement")
+                        .to_string();
+                    let host = data
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
                     if protocol == "wicket" {
                         tracing::info!(client_id, slug = %connect_slug, host = ?host, "wicket associating");
@@ -1988,7 +2059,9 @@ async fn handle_websocket(
     }
     if wicket_host.is_some() {
         let state = server.read().await;
-        let _ = state.wicket_mgr_tx.send(WicketManagerMsg::Disconnected { client_id });
+        let _ = state
+            .wicket_mgr_tx
+            .send(WicketManagerMsg::Disconnected { client_id });
     }
     write_task.abort();
     tracing::info!(client_id, slug = ?slug, "websocket disconnected");
@@ -2101,14 +2174,19 @@ async fn handle_mcp(
             let coord_tx = {
                 let state = server.read().await;
                 let ts = timestamp.as_deref().unwrap_or("");
-                state.coordinators.get(&(slug.to_string(), ts.to_string())).map(|h| h.tx.clone())
+                state
+                    .coordinators
+                    .get(&(slug.to_string(), ts.to_string()))
+                    .map(|h| h.tx.clone())
             };
 
             let coord_tx = match coord_tx {
                 Some(tx) => tx,
                 None => {
                     return make_json_response(jsonrpc_error(
-                        id, -32000, "no active session for this slug".to_string(),
+                        id,
+                        -32000,
+                        "no active session for this slug".to_string(),
                     ));
                 }
             };
@@ -2116,7 +2194,9 @@ async fn handle_mcp(
             tracing::info!(tool_name = %params.name, arguments = %params.arguments, "MCP tools/call received");
 
             if params.name == "approve" {
-                let updated_input = params.arguments.get("input")
+                let updated_input = params
+                    .arguments
+                    .get("input")
                     .cloned()
                     .unwrap_or(params.arguments.clone());
                 let text = json!({
@@ -2151,13 +2231,25 @@ async fn handle_mcp(
             }
 
             // mcp__o__call — generic dispatch
-            let who = params.arguments.get("who").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let f = params.arguments.get("f").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let who = params
+                .arguments
+                .get("who")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let f = params
+                .arguments
+                .get("f")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let args = params.arguments.get("args").cloned().unwrap_or(json!({}));
 
             if who.is_empty() || f.is_empty() {
                 return make_json_response(jsonrpc_error(
-                    id, -32602, "call requires who and f".to_string(),
+                    id,
+                    -32602,
+                    "call requires who and f".to_string(),
                 ));
             }
 
@@ -2207,13 +2299,12 @@ async fn handle_mcp(
 
 // -- Capture HTTP handler --
 
-async fn handle_capture(
-    slug: &str,
-    server: Arc<RwLock<ServerState>>,
-) -> Response<Full<Bytes>> {
+async fn handle_capture(slug: &str, server: Arc<RwLock<ServerState>>) -> Response<Full<Bytes>> {
     let coord_tx = {
         let state = server.read().await;
-        state.coordinators.iter()
+        state
+            .coordinators
+            .iter()
             .find(|((s, _), _)| s == slug)
             .map(|(_, h)| h.tx.clone())
     };
@@ -2277,7 +2368,9 @@ async fn handle_request(
         if parts.is_empty() || parts[0].is_empty() {
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("missing slug in /mcp/<slug>/<timestamp>")))
+                .body(Full::new(Bytes::from(
+                    "missing slug in /mcp/<slug>/<timestamp>",
+                )))
                 .unwrap())
         } else {
             let slug = parts[0].to_string();
@@ -2297,11 +2390,14 @@ async fn handle_request(
                 .unwrap())
         } else {
             let slug = slug.to_string();
-            let body = req.collect().await
+            let body = req
+                .collect()
+                .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
             let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
-            let message = payload.get("message")
+            let message = payload
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -2353,11 +2449,14 @@ async fn handle_request(
                 (raw_slug.to_string(), false)
             };
 
-            let body = req.collect().await
+            let body = req
+                .collect()
+                .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
             let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
-            let message = payload.get("message")
+            let message = payload
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -2375,7 +2474,8 @@ async fn handle_request(
                 state.find_or_create_coordinator(&slug, &ts)
             };
 
-            let notification = payload.get("notification")
+            let notification = payload
+                .get("notification")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
@@ -2388,25 +2488,19 @@ async fn handle_request(
             });
 
             match tokio::time::timeout(std::time::Duration::from_secs(300), reply_rx).await {
-                Ok(Ok(response_text)) => {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "text/plain; charset=utf-8")
-                        .body(Full::new(Bytes::from(response_text)))
-                        .unwrap())
-                }
-                Ok(Err(_)) => {
-                    Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("coordinator dropped reply")))
-                        .unwrap())
-                }
-                Err(_) => {
-                    Ok(Response::builder()
-                        .status(StatusCode::GATEWAY_TIMEOUT)
-                        .body(Full::new(Bytes::from("response timeout")))
-                        .unwrap())
-                }
+                Ok(Ok(response_text)) => Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .body(Full::new(Bytes::from(response_text)))
+                    .unwrap()),
+                Ok(Err(_)) => Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from("coordinator dropped reply")))
+                    .unwrap()),
+                Err(_) => Ok(Response::builder()
+                    .status(StatusCode::GATEWAY_TIMEOUT)
+                    .body(Full::new(Bytes::from("response timeout")))
+                    .unwrap()),
             }
         }
     } else if let Some(slug) = path.strip_prefix("/session/") {
@@ -2432,19 +2526,17 @@ async fn handle_request(
             let _ = coord_tx.send(CoordMessage::NewSession { reply: reply_tx });
 
             match reply_rx.await {
-                Ok(timestamp) => {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(json!({"timestamp": timestamp}).to_string())))
-                        .unwrap())
-                }
-                Err(_) => {
-                    Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("failed")))
-                        .unwrap())
-                }
+                Ok(timestamp) => Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(
+                        json!({"timestamp": timestamp}).to_string(),
+                    )))
+                    .unwrap()),
+                Err(_) => Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from("failed")))
+                    .unwrap()),
             }
         }
     } else if path == "/health" {
