@@ -1,13 +1,11 @@
-// Transcript authority. Easement owns the canonical transcript as a Vec
-// in memory with a UUID index. Persistence is append-only to a JSONL file.
+// Transcript authority. Easement owns the canonical transcript as a Vec in memory with a UUID
+// index. Persistence is append-only to a JSONL file.
 //
-// On load, the chain is validated. If our own file has a broken chain,
-// that is a fatal error.
+// On load, the chain is validated. If our own file has a broken chain, that is a fatal error.
 //
-// After each round, the CLI's transcript file is reconciled against ours.
-// The CLI gets one chance to prune — its cleanup transforms may shorten
-// the chain. We accept the pruning, log the cut, and continue from the
-// CLI's chain point. After reconciliation, any chain break is fatal.
+// After each round, the CLI's transcript file is reconciled against ours. The CLI gets one chance
+// to prune — its cleanup transforms may shorten the chain. We accept the pruning, log the cut, and
+// continue from the CLI's chain point. After reconciliation, any chain break is fatal.
 
 use std::collections::HashMap;
 use std::fs;
@@ -219,6 +217,7 @@ impl Transcript {
     }
 
     /// Strict entry handler for live operation. Any chain break is fatal.
+    #[allow(dead_code)]
     pub fn handle_entry(&mut self, data: serde_json::Value) -> Vec<NormalizedEntry> {
         let entry_uuid = data.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
         let entry_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -359,97 +358,5 @@ impl Transcript {
                 tracing::warn!(error = %e, "cannot create temp file for transcript rewrite");
             }
         }
-    }
-}
-
-// -- Session tracking --
-
-pub struct Sessions {
-    local: Option<String>,
-    remote: Option<String>,
-    slug: String,
-    state_dir: PathBuf,
-}
-
-impl Sessions {
-    pub fn new(slug: &str) -> Self {
-        let home = std::env::var("HOME").expect("HOME not set");
-        let state_dir = std::path::Path::new(&home)
-            .join(".local")
-            .join("state")
-            .join("easement");
-
-        let local = Self::read_latest(&state_dir, slug);
-
-        Self {
-            local,
-            remote: None,
-            slug: slug.to_string(),
-            state_dir,
-        }
-    }
-
-    pub fn local(&self) -> Option<&str> {
-        self.local.as_deref()
-    }
-
-    pub fn remote(&self) -> Option<&str> {
-        self.remote.as_deref()
-    }
-
-    pub fn set_local(&mut self, id: String) {
-        self.record(&id);
-        self.local = Some(id);
-    }
-
-    pub fn clear_local(&mut self) {
-        tracing::info!("clearing stale local session id");
-        self.local = None;
-    }
-
-    pub fn set_remote(&mut self, id: String) {
-        self.remote = Some(id);
-    }
-
-    fn record(&self, session_id: &str) {
-        let path = self.state_dir.join(&self.slug).join("sessions.jsonl");
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        let entry = serde_json::json!({
-            "session_id": session_id,
-            "timestamp": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
-
-        let mut line = serde_json::to_string(&entry).unwrap();
-        line.push('\n');
-
-        match fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                let _ = file.write_all(line.as_bytes());
-            }
-            Err(e) => {
-                tracing::warn!("session record error: {}", e);
-            }
-        }
-    }
-
-    fn read_latest(state_dir: &std::path::Path, slug: &str) -> Option<String> {
-        let path = state_dir.join(slug).join("sessions.jsonl");
-        let content = fs::read_to_string(&path).ok()?;
-        let last_line = content.lines().rev().find(|l| !l.trim().is_empty())?;
-        let entry: serde_json::Value = serde_json::from_str(last_line).ok()?;
-        entry
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
     }
 }

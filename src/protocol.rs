@@ -1,7 +1,6 @@
-// Wire types for the client protocol. These are what Wicket sends to Puzzle
-// and Shotgun. The format is richer than what the renderer needs today —
-// clients ignore what they don't use, and the protocol doesn't change when
-// they start needing it.
+// Wire types for the client protocol. These are what Wicket sends to Puzzle and Shotgun. The
+// format is richer than what the renderer needs today — clients ignore what they don't use, and
+// the protocol doesn't change when they start needing it.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,23 +53,4 @@ pub enum LifecycleEvent {
 pub struct InboundEnvelope {
     pub stream: String,
     pub data: Value,
-}
-
-
-#[derive(Debug, Deserialize)]
-pub struct ClaudeMessage {
-    pub message: String,
-    #[serde(default)]
-    pub remote: Option<String>,
-    #[serde(default)]
-    pub yolo: bool,
-    #[serde(default)]
-    pub turn_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ApprovalDecision {
-    pub behavior: String,
-    #[serde(default)]
-    pub message: Option<String>,
 }

@@ -1,6 +1,6 @@
-// Normalization layer. Sits between parser.rs (raw JSONL schema) and
-// protocol.rs (wire types). Filters to the main conversation chain,
-// drops sidechains and noise entry types, converts to NormalizedEntry.
+// Normalization layer. Sits between parser.rs (raw JSONL schema) and protocol.rs (wire types).
+// Filters to the main conversation chain, drops sidechains and noise entry types, converts to
+// NormalizedEntry.
 
 use crate::parser::{
     AssistantContentBlock, AssistantEntry, Entry, TextBlock, ThinkingBlock,
@@ -9,10 +9,9 @@ use crate::parser::{
 };
 use crate::protocol::{ContentBlock, NormalizedEntry};
 
-/// Filter and convert a raw parsed Entry into a NormalizedEntry for the
-/// client. Returns None for entries that should be skipped (progress,
-/// system, sidechains, empty content). The seq number is assigned by the
-/// caller (transcript layer) — this function just does the conversion.
+/// Filter and convert a raw parsed Entry into a NormalizedEntry for the client. Returns None for
+/// entries that should be skipped (progress, system, sidechains, empty content). The seq number is
+/// assigned by the caller (transcript layer) — this function just does the conversion.
 pub fn try_normalize(entry: Entry, seq: u64) -> Option<NormalizedEntry> {
     match entry {
         Entry::User(user) if !user.is_sidechain => normalize_user(user, seq),

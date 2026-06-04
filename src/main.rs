@@ -122,18 +122,6 @@ enum StdoutEvent {
     Unknown,
 }
 
-// -- Output envelope --
-
-#[derive(Debug, Serialize)]
-struct OutEnvelope<'a> {
-    stream: &'a str,
-    data: Value,
-}
-
-fn envelope_json(stream: &str, data: Value) -> Option<String> {
-    serde_json::to_string(&OutEnvelope { stream, data }).ok()
-}
-
 // -- Logging --
 
 fn init_tracing() -> WorkerGuard {
@@ -499,7 +487,7 @@ struct CoordinatorHandle {
 
 // -- Messages to coordinator --
 
-enum CoordMessage {
+#[allow(dead_code)]enum CoordMessage {
     ClientConnected {
         id: u64,
         protocol: String,
@@ -520,10 +508,6 @@ enum CoordMessage {
         args: Value,
         reply: oneshot::Sender<ToolResult>,
     },
-    SetHost {
-        hostname: String,
-        reply: oneshot::Sender<String>,
-    },
     Message {
         message: String,
         full: bool,
@@ -542,7 +526,7 @@ struct ToolResult {
 
 // -- Service request/response (retained for Shotgun) --
 
-struct ServiceResponse {
+#[allow(dead_code)]struct ServiceResponse {
     content_type: String,
     body: Vec<u8>,
 }
@@ -603,13 +587,6 @@ fn bus_publish_replay(bus_tx: &broadcast::Sender<String>, stream: &str, slug: &s
     }
 }
 
-fn send_to(clients: &Clients, client_id: u64, stream: &str, data: Value) {
-    if let Some(json) = envelope_json(stream, data) {
-        if let Some(tx) = clients.get(&client_id) {
-            let _ = tx.send(json);
-        }
-    }
-}
 
 const STEER_SENTINEL: &str = "\n\x07---\n";
 
@@ -1022,7 +999,7 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
         tokio::select! {
             Some(msg) = coord_rx.recv() => {
                 match msg {
-                    CoordMessage::ClientConnected { id, protocol, timestamp: _connect_ts, host, tx } => {
+                    CoordMessage::ClientConnected { id, protocol, timestamp: _connect_ts, host: _, tx } => {
                         if protocol == "wicket" {
                             clients.insert(id, tx);
                             tracing::info!(client_id = id, "wicket connected");
@@ -1154,10 +1131,6 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                 "tool": tool,
                             }));
                         }
-                    }
-                    CoordMessage::SetHost { hostname, reply } => {
-                        tracing::info!(to = %hostname, "host switch (no-op, host is in args)");
-                        let _ = reply.send(hostname);
                     }
                     CoordMessage::Message { message, full, notification, reply } => {
                         let message = if notification {
@@ -1351,7 +1324,6 @@ async fn run_coordinator(slug: String, timestamp: String, coord_tx: mpsc::Unboun
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
                                         let output = if content_type == "image/jpeg" || content_type == "image/png" {
-                                            use base64::Engine;
                                             let content = json!([
                                                 { "type": "text", "text": format!("screenshot ({})", content_type) },
                                                 { "type": "image", "data": body_b64, "mimeType": content_type }

@@ -1,8 +1,7 @@
-// Claude Code JSONL transcript format. Moved from Puzzle — Wicket now owns
-// parsing. The types model the full schema faithfully so deserialization
-// succeeds for all entry types, even those we filter out. The serde strategy:
-// #[serde(tag = "type")] for the top-level enum, #[serde(untagged)] for
-// UserContent (bare string or array), #[serde(other)] as catch-all.
+// Claude Code JSONL transcript format. Moved from Puzzle — Wicket now owns parsing. The types
+// model the full schema faithfully so deserialization succeeds for all entry types, even those we
+// filter out. The serde strategy: #[serde(tag = "type")] for the top-level enum,
+// #[serde(untagged)] for UserContent (bare string or array), #[serde(other)] as catch-all.
 
 use serde::Deserialize;
 use serde_json::Value;
