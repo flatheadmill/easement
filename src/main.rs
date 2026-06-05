@@ -187,16 +187,8 @@ fn format_user_message(content: &str) -> String {
 
 // -- ClaudePrint: events from the stdout reader task --
 
-enum ClaudeEvent {
-    Delta(Value),
-    Replay {
-        message: String,
-    },
-    Result {
-        usage: Option<Value>,
-        is_interrupted: bool,
-    },
-    SessionId(String),
+enum StdoutLine {
+    Json(Value),
     Eof,
 }
 
@@ -320,7 +312,7 @@ fn extract_session_uuid(entries: &[Value]) -> Option<String> {
 struct ClaudePrint {
     child: tokio::process::Child,
     stdin: Option<tokio::process::ChildStdin>,
-    event_rx: mpsc::Receiver<ClaudeEvent>,
+    stdout_rx: mpsc::Receiver<ClaudeEvent>,
     session_id: Option<String>,
     drain_sent: u64,
     drain_replayed: u64,
@@ -604,12 +596,16 @@ fn make_json_response(resp: JsonRpcResponse) -> Response<Full<Bytes>> {
 async fn spawn_claude_print(
     slug: &str,
     message: &str,
-    transcript_entries: &[Value],
-    session_uuid: Option<&str>,
     timestamp: &str,
     _cancel: tokio_util::sync::CancellationToken,
 ) -> Result<ClaudePrint, String> {
     let home = env::var("HOME").unwrap_or_default();
+
+    // Load the transcript and extract the session UUID for emplacement.
+    let mut transcript = Transcript::new(slug, Some(timestamp));
+    let _entries = transcript.load_history();
+    let transcript_entries = transcript.entries();
+    let session_uuid = extract_session_uuid(transcript_entries);
 
     // claudep organizes transcripts by working directory. The pane directory is the cwd for the
     // round and determines the project slug in ~/.claude/projects/.
@@ -693,7 +689,7 @@ async fn spawn_claude_print(
 
     let round_log = Arc::new(RoundLog::begin(slug));
 
-    let resume_arg: Option<String> = if let Some(uuid) = session_uuid {
+    let resume_arg: Option<String> = if let Some(ref uuid) = session_uuid {
         assert!(
             !transcript_entries.is_empty(),
             "session uuid {} with no transcript entries",
@@ -703,7 +699,7 @@ async fn spawn_claude_print(
         let cli_path = cli_transcript_path(slug, uuid);
         emplace_transcript(&cli_path, transcript_entries)?;
         tracing::info!(uuid = %uuid, path = %cli_path.display(), entries = transcript_entries.len(), "emplaced transcript");
-        Some(uuid.to_string())
+        Some(uuid.clone())
     } else {
         None
     };
@@ -798,20 +794,21 @@ async fn spawn_claude_print(
         .map_err(|_| "failed to send kickoff message".to_string())?;
     let _ = child_stdin.flush().await;
 
-    // Stdout reader task.
-    let (event_tx, event_rx) = mpsc::channel::<ClaudeEvent>(256);
+    // Stdout reader task. Reads claudep stdout and pushes typed events onto
+    // Stdout reader. Parses JSON, sends the Value. Classification happens in
+    // the claudep loop where the logic lives.
+    let (stdout_tx, stdout_rx) = mpsc::channel::<StdoutLine>(256);
     let round_log_clone = round_log.clone();
 
     tokio::spawn(async move {
         let mut reader = BufReader::new(child_stdout);
         let mut line = String::new();
-        let mut session_id_sent = false;
 
         loop {
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => {
-                    let _ = event_tx.send(ClaudeEvent::Eof).await;
+                    let _ = stdout_tx.send(StdoutLine::Eof).await;
                     break;
                 }
                 Ok(_) => {
@@ -820,56 +817,18 @@ async fn spawn_claude_print(
                         continue;
                     }
                     round_log_clone.log_stdout(trimmed);
-
-                    let data: Value = match serde_json::from_str(trimmed) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-
-                    if !session_id_sent {
-                        if let Some(sid) = data.get("session_id").and_then(|v| v.as_str()) {
-                            let _ = event_tx.send(ClaudeEvent::SessionId(sid.to_string())).await;
-                            session_id_sent = true;
+                    match serde_json::from_str::<Value>(trimmed) {
+                        Ok(data) => {
+                            let _ = stdout_tx.send(StdoutLine::Json(data)).await;
                         }
-                    }
-
-                    let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                    if event_type == "stream_event" {
-                        if let Some(event) = data.get("event") {
-                            let _ = event_tx.send(ClaudeEvent::Delta(event.clone())).await;
-                        }
-                    } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
-                        match &event {
-                            StdoutEvent::User {
-                                is_replay: true,
-                                message,
-                                ..
-                            } => {
-                                let text = message
-                                    .get("content")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let _ = event_tx.send(ClaudeEvent::Replay { message: text }).await;
-                            }
-                            StdoutEvent::Result { subtype, .. } => {
-                                let usage = data.get("usage").cloned();
-                                let is_interrupted =
-                                    subtype.as_deref() == Some("error_during_execution");
-                                let _ = event_tx
-                                    .send(ClaudeEvent::Result {
-                                        usage,
-                                        is_interrupted,
-                                    })
-                                    .await;
-                            }
-                            _ => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "claudep stdout: invalid JSON");
                         }
                     }
                 }
-                Err(_) => {
-                    let _ = event_tx.send(ClaudeEvent::Eof).await;
+                Err(e) => {
+                    tracing::warn!(error = %e, "claudep stdout read error");
+                    let _ = stdout_tx.send(StdoutLine::Eof).await;
                     break;
                 }
             }
@@ -879,7 +838,7 @@ async fn spawn_claude_print(
     Ok(ClaudePrint {
         child,
         stdin: Some(child_stdin),
-        event_rx,
+        stdout_rx,
         session_id: None,
         drain_sent: 1,
         drain_replayed: 0,
@@ -1231,10 +1190,9 @@ async fn run_coordinator(
                                 }));
                                 if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundStarted) { bus_publish(&bus_tx, "lifecycle", &slug, &timestamp, __lc_data); }
 
-                                let entries = transcript.entries().to_vec();
-                                tracing::info!(turn_id = %turn_id, transcript_entries = entries.len(), "spawning ClaudePrint");
+                                tracing::info!(turn_id = %turn_id, "spawning ClaudePrint");
 
-                                match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref(), &timestamp, tokio_util::sync::CancellationToken::new()).await {
+                                match spawn_claude_print(&slug, &message, &timestamp, tokio_util::sync::CancellationToken::new()).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
@@ -1577,7 +1535,7 @@ async fn run_coordinator(
             // ClaudePrint stdout events.
             Some(event) = async {
                 match claude.as_mut() {
-                    Some(cp) => cp.event_rx.recv().await,
+                    Some(cp) => cp.stdout_rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
@@ -1598,16 +1556,13 @@ async fn run_coordinator(
                             }
                         }
                     }
-                    // The CLI echoes every user message we wrote to stdin as a
-                    // replay event. The first replay is the kickoff message
-                    // (the turn start). Replays after that are steers we
-                    // injected before tool calls. We count replays for the
-                    // drain gate and broadcast steer acks to clear the TUI
-                    // preview. A stronger assertion would count queued_command
-                    // attachment entries in the CLI's transcript file after the
-                    // round and panic if the count doesn't match drain_sent - 1.
-                    // See easement/observations/transcripts.md, concern on
-                    // attachment entries.
+                    // The CLI echoes every user message we wrote to stdin as a replay event. The
+                    // first replay is the kickoff message (the turn start). Replays after that are
+                    // steers we injected before tool calls. We count replays for the drain gate
+                    // and broadcast steer acks to clear the TUI preview. A stronger assertion
+                    // would count queued_command attachment entries in the CLI's transcript file
+                    // after the round and panic if the count doesn't match drain_sent - 1. See
+                    // easement/observations/transcripts.md, concern on attachment entries.
                     ClaudeEvent::Replay { message } => {
                         cp.drain_replayed += 1;
                         let is_steer_ack = cp.drain_replayed > 1;
@@ -1735,8 +1690,7 @@ async fn run_coordinator(
                                     "turn_id": turn_id,
                                 }));
                                 if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundStarted) { bus_publish(&bus_tx, "lifecycle", &slug, &timestamp, __lc_data); }
-                                let entries = transcript.entries().to_vec();
-                                match spawn_claude_print(&slug, &next_message, &entries, session_uuid.as_deref(), &timestamp, tokio_util::sync::CancellationToken::new()).await {
+                                match spawn_claude_print(&slug, &next_message, &timestamp, tokio_util::sync::CancellationToken::new()).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
