@@ -446,12 +446,6 @@ enum CoordMessage {
         args: Value,
         reply: oneshot::Sender<ToolResult>,
     },
-    Message {
-        message: String,
-        full: bool,
-        notification: bool,
-        reply: oneshot::Sender<String>,
-    },
     NewSession {
         reply: oneshot::Sender<String>,
     },
@@ -541,6 +535,15 @@ fn bus_publish_replay(
 
 const STEER_SENTINEL: &str = "\n\x07---\n";
 
+// Built-in CLI tools we replace with our own MCP tools. Claude never sees these.
+const DISALLOWED_TOOLS: &[&str] = &[
+    "Bash", "Write", "Edit", "Read", "Glob", "Grep", "Skill", "ToolSearch",
+    "NotebookEdit", "WebFetch", "WebSearch", "CronCreate", "CronDelete", "CronList",
+    "RemoteTrigger", "TaskOutput", "TaskStop", "EnterWorktree", "ExitWorktree",
+    "ExitPlanMode", "Monitor", "PushNotification", "AskUserQuestion",
+    "ScheduleWakeup", "ShareOnboardingGuide",
+];
+
 // -- MCP JSON-RPC types --
 
 #[derive(Debug, serde::Deserialize)]
@@ -604,20 +607,20 @@ async fn spawn_claude_print(
     transcript_entries: &[Value],
     session_uuid: Option<&str>,
     timestamp: &str,
+    _cancel: tokio_util::sync::CancellationToken,
 ) -> Result<ClaudePrint, String> {
     let home = env::var("HOME").unwrap_or_default();
 
-    // claudep organizes transcripts by working directory. The pane
-    // directory is the cwd for the round and determines the project
-    // slug in ~/.claude/projects/.
+    // claudep organizes transcripts by working directory. The pane directory is the cwd for the
+    // round and determines the project slug in ~/.claude/projects/.
     let pane_dir = PathBuf::from(&home).join("pane").join(slug);
     let _ = tokio::fs::create_dir_all(&pane_dir).await;
     if std::env::set_current_dir(&pane_dir).is_err() {
         return Err(format!("cannot cd to {}", pane_dir.display()));
     }
 
-    // Trust injection -- write hasTrustDialogAccepted into ~/.claude.json
-    // so claudep does not hang waiting for interactive approval.
+    // Trust injection -- write hasTrustDialogAccepted into ~/.claude.json so claudep does not hang
+    // waiting for interactive approval.
     let config_path = PathBuf::from(&home).join(".claude.json");
     let directory = pane_dir.to_str().unwrap_or("");
     {
@@ -690,32 +693,30 @@ async fn spawn_claude_print(
 
     let round_log = Arc::new(RoundLog::begin(slug));
 
-    let mut resume_arg: Option<String> = None;
-    if let Some(uuid) = session_uuid {
-        if !transcript_entries.is_empty() {
-            round_log.log_sent(transcript_entries);
-            let cli_path = cli_transcript_path(slug, uuid);
-            emplace_transcript(&cli_path, transcript_entries)?;
-            tracing::info!(uuid = %uuid, path = %cli_path.display(), entries = transcript_entries.len(), "emplaced transcript");
-        }
-        resume_arg = Some(uuid.to_string());
-    } else if !transcript_entries.is_empty() {
+    let resume_arg: Option<String> = if let Some(uuid) = session_uuid {
+        assert!(
+            !transcript_entries.is_empty(),
+            "session uuid {} with no transcript entries",
+            uuid
+        );
         round_log.log_sent(transcript_entries);
-        let tmp_path = std::env::temp_dir().join(format!("easement-{}.jsonl", slug));
-        let mut content = String::new();
-        for entry in transcript_entries {
-            if let Ok(line) = serde_json::to_string(entry) {
-                content.push_str(&line);
-                content.push('\n');
-            }
-        }
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| format!("cannot write transcript temp file: {}", e))?;
-        resume_arg = Some(tmp_path.to_string_lossy().to_string());
-    }
+        let cli_path = cli_transcript_path(slug, uuid);
+        emplace_transcript(&cli_path, transcript_entries)?;
+        tracing::info!(uuid = %uuid, path = %cli_path.display(), entries = transcript_entries.len(), "emplaced transcript");
+        Some(uuid.to_string())
+    } else {
+        None
+    };
 
     tracing::info!(resume_arg = ?resume_arg, "spawning claude");
 
+    // The mcp__o__approve tool auto-allows every permission request. We avoided
+    // --dangerously-skip-permissions because the name felt reckless, but the sandbox is the real
+    // permission system -- the seatbelt/bwrap policy restricts what commands can do, and the
+    // escalation path routes through the operator's approval viewport. The approve tool is just
+    // saying yes with extra steps. Switching to --dangerously-skip-permissions would remove the
+    // approve tool from the MCP surface entirely and simplify the tools/list. The sandbox still
+    // catches everything the approval shim pretends to gate.
     let mut cmd = Command::new("claude");
     cmd.env("MCP_TOOL_TIMEOUT", "2147483647");
     cmd.arg("--print")
@@ -733,8 +734,17 @@ async fn spawn_claude_print(
         .arg("--max-thinking-tokens")
         .arg("31999")
         .arg("--add-dir")
-        .arg(format!("{}/code", home));
+        .arg(format!("{}/code", home))
+        .arg("--permission-prompt-tool").arg("mcp__o__approve")
+        .arg("--disallowed-tools").arg(DISALLOWED_TOOLS.join(","));
 
+    if let Some(ref ra) = resume_arg {
+        cmd.arg("--resume").arg(ra);
+    }
+
+    // The MCP config could be shared across all claudep instances for a slug -- the URL contains
+    // the slug and timestamp but the timestamp could be resolved server-side. One file per slug
+    // instead of one per round.
     let mcp_config_path = std::env::temp_dir().join(format!("easement-mcp-{}.json", slug));
     let mcp_config = json!({
         "mcpServers": {
@@ -744,16 +754,10 @@ async fn spawn_claude_print(
             }
         }
     });
-    if let Err(e) = std::fs::write(&mcp_config_path, mcp_config.to_string()) {
+    if let Err(e) = tokio::fs::write(&mcp_config_path, mcp_config.to_string()).await {
         return Err(format!("cannot write mcp config: {}", e));
     }
-    cmd.arg("--permission-prompt-tool").arg("mcp__o__approve")
-        .arg("--mcp-config").arg(&mcp_config_path)
-        .arg("--disallowed-tools").arg("Bash,Write,Edit,Read,Glob,Grep,Skill,ToolSearch,NotebookEdit,WebFetch,WebSearch,CronCreate,CronDelete,CronList,RemoteTrigger,TaskOutput,TaskStop,EnterWorktree,ExitWorktree,ExitPlanMode,Monitor,PushNotification,AskUserQuestion,ScheduleWakeup,ShareOnboardingGuide");
-
-    if let Some(ref ra) = resume_arg {
-        cmd.arg("--resume").arg(ra);
-    }
+    cmd.arg("--mcp-config").arg(&mcp_config_path);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1036,8 +1040,6 @@ async fn run_coordinator(
     let mut pending_escalation: Option<(String, String, Value)> = None;
     let mut turn_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    let mut pending_message_reply: Option<oneshot::Sender<String>> = None;
-    let mut response_accumulator: String = String::new();
     let mut shell_host: String = "localhost".to_string();
     let mut pending_ensure: Option<oneshot::Receiver<Result<String, String>>> = None;
 
@@ -1185,39 +1187,6 @@ async fn run_coordinator(
                             }));
                         }
                     }
-                    CoordMessage::Message { message, full, notification, reply } => {
-                        let message = if notification {
-                            format!("\x07**notification**: {}", message)
-                        } else {
-                            message
-                        };
-                        tracing::info!(message = %message, full, notification, "synchronous message");
-                        if claude.is_some() {
-                            turn_queue.push_back(message);
-                        } else {
-                            let turn_id = uuid::Uuid::new_v4().to_string();
-                            bus_publish(&bus_tx, "turn", &slug, &timestamp, json!({
-                                "event": "started",
-                                "turn_id": turn_id,
-                            }));
-                            bus_publish(&bus_tx, "user_message", &slug, &timestamp, json!({
-                                "text": message,
-                            }));
-                            if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundStarted) { bus_publish(&bus_tx, "lifecycle", &slug, &timestamp, __lc_data); }
-                            let entries = transcript.entries().to_vec();
-                            match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref(), &timestamp).await {
-                                Ok(mut cp) => {
-                                    cp.turn_id = Some(turn_id);
-                                    claude = Some(cp);
-                                }
-                                Err(e) => {
-                                    let _ = reply.send(format!("error: {}", e));
-                                    continue;
-                                }
-                            }
-                        }
-                        pending_message_reply = Some(reply);
-                    }
                     CoordMessage::NewSession { reply } => {
                         let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
                         tracing::info!(timestamp = %ts, "new session requested");
@@ -1232,10 +1201,18 @@ async fn run_coordinator(
 
                         match envelope.stream.as_str() {
                             "turn" | "claude" => {
-                                let message = envelope.data.get("message")
+                                let notification = envelope.data.get("notification")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let raw_message = envelope.data.get("message")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                let message = if notification {
+                                    format!("\x07**notification**: {}", raw_message)
+                                } else {
+                                    raw_message
+                                };
 
                                 if claude.is_some() {
                                     tracing::info!(message = %message, "turn queued, ClaudePrint active");
@@ -1257,7 +1234,7 @@ async fn run_coordinator(
                                 let entries = transcript.entries().to_vec();
                                 tracing::info!(turn_id = %turn_id, transcript_entries = entries.len(), "spawning ClaudePrint");
 
-                                match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref(), &timestamp).await {
+                                match spawn_claude_print(&slug, &message, &entries, session_uuid.as_deref(), &timestamp, tokio_util::sync::CancellationToken::new()).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
@@ -1491,12 +1468,12 @@ async fn run_coordinator(
                                     "background task {} exited with code {}, output at {}",
                                     task_uuid, exit_code, output_path
                                 );
-                                let (reply_tx, _) = oneshot::channel();
-                                let _ = coord_tx.send(CoordMessage::Message {
-                                    message: notif_text,
-                                    full: false,
-                                    notification: true,
-                                    reply: reply_tx,
+                                let _ = coord_tx.send(CoordMessage::Envelope {
+                                    id: 0,
+                                    envelope: InboundEnvelope {
+                                        stream: "turn".to_string(),
+                                        data: json!({ "message": notif_text, "notification": true }),
+                                    },
                                 });
                             }
                             "approval" => {
@@ -1607,14 +1584,6 @@ async fn run_coordinator(
                 let cp = claude.as_mut().unwrap();
                 match event {
                     ClaudeEvent::Delta(ref delta) => {
-                        if pending_message_reply.is_some() {
-                            if let Some(text) = delta.get("delta")
-                                .and_then(|d| d.get("text"))
-                                .and_then(|v| v.as_str())
-                            {
-                                response_accumulator.push_str(text);
-                            }
-                        }
                         bus_publish(&bus_tx, "delta", &slug, &timestamp, delta.clone());
                     }
                     ClaudeEvent::SessionId(sid) => {
@@ -1756,10 +1725,6 @@ async fn run_coordinator(
 
                             claude = None;
                             steer_queue.clear();
-                            if let Some(reply) = pending_message_reply.take() {
-                                let _ = reply.send(std::mem::take(&mut response_accumulator));
-                            }
-                            response_accumulator.clear();
                             tracing::info!("round completed");
 
                             if let Some(next_message) = turn_queue.pop_front() {
@@ -1771,7 +1736,7 @@ async fn run_coordinator(
                                 }));
                                 if let Ok(__lc_data) = serde_json::to_value(&LifecycleEvent::RoundStarted) { bus_publish(&bus_tx, "lifecycle", &slug, &timestamp, __lc_data); }
                                 let entries = transcript.entries().to_vec();
-                                match spawn_claude_print(&slug, &next_message, &entries, session_uuid.as_deref(), &timestamp).await {
+                                match spawn_claude_print(&slug, &next_message, &entries, session_uuid.as_deref(), &timestamp, tokio_util::sync::CancellationToken::new()).await {
                                     Ok(mut cp) => {
                                         cp.turn_id = Some(turn_id);
                                         claude = Some(cp);
@@ -1823,11 +1788,6 @@ async fn run_coordinator(
                         claude = None;
                         steer_queue.clear();
                         turn_queue.clear();
-
-                        if let Some(reply) = pending_message_reply.take() {
-                            let _ = reply.send("error: claude exited unexpectedly".to_string());
-                        }
-                        response_accumulator.clear();
                     }
                 }
             }
