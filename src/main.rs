@@ -201,65 +201,6 @@ enum ClaudeEvent {
     Eof,
 }
 
-// -- ClaudePrint: trust injection --
-
-fn ensure_trust(config_path: &Path, directory: &str) -> Result<(), String> {
-    let lock_path = config_path.with_extension("json.lock");
-    if std::fs::create_dir(&lock_path).is_err() {
-        return Err("lock contention".to_string());
-    }
-
-    let result = (|| -> Result<(), String> {
-        let mut config: Value = match std::fs::read_to_string(config_path) {
-            Ok(content) => serde_json::from_str(&content).map_err(|e| e.to_string())?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Value::Object(serde_json::Map::new())
-            }
-            Err(e) => return Err(e.to_string()),
-        };
-
-        let already = config
-            .get("projects")
-            .and_then(|p| p.get(directory))
-            .and_then(|e| e.get("hasTrustDialogAccepted"))
-            .and_then(|v| v.as_bool())
-            == Some(true);
-
-        if already {
-            return Ok(());
-        }
-
-        let obj = config.as_object_mut().ok_or("config not an object")?;
-        let projects = obj
-            .entry("projects")
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        let project = projects
-            .as_object_mut()
-            .ok_or("projects not an object")?
-            .entry(directory)
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        project
-            .as_object_mut()
-            .ok_or("project entry not an object")?
-            .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
-
-        let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-        std::fs::write(config_path, &content).map_err(|e| e.to_string())?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600));
-        }
-
-        tracing::info!(directory, "trust injected");
-        Ok(())
-    })();
-
-    let _ = std::fs::remove_dir(&lock_path);
-    result
-}
-
 // -- ClaudePrint: round log --
 
 struct RoundLog {
@@ -667,15 +608,85 @@ async fn spawn_claude_print(
 ) -> Result<ClaudePrint, String> {
     let home = env::var("HOME").unwrap_or_default();
 
+    // claudep organizes transcripts by working directory. The pane
+    // directory is the cwd for the round and determines the project
+    // slug in ~/.claude/projects/.
     let pane_dir = PathBuf::from(&home).join("pane").join(slug);
-    let _ = std::fs::create_dir_all(&pane_dir);
+    let _ = tokio::fs::create_dir_all(&pane_dir).await;
     if std::env::set_current_dir(&pane_dir).is_err() {
         return Err(format!("cannot cd to {}", pane_dir.display()));
     }
 
+    // Trust injection -- write hasTrustDialogAccepted into ~/.claude.json
+    // so claudep does not hang waiting for interactive approval.
     let config_path = PathBuf::from(&home).join(".claude.json");
-    if let Err(e) = ensure_trust(&config_path, pane_dir.to_str().unwrap_or("")) {
-        tracing::warn!("failed to ensure trust: {}", e);
+    let directory = pane_dir.to_str().unwrap_or("");
+    {
+        let lock_path = config_path.with_extension("json.lock");
+        let locked = tokio::fs::create_dir(&lock_path).await.is_ok();
+        if locked {
+            let trust_result = async {
+                let mut config: Value = match tokio::fs::read_to_string(&config_path).await {
+                    Ok(content) => serde_json::from_str(&content).map_err(|e| e.to_string())?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Value::Object(serde_json::Map::new())
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+
+                let already = config
+                    .get("projects")
+                    .and_then(|p| p.get(directory))
+                    .and_then(|e| e.get("hasTrustDialogAccepted"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true);
+
+                if already {
+                    return Ok(());
+                }
+
+                let obj = config.as_object_mut().ok_or("config not an object")?;
+                let projects = obj
+                    .entry("projects")
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                let project = projects
+                    .as_object_mut()
+                    .ok_or("projects not an object")?
+                    .entry(directory)
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                project
+                    .as_object_mut()
+                    .ok_or("project entry not an object")?
+                    .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
+
+                let content =
+                    serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+                tokio::fs::write(&config_path, &content)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = tokio::fs::set_permissions(
+                        &config_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .await;
+                }
+
+                tracing::info!(directory, "trust injected");
+                Ok(())
+            }
+            .await;
+
+            let _ = tokio::fs::remove_dir(&lock_path).await;
+            if let Err(e) = trust_result {
+                tracing::warn!("failed to ensure trust: {}", e);
+            }
+        } else {
+            return Err("trust lock contention".to_string());
+        }
     }
 
     let round_log = Arc::new(RoundLog::begin(slug));
