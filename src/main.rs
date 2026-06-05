@@ -1,12 +1,11 @@
 // Wicket: WebSocket and HTTP server on port 6502.
 //
-// Clients (Puzzle, Shotgun) connect over WebSocket. Claude's MCP approval
-// requests arrive over HTTP at /mcp/<slug>. One process, one port.
+// Clients (Puzzle, Shotgun) connect over WebSocket. Claude's MCP approval requests arrive over
+// HTTP at /mcp/<slug>. One process, one port.
 //
-// Each slug gets its own coordinator task that manages the ClaudePrint
-// lifecycle, transcript persistence, and client broadcasting. Clients
-// register with the coordinator for their slug and receive normalized
-// entries and lifecycle events.
+// Each slug gets its own coordinator task that manages the ClaudePrint lifecycle, transcript
+// persistence, and client broadcasting. Clients register with the coordinator for their slug and
+// receive normalized entries and lifecycle events.
 
 mod normalize;
 mod parser;
@@ -2308,37 +2307,6 @@ async fn handle_mcp(
     make_json_response(response)
 }
 
-// -- Capture HTTP handler --
-
-async fn handle_capture(slug: &str, server: Arc<RwLock<ServerState>>) -> Response<Full<Bytes>> {
-    let coord_tx = {
-        let state = server.read().await;
-        state
-            .coordinators
-            .iter()
-            .find(|((s, _), _)| s == slug)
-            .map(|(_, h)| h.tx.clone())
-    };
-
-    let coord_tx = match coord_tx {
-        Some(tx) => tx,
-        None => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("no coordinator for slug")))
-                .unwrap();
-        }
-    };
-
-    // Capture not wired for Ping/Pong. Shotgun service requests
-    // will be restored when tools are added back.
-    drop(coord_tx);
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Full::new(Bytes::from("capture not available")))
-        .unwrap()
-}
-
 // -- HTTP/WebSocket connection handler --
 
 async fn handle_request(
@@ -2364,16 +2332,6 @@ async fn handle_request(
                     .unwrap())
             }
         }
-    } else if let Some(slug) = path.strip_prefix("/capture/") {
-        if slug.is_empty() {
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("missing slug in /capture/<slug>")))
-                .unwrap())
-        } else {
-            let slug = slug.to_string();
-            Ok(handle_capture(&slug, server).await)
-        }
     } else if let Some(rest) = path.strip_prefix("/mcp/") {
         let parts: Vec<&str> = rest.splitn(2, '/').collect();
         if parts.is_empty() || parts[0].is_empty() {
@@ -2387,168 +2345,6 @@ async fn handle_request(
             let slug = parts[0].to_string();
             let timestamp = parts.get(1).map(|s| s.to_string());
             Ok(handle_mcp(req, &slug, timestamp.as_deref(), server).await)
-        }
-    } else if let Some(slug) = path.strip_prefix("/turn/") {
-        if slug.is_empty() {
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("missing slug in /turn/<slug>")))
-                .unwrap())
-        } else if req.method() != hyper::Method::POST {
-            Ok(Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(Full::new(Bytes::new()))
-                .unwrap())
-        } else {
-            let slug = slug.to_string();
-            let body = req
-                .collect()
-                .await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
-            let message = payload
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            if message.is_empty() {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("missing message")))
-                    .unwrap());
-            }
-
-            let coord_tx = {
-                let ts = ServerState::resolve_timestamp(&slug, "latest").unwrap_or_default();
-                let mut state = server.write().await;
-                state.find_or_create_coordinator(&slug, &ts)
-            };
-
-            let _ = coord_tx.send(CoordMessage::Envelope {
-                id: 0,
-                envelope: InboundEnvelope {
-                    stream: "claude".to_string(),
-                    data: json!({ "message": message }),
-                },
-            });
-
-            tracing::info!(slug = %slug, "system turn initiated via HTTP");
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(json!({"status": "ok"}).to_string())))
-                .unwrap())
-        }
-    } else if let Some(raw_slug) = path.strip_prefix("/message/") {
-        if raw_slug.is_empty() {
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("missing slug")))
-                .unwrap())
-        } else if req.method() != hyper::Method::POST {
-            Ok(Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(Full::new(Bytes::new()))
-                .unwrap())
-        } else {
-            let (slug, full) = if let Some(s) = raw_slug.strip_suffix("@full") {
-                (s.to_string(), true)
-            } else {
-                (raw_slug.to_string(), false)
-            };
-
-            let body = req
-                .collect()
-                .await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
-            let message = payload
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            if message.is_empty() {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("missing message")))
-                    .unwrap());
-            }
-
-            let coord_tx = {
-                let ts = ServerState::resolve_timestamp(&slug, "latest").unwrap_or_default();
-                let mut state = server.write().await;
-                state.find_or_create_coordinator(&slug, &ts)
-            };
-
-            let notification = payload
-                .get("notification")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = coord_tx.send(CoordMessage::Message {
-                message,
-                full,
-                notification,
-                reply: reply_tx,
-            });
-
-            match tokio::time::timeout(std::time::Duration::from_secs(300), reply_rx).await {
-                Ok(Ok(response_text)) => Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain; charset=utf-8")
-                    .body(Full::new(Bytes::from(response_text)))
-                    .unwrap()),
-                Ok(Err(_)) => Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from("coordinator dropped reply")))
-                    .unwrap()),
-                Err(_) => Ok(Response::builder()
-                    .status(StatusCode::GATEWAY_TIMEOUT)
-                    .body(Full::new(Bytes::from("response timeout")))
-                    .unwrap()),
-            }
-        }
-    } else if let Some(slug) = path.strip_prefix("/session/") {
-        if slug.is_empty() {
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("missing slug")))
-                .unwrap())
-        } else if req.method() != hyper::Method::POST {
-            Ok(Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(Full::new(Bytes::new()))
-                .unwrap())
-        } else {
-            let slug = slug.to_string();
-            let coord_tx = {
-                let ts = ServerState::resolve_timestamp(&slug, "latest").unwrap_or_default();
-                let mut state = server.write().await;
-                state.find_or_create_coordinator(&slug, &ts)
-            };
-
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = coord_tx.send(CoordMessage::NewSession { reply: reply_tx });
-
-            match reply_rx.await {
-                Ok(timestamp) => Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(
-                        json!({"timestamp": timestamp}).to_string(),
-                    )))
-                    .unwrap()),
-                Err(_) => Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from("failed")))
-                    .unwrap()),
-            }
         }
     } else if path == "/health" {
         Ok(Response::builder()
