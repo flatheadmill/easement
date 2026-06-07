@@ -163,8 +163,8 @@ enum StdoutEvent {
     },
     Assistant {
         message: Value,
-        session_id: Option<String>,
-        uuid: Option<String>,
+        session_id: String,
+        uuid: String,
     },
     User {
         message: Value,
@@ -180,9 +180,31 @@ enum StdoutEvent {
     Unknown,
 }
 
-// Claude Code JSONL transcript format. Deserializes the raw entries from the CLI's transcript
-// file into typed structures. The serde strategy: #[serde(tag = "type")] for the top-level
-// enum, #[serde(untagged)] for UserContent (bare string or array), #[serde(other)] as catch-all.
+// Transcript entry types from the Claude CLI's JSONL files and the Codex TUI's
+// JSON-RPC messages.
+//
+// Fields are required unless there is a specific reason for Option. A field being
+// absent in some CLI version is not a reason to make it optional -- it is a reason
+// to find out why it is absent. Option<T> on a struct field propagates None checks
+// into every function that touches the value, and each check is a silent decision
+// to continue without data that should be there. When uuid is Option<String>, a
+// user entry with no uuid passes deserialization, passes normalization, enters the
+// transcript, and breaks chain validation later or never. When uuid is String, a
+// user entry with no uuid fails deserialization at the boundary, the parse_entry
+// call returns None, and we know immediately.
+//
+// We do not control these formats. The CLI and the TUI change across versions and
+// we discover their behavior through observation, not documentation. But making a
+// field required is not a claim that it will always be present. It is an assertion
+// that our code depends on it being present. When the CLI changes and the assertion
+// fires, we learn about it at the parse boundary instead of discovering corruption
+// downstream. A panic from a missing field is a ten-second fix. Silent propagation
+// of None through ten functions is a four-hour investigation.
+//
+// Legitimately optional fields do exist. parentUuid is absent on root entries.
+// duration_ms is absent on incomplete results. Booleans default to false via
+// #[serde(default)]. The #[serde(other)] Unknown variant absorbs entry types we
+// have not observed yet. These are design decisions, not defensive programming.
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -206,12 +228,12 @@ enum Entry {
 #[allow(dead_code)]
 struct UserEntry {
     message: UserMessage,
-    uuid: Option<String>,
-    timestamp: Option<String>,
+    uuid: String,
+    timestamp: String,
     parent_uuid: Option<String>,
     #[serde(default)]
     is_sidechain: bool,
-    session_id: Option<String>,
+    session_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -241,7 +263,7 @@ enum UserContentBlock {
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 struct ToolResultBlock {
-    tool_use_id: Option<String>,
+    tool_use_id: String,
     content: Option<ToolResultContent>,
     #[serde(default)]
     is_error: bool,
@@ -260,18 +282,18 @@ enum ToolResultContent {
 #[allow(dead_code)]
 struct AssistantEntry {
     message: AssistantMessage,
-    uuid: Option<String>,
-    timestamp: Option<String>,
+    uuid: String,
+    timestamp: String,
     parent_uuid: Option<String>,
     #[serde(default)]
     is_sidechain: bool,
-    session_id: Option<String>,
+    session_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 struct AssistantMessage {
-    role: Option<String>,
+    role: String,
     content: Vec<AssistantContentBlock>,
     model: Option<String>,
     stop_reason: Option<String>,
@@ -313,7 +335,7 @@ struct TextBlock {
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 struct ToolUseBlock {
-    id: Option<String>,
+    id: String,
     name: String,
     input: Value,
 }
@@ -338,8 +360,8 @@ struct ProgressEntry {
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct SummaryEntry {
-    summary: Option<String>,
-    leaf_uuid: Option<String>,
+    summary: String,
+    leaf_uuid: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -360,8 +382,8 @@ struct QueueOperationEntry {
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct CustomTitleEntry {
-    custom_title: Option<String>,
-    session_id: Option<String>,
+    custom_title: String,
+    session_id: String,
 }
 
 fn parse_entry(line: &str) -> Option<Entry> {
@@ -389,7 +411,7 @@ struct NormalizedEntry {
     who: &'static str,
     what: &'static str,
     blocks: Vec<NormalizedBlock>,
-    uuid: Option<String>,
+    uuid: String,
 }
 
 fn normalize(entry: Entry) -> Option<NormalizedEntry> {
@@ -913,14 +935,6 @@ async fn claudep(
     }
 
     let mut session_uuid = extract_session_uuid(&entries);
-    let mut session_id: Option<String> = None;
-    let mut tailing = false;
-    let mut last_usage: Option<Value> = None;
-    let mut turn_queue: std::collections::VecDeque<(String, String, bool)> = std::collections::VecDeque::new();
-    let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    let mut active_turn_id: Option<String> = None;
-    let mut sent: u64 = 0;
-    let mut replayed: u64 = 0;
     let mut seen_uuids: std::collections::HashSet<String> = entries
         .iter()
         .filter_map(|e| {
@@ -929,13 +943,6 @@ async fn claudep(
                 .map(|s| s.to_string())
         })
         .collect();
-    let mut rewinding = !entries.is_empty();
-
-    let mut transcript_file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&transcript_path)
-        .await
-        .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e));
 
     log!("easement", "claudep", "loaded", "slug": slug, "transcript": transcript, "entries": entries.len(), "session_uuid": session_uuid);
 
@@ -1164,9 +1171,22 @@ async fn claudep(
         turn_id: None,
     };
 
-    // Transcript tailer channel. The tailer task is spawned once we know the session ID and can
-    // find the CLI's transcript file.
     let (transcript_tx, mut transcript_rx) = mpsc::channel::<TranscriptLine>(256);
+
+    let mut session_id: Option<String> = None;
+    let mut tailing = false;
+    let mut last_usage: Option<Value> = None;
+    let mut turn_queue: std::collections::VecDeque<(String, String, bool)> = std::collections::VecDeque::new();
+    let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut active_turn_id: Option<String> = None;
+    let mut sent: u64 = 0;
+    let mut replayed: u64 = 0;
+    let mut rewinding = !entries.is_empty();
+    let mut transcript_file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript_path)
+        .await
+        .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e));
 
     loop {
         tokio::select! {
@@ -1219,7 +1239,7 @@ async fn claudep(
                                 let line = serde_json::to_string(e).ok()?;
                                 let parsed = parse_entry(&line)?;
                                 let normalized = normalize(parsed)?;
-                                normalized.uuid.clone()
+                                Some(normalized.uuid)
                             });
                         let s = slug.to_string();
                         let t = transcript.to_string();
@@ -1261,6 +1281,8 @@ async fn claudep(
                     StdoutLine::Json(data) => {
                         log!("easement", "claudep", "stdout", "data": data);
 
+                        // Spawn the transcript tailer once we know the session ID and
+                        // can find the CLI's file.
                         if !tailing {
                             if let Some(ref sid) = session_id {
                                 tailing = true;
