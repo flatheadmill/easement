@@ -37,6 +37,7 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Clone, Serialize)]
 struct LogMessage {
     when: String,
+    level: u8,
     who: &'static str,
     what: &'static str,
     why: &'static str,
@@ -52,20 +53,60 @@ struct LogEntry {
 
 static LOG: OnceLock<broadcast::Sender<LogMessage>> = OnceLock::new();
 
-fn log(msg: LogMessage) {
+fn log(level: u8, msg: LogMessage) {
     if let Some(tx) = LOG.get() {
-        let _ = tx.send(msg);
+        let _ = tx.send(LogMessage { level, ..msg });
     }
 }
 
-macro_rules! log {
+macro_rules! trace {
     ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(LogMessage {
+        crate::log(0, LogMessage {
             when: now(),
+            level: 0,
             who: $who,
             what: $what,
             why: $why,
             payload: serde_json::json!({ $($key: $val),* }),
+        })
+    };
+}
+
+macro_rules! wire {
+    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
+        crate::log(1, LogMessage {
+            when: now(),
+            level: 1,
+            who: $who,
+            what: $what,
+            why: $why,
+            payload: serde_json::json!({ $($key: $val),* }),
+        })
+    };
+}
+
+macro_rules! dump {
+    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
+        crate::log(2, LogMessage {
+            when: now(),
+            level: 2,
+            who: $who,
+            what: $what,
+            why: $why,
+            payload: serde_json::json!({ $($key: $val),* }),
+        })
+    };
+}
+
+macro_rules! error {
+    ($who:expr, $what:expr, $how:expr, $error:expr $(, $key:tt: $val:expr)* $(,)?) => {
+        crate::log(0, LogMessage {
+            when: now(),
+            level: 0,
+            who: $who,
+            what: $what,
+            why: "error",
+            payload: serde_json::json!({ "how": $how, "error": $error.to_string() $(, $key: $val)* }),
         })
     };
 }
@@ -123,6 +164,7 @@ fn init_log() {
                         when: now(),
                         what: LogMessage {
                             when: now(),
+                            level: 0,
                             who: "log",
                             what: "lifecycle",
                             why: "shed",
@@ -390,7 +432,7 @@ fn parse_entry(line: &str) -> Option<Entry> {
     match serde_json::from_str::<Entry>(line) {
         Ok(entry) => Some(entry),
         Err(e) => {
-            log!("easement", "parser", "error", "error": e.to_string());
+            trace!("easement", "parser", "error", "error": e.to_string());
             None
         }
     }
@@ -878,7 +920,7 @@ async fn claudep(
     main_tx: mpsc::UnboundedSender<MainEvent>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<ClaudePrint, String> {
-    log!("easement", "claudep", "started", "slug": slug, "transcript": transcript);
+    trace!("easement", "claudep", "started", "slug": slug, "transcript": transcript);
     let home = env::var("HOME").unwrap_or_default();
 
     // Slurp our transcript. If the file does not exist, abend -- the caller should have created
@@ -945,7 +987,7 @@ async fn claudep(
         })
         .collect();
 
-    log!("easement", "claudep", "loaded", "slug": slug, "transcript": transcript, "entries": entries.len(), "session_uuid": session_uuid);
+    trace!("easement", "claudep", "loaded", "slug": slug, "transcript": transcript, "entries": entries.len(), "session_uuid": session_uuid);
 
     // claudep organizes transcripts by working directory. The pane directory is the cwd for the
     // round and determines the project slug in ~/.claude/projects/.
@@ -1012,14 +1054,14 @@ async fn claudep(
                     .await;
                 }
 
-                log!("easement", "claudep", "trust_injected");
+                trace!("easement", "claudep", "trust_injected");
                 Ok(())
             }
             .await;
 
             let _ = tokio::fs::remove_dir(&lock_path).await;
             if let Err(e) = trust_result {
-                log!("easement", "claudep", "trust_failed", "error": e.to_string());
+                error!("easement", "claudep", "trust_failed", e);
             }
         } else {
             return Err("trust lock contention".to_string());
@@ -1034,13 +1076,13 @@ async fn claudep(
         );
         let cli_path = cli_transcript_path(slug, uuid);
         emplace_transcript(&cli_path, &entries)?;
-        log!("easement", "claudep", "emplaced", "uuid": uuid, "path": cli_path.display().to_string(), "entries": entries.len());
+        trace!("easement", "claudep", "emplaced", "uuid": uuid, "path": cli_path.display().to_string(), "entries": entries.len());
         Some(uuid.clone())
     } else {
         None
     };
 
-    log!("easement", "claudep", "spawning", "resume_arg": format!("{:?}", resume_arg));
+    trace!("easement", "claudep", "spawning", "resume_arg": format!("{:?}", resume_arg));
 
     // The mcp__o__approve tool auto-allows every permission request. We avoided
     // --dangerously-skip-permissions because the name felt reckless, but the sandbox is the real
@@ -1117,7 +1159,7 @@ async fn claudep(
                 Ok(_) => {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
-                        log!("easement", "claudep", "stderr", "line": trimmed);
+                        dump!("easement", "claudep", "stderr", "line": trimmed);
                     }
                 }
                 Err(_) => break,
@@ -1151,12 +1193,12 @@ async fn claudep(
                             let _ = stdout_tx.send(StdoutLine::Json(data)).await;
                         }
                         Err(e) => {
-                            log!("easement", "claudep", "stdout_invalid_json", "error": e.to_string());
+                            error!("easement", "claudep", "stdout_invalid_json", e);
                         }
                     }
                 }
                 Err(e) => {
-                    log!("easement", "claudep", "stdout_read_error", "error": e.to_string());
+                    error!("easement", "claudep", "stdout_read_error", e);
                     let _ = stdout_tx.send(StdoutLine::Eof).await;
                     break;
                 }
@@ -1184,11 +1226,15 @@ async fn claudep(
     let mut sent: u64 = 0;
     let mut replayed: u64 = 0;
     let mut rewinding = !entries.is_empty();
-    let mut transcript_file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&transcript_path)
-        .await
-        .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e));
+    let mut transcript_file: Option<tokio::fs::File> = if entries.is_empty() {
+        Some(tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .await
+            .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e)))
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -1196,7 +1242,7 @@ async fn claudep(
                 match event {
                     ClaudeEvent::Turn { turn_id, message, notification } => {
                         if active_turn_id.is_some() {
-                            log!("easement", "claudep", "turn_queued", "turn_id": turn_id, "message": message);
+                            trace!("easement", "claudep", "turn_queued", "turn_id": turn_id, "message": message);
                             turn_queue.push_back((turn_id, message, notification));
                         } else {
                             let text = if notification {
@@ -1206,7 +1252,7 @@ async fn claudep(
                             };
                             active_turn_id = Some(turn_id.clone());
                             cp.turn_id = Some(turn_id.clone());
-                            log!("easement", "claudep", "turn_started", "turn_id": turn_id);
+                            trace!("easement", "claudep", "turn_started", "turn_id": turn_id);
                             broadcast(&broadcast_tx, Broadcast::Turn {
                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                 event: TurnBroadcast::Started { turn_id },
@@ -1225,14 +1271,14 @@ async fn claudep(
                     }
                     ClaudeEvent::Steer { message, expected_turn_id } => {
                         if active_turn_id.as_deref() != Some(&expected_turn_id) {
-                            log!("easement", "claudep", "steer_rejected", "expected": expected_turn_id, "active": active_turn_id);
+                            trace!("easement", "claudep", "steer_rejected", "expected": expected_turn_id, "active": active_turn_id);
                         } else {
-                            log!("easement", "claudep", "steer_queued", "message": message);
+                            trace!("easement", "claudep", "steer_queued", "message": message);
                             steer_queue.push_back(message);
                         }
                     }
                     ClaudeEvent::FlushSteers { call_id } => {
-                        log!("easement", "claudep", "flush_steers", "call_id": call_id, "queued": steer_queue.len());
+                        trace!("easement", "claudep", "flush_steers", "call_id": call_id, "queued": steer_queue.len());
                         // TODO: flush steer queue to stdin before dispatching
                         let _ = main_tx.send(MainEvent::ToolSteered { call_id });
                     }
@@ -1275,59 +1321,14 @@ async fn claudep(
                                 usage: usage.clone(),
                             });
                         }
-                        log!("easement", "claudep", "history_replayed", "replay_id": replay_id, "entries": entries.len(), "slug": slug, "transcript": transcript);
+                        trace!("easement", "claudep", "history_replayed", "replay_id": replay_id, "entries": entries.len(), "slug": slug, "transcript": transcript);
                     }
                 }
             }
             Some(line) = cp.stdout_rx.recv() => {
                 match line {
                     StdoutLine::Json(data) => {
-                        log!("easement", "claudep", "stdout", "data": data);
-
-                        // Spawn the transcript tailer once we know the session ID and
-                        // can find the CLI's file.
-                        if !tailing {
-                            if let Some(ref sid) = session_id {
-                                tailing = true;
-                                log!("easement", "claudep", "tailing", "session_id": sid, "slug": slug, "transcript": transcript);
-
-                                let cli_path = cli_transcript_path(slug, sid);
-                                let tx = transcript_tx.clone();
-                                let tailer_token = cancel.child_token();
-                                tokio::spawn(async move {
-                                    let mut mux = match linemux::MuxedLines::new() {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            panic!("cannot create tailer: {}", e);
-                                        }
-                                    };
-                                    if let Err(e) = mux.add_file_from_start(&cli_path).await {
-                                        panic!("cannot tail transcript at {}: {}", cli_path.display(), e);
-                                    }
-                                    loop {
-                                        tokio::select! {
-                                            result = mux.next_line() => {
-                                                match result {
-                                                    Ok(Some(line)) => {
-                                                        let text = line.line().trim();
-                                                        if !text.is_empty() {
-                                                            if let Ok(data) = serde_json::from_str::<Value>(text) {
-                                                                let _ = tx.send(TranscriptLine::Entry(data)).await;
-                                                            }
-                                                        }
-                                                    }
-                                                    Ok(None) => break,
-                                                    Err(e) => {
-                                                        panic!("tailer read error: {}", e);
-                                                    }
-                                                }
-                                            }
-                                            _ = tailer_token.cancelled() => break,
-                                        }
-                                    }
-                                });
-                            }
-                        }
+                        dump!("easement", "claudep", "stdout", "data": data);
 
                         let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -1344,8 +1345,50 @@ async fn claudep(
                                     match &session_id {
                                         None => {
                                             assert!(uuid::Uuid::parse_str(sid).is_ok(), "session_id is not a UUID: {}", sid);
-                                            log!("easement", "claudep", "session_id", "session_id": sid, "slug": slug, "transcript": transcript);
+                                            trace!("easement", "claudep", "session_id", "session_id": sid, "slug": slug, "transcript": transcript);
                                             session_id = Some(sid.clone());
+
+                                            // Start the transcript tailer now that we know the session ID and the CLI's file path.
+                                            if !tailing {
+                                                tailing = true;
+                                                trace!("easement", "claudep", "tailing", "session_id": sid, "slug": slug, "transcript": transcript);
+
+                                                let cli_path = cli_transcript_path(slug, sid);
+                                                let tx = transcript_tx.clone();
+                                                let tailer_token = cancel.child_token();
+                                                tokio::spawn(async move {
+                                                    let mut mux = match linemux::MuxedLines::new() {
+                                                        Ok(m) => m,
+                                                        Err(e) => {
+                                                            panic!("cannot create tailer: {}", e);
+                                                        }
+                                                    };
+                                                    if let Err(e) = mux.add_file_from_start(&cli_path).await {
+                                                        panic!("cannot tail transcript at {}: {}", cli_path.display(), e);
+                                                    }
+                                                    loop {
+                                                        tokio::select! {
+                                                            // Await the channel for file read backpressure.
+                                                            result = mux.next_line() => {
+                                                                match result {
+                                                                    Ok(Some(line)) => {
+                                                                        let text = line.line().trim();
+                                                                        assert!(!text.is_empty(), "empty line in CLI transcript");
+                                                                        let data: Value = serde_json::from_str(text)
+                                                                            .unwrap_or_else(|e| panic!("invalid JSON in CLI transcript: {}", e));
+                                                                        let _ = tx.send(TranscriptLine::Entry(data)).await;
+                                                                    }
+                                                                    Ok(None) => break,
+                                                                    Err(e) => {
+                                                                        panic!("tailer read error: {}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            _ = tailer_token.cancelled() => break,
+                                                        }
+                                                    }
+                                                });
+                                            }
                                         }
                                         Some(existing) => {
                                             assert_eq!(existing.as_str(), sid.as_str(), "session id changed from {} to {}", existing, sid);
@@ -1358,13 +1401,13 @@ async fn claudep(
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
-                                    log!("easement", "claudep", "drain_gate", "sent": sent, "replayed": replayed, "is_steer_ack": is_steer_ack, "message": text);
+                                    trace!("easement", "claudep", "drain_gate", "sent": sent, "replayed": replayed, "is_steer_ack": is_steer_ack, "message": text);
                                     if is_steer_ack && !text.is_empty() {
                                         let parts: Vec<&str> = text.split(STEER_SENTINEL).collect();
                                         for part in &parts {
                                             let trimmed = part.trim();
                                             if !trimmed.is_empty() {
-                                                log!("easement", "claudep", "steer_broadcast", "text": trimmed);
+                                                trace!("easement", "claudep", "steer_broadcast", "text": trimmed);
                                                 broadcast(&broadcast_tx, Broadcast::UserMessage {
                                                     slug: slug.to_string(), transcript: transcript.to_string(),
                                                     text: trimmed.to_string(),
@@ -1415,7 +1458,7 @@ async fn claudep(
                                                 let _ = stdin.write_all(msg.as_bytes()).await;
                                                 let _ = stdin.flush().await;
                                                 sent += 1;
-                                                log!("easement", "claudep", "steers_flushed");
+                                                trace!("easement", "claudep", "steers_flushed");
                                             }
                                             continue;
                                         }
@@ -1436,7 +1479,7 @@ async fn claudep(
                                             }
                                         }
 
-                                        log!("easement", "claudep", "round_completed", "turn_id": completed_turn_id);
+                                        trace!("easement", "claudep", "round_completed", "turn_id": completed_turn_id);
 
                                         // Dispatch next queued turn if any.
                                         if let Some((next_turn_id, next_message, next_notification)) = turn_queue.pop_front() {
@@ -1447,7 +1490,7 @@ async fn claudep(
                                             };
                                             active_turn_id = Some(next_turn_id.clone());
                                             cp.turn_id = Some(next_turn_id.clone());
-                                            log!("easement", "claudep", "turn_started", "turn_id": next_turn_id, "from_queue": true);
+                                            trace!("easement", "claudep", "turn_started", "turn_id": next_turn_id, "from_queue": true);
                                             broadcast(&broadcast_tx, Broadcast::Turn {
                                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                                 event: TurnBroadcast::Started { turn_id: next_turn_id },
@@ -1470,7 +1513,7 @@ async fn claudep(
                         }
                     }
                     StdoutLine::Eof => {
-                        log!("easement", "claudep", "stdout_eof");
+                        trace!("easement", "claudep", "stdout_eof");
                         let turn_id = cp.turn_id.clone();
 
                         cp.stdin.take();
@@ -1496,7 +1539,7 @@ async fn claudep(
             Some(line) = transcript_rx.recv() => {
                 match line {
                     TranscriptLine::Entry(data) => {
-                        log!("easement", "transcript", "line", "data": data);
+                        dump!("easement", "transcript", "line", "data": data);
                         let uuid = match data.get("uuid").and_then(|v| v.as_str()) {
                             Some(u) => u,
                             None => continue,
@@ -1505,44 +1548,80 @@ async fn claudep(
                             continue;
                         }
                         if entries.is_empty() {
-                            log!("easement", "transcript", "root", "uuid": uuid);
+                            trace!("easement", "transcript", "root", "uuid": uuid);
                         } else {
-                            let parent = data.get("parentUuid").and_then(|v| v.as_str());
-                            let chain_head = entries.iter().rev()
-                                .find_map(|e| e.get("uuid").and_then(|v| v.as_str()));
+                            let parent = data.get("parentUuid").and_then(|v| v.as_str())
+                                .expect("missing parentUuid on non-root entry");
+                            let chain_head = entries.last()
+                                .and_then(|e| e.get("uuid").and_then(|v| v.as_str()))
+                                .expect("unreachable");
 
                             if rewinding {
-                                if let Some(parent) = parent {
-                                    if chain_head != Some(parent) {
-                                        if seen_uuids.contains(parent) {
-                                            let cut = entries.iter().rposition(|e| {
-                                                e.get("uuid").and_then(|v| v.as_str()) == Some(parent)
-                                            }).expect("parent in seen_uuids but not in entries");
-                                            let removed: Vec<Value> = entries.drain(cut + 1..).collect();
-                                            log!("easement", "claudep", "rewind",
-                                                "parent": parent, "cut": removed.len(),
-                                                "slug": slug, "transcript": transcript);
-                                            for r in &removed {
-                                                if let Some(u) = r.get("uuid").and_then(|v| v.as_str()) {
-                                                    seen_uuids.remove(u);
-                                                }
+                                if chain_head != parent {
+                                    if seen_uuids.contains(parent) {
+                                        let cut = entries.iter().rposition(|e| {
+                                            e.get("uuid").and_then(|v| v.as_str()) == Some(parent)
+                                        }).expect("parent in seen_uuids but not in entries");
+                                        let removed: Vec<Value> = entries.drain(cut + 1..).collect();
+                                        trace!("easement", "transcript", "rewind",
+                                            "parent": parent, "cut": removed.len(),
+                                            "removed": removed,
+                                            "slug": slug, "transcript": transcript);
+                                        for r in &removed {
+                                            if let Some(u) = r.get("uuid").and_then(|v| v.as_str()) {
+                                                seen_uuids.remove(u);
                                             }
-                                        } else {
-                                            panic!("transcript entry {} chains from unknown parent {}", uuid, parent);
                                         }
+
+                                        let rewind_dir = PathBuf::from(&home)
+                                            .join(".local/state/easement")
+                                            .join(slug)
+                                            .join("rewind")
+                                            .join(transcript);
+                                        tokio::fs::create_dir_all(&rewind_dir).await
+                                            .unwrap_or_else(|e| panic!("cannot create rewind dir: {}", e));
+                                        let rewind_ts = chrono::Local::now()
+                                            .format("%Y-%m-%d-%H-%M-%S").to_string();
+                                        let rewind_path = rewind_dir.join(format!("{}.jsonl", rewind_ts));
+                                        assert!(!rewind_path.exists(),
+                                            "rewind file already exists: {}", rewind_path.display());
+                                        tokio::fs::rename(&transcript_path, &rewind_path).await
+                                            .unwrap_or_else(|e| panic!("cannot move transcript to rewind: {}", e));
+
+                                        let mut content = String::new();
+                                        for e in &entries {
+                                            let line = serde_json::to_string(e)
+                                                .expect("entry serialization cannot fail");
+                                            content.push_str(&line);
+                                            content.push('\n');
+                                        }
+                                        tokio::fs::write(&transcript_path, &content).await
+                                            .unwrap_or_else(|e| panic!("cannot write rewound transcript: {}", e));
+
+                                        transcript_file = Some(tokio::fs::OpenOptions::new()
+                                            .append(true)
+                                            .open(&transcript_path)
+                                            .await
+                                            .unwrap_or_else(|e| panic!("cannot open transcript for append: {}", e)));
+                                    } else {
+                                        panic!("transcript entry {} chains from unknown parent {}", uuid, parent);
                                     }
+                                } else {
+                                    transcript_file = Some(tokio::fs::OpenOptions::new()
+                                        .append(true)
+                                        .open(&transcript_path)
+                                        .await
+                                        .unwrap_or_else(|e| panic!("cannot open transcript for append: {}", e)));
                                 }
                                 rewinding = false;
                             } else {
-                                if let Some(parent) = parent {
-                                    assert_eq!(chain_head, Some(parent),
-                                        "chain break: entry {} parent {} does not follow head {:?}",
-                                        uuid, parent, chain_head);
-                                }
+                                assert_eq!(chain_head, parent,
+                                    "chain break: entry {} parent {} does not follow head {}",
+                                    uuid, parent, chain_head);
                             }
                         }
 
-                        log!("easement", "transcript", "entry", "uuid": uuid);
+                        wire!("easement", "transcript", "entry", "data": data);
                         let entry_line = {
                             let mut s = serde_json::to_string(&data)
                                 .expect("entry serialization cannot fail");
@@ -1551,13 +1630,14 @@ async fn claudep(
                         };
                         seen_uuids.insert(uuid.to_string());
                         entries.push(data);
-                        transcript_file.write_all(entry_line.as_bytes()).await
+                        transcript_file.as_mut().expect("unreachable")
+                            .write_all(entry_line.as_bytes()).await
                             .expect("transcript write failed");
                     }
                 }
             }
             _ = cancel.cancelled() => {
-                log!("easement", "claudep", "cancelled");
+                trace!("easement", "claudep", "cancelled");
                 cp.stdin.take();
                 break;
             }
@@ -1618,7 +1698,7 @@ async fn handle_mcp(
     transcript: Option<&str>,
     main_tx: mpsc::UnboundedSender<MainEvent>,
 ) -> Response<Full<Bytes>> {
-    log!("easement", "mcp", "request", "slug": slug, "transcript": transcript, "method": req.method().to_string());
+    trace!("easement", "mcp", "request", "slug": slug, "transcript": transcript, "method": req.method().to_string());
     if req.method() != hyper::Method::POST {
         return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -1709,7 +1789,7 @@ async fn handle_mcp(
                 }
             };
 
-            log!("easement", "mcp", "tools_call", "tool": params.name, "arguments": params.arguments);
+            trace!("easement", "mcp", "tools_call", "tool": params.name, "arguments": params.arguments);
             let ts = transcript.unwrap_or("");
 
             if params.name == "approve" {
@@ -1834,7 +1914,7 @@ async fn handle_request(
                 Ok(response)
             }
             Err(e) => {
-                log!("easement", "websocket", "upgrade_error", "error": e.to_string());
+                error!("easement", "websocket", "upgrade_error", e);
                 Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from(format!("upgrade error: {}", e))))
@@ -2096,11 +2176,6 @@ enum MainEvent {
     WicketSpawnTimeout {
         host: String,
     },
-    ShellClaimTimeout {
-        id: String,
-        slug: String,
-        transcript: String,
-    },
 }
 
 
@@ -2114,14 +2189,11 @@ async fn main() {
 
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
-            log!("easement", "lifecycle", "listening", "addr": addr.to_string());
-            log!("easement", "lifecycle", "started", "port": port);
+            trace!("easement", "lifecycle", "started", "port": port, "addr": addr.to_string());
             l
         }
         Err(e) => {
-            log!("easement", "lifecycle", "bind_failed", "addr": addr.to_string(), "error": e.to_string());
-            eprintln!("failed to bind {}: {}", addr, e);
-            std::process::exit(1);
+            panic!("failed to bind {}: {}", addr, e);
         }
     };
 
@@ -2206,7 +2278,7 @@ async fn main() {
                 let (stream, peer) = match result {
                     Ok(s) => s,
                     Err(e) => {
-                        log!("easement", "lifecycle", "accept_error", "error": e.to_string());
+                        error!("easement", "lifecycle", "accept_error", e);
                         continue;
                     }
                 };
@@ -2225,7 +2297,7 @@ async fn main() {
                         .with_upgrades()
                         .await
                     {
-                        log!("easement", "websocket", "connection_error", "peer": peer.to_string(), "error": e.to_string());
+                        trace!("easement", "websocket", "connection_error", "peer": peer.to_string(), "error": e.to_string());
                     }
                 });
             }
@@ -2235,14 +2307,14 @@ async fn main() {
                         let ws_stream = match ws.await {
                             Ok(s) => s,
                             Err(e) => {
-                                log!("easement", "websocket", "upgrade_failed", "peer": peer.to_string(), "error": e.to_string());
+                                error!("easement", "websocket", "upgrade_failed", e, "peer": peer.to_string());
                                 continue;
                             }
                         };
 
                         let client_id = next_client_id;
                         next_client_id += 1;
-                        log!("easement", "websocket", "connected", "client_id": client_id, "peer": peer.to_string());
+                        trace!("easement", "websocket", "connected", "client_id": client_id, "peer": peer.to_string());
 
                         let (mut sink, mut stream) = ws_stream.split();
 
@@ -2280,19 +2352,19 @@ async fn main() {
                                                 let _ = main_tx.send(MainEvent::Packet { client_id, data });
                                             }
                                             Err(e) => {
-                                                log!("easement", "websocket", "bad_json", "client_id": client_id, "error": e.to_string());
+                                                error!("easement", "websocket", "bad_json", e, "client_id": client_id);
                                             }
                                         }
                                     }
                                     Ok(Message::Close(_)) => break,
                                     Err(e) => {
-                                        log!("easement", "websocket", "error", "client_id": client_id, "error": e.to_string());
+                                        error!("easement", "websocket", "stream", e, "client_id": client_id);
                                         break;
                                     }
                                     _ => {}
                                 }
                             }
-                            log!("easement", "websocket", "reader_exited", "client_id": client_id);
+                            trace!("easement", "websocket", "reader_exited", "client_id": client_id);
                             let _ = main_tx.send(MainEvent::Disconnected { client_id });
                         });
                     }
@@ -2325,7 +2397,7 @@ async fn main() {
                                 let _ = main_tx.send(ensured);
                             }
                             Some(wicket @ Wicket { state: WicketState::Starting, .. }) => {
-                                log!("easement", "tool", "stashed", "call_id": call_id, "where": r#where);
+                                trace!("easement", "tool", "stashed", "call_id": call_id, "where": r#where);
                                 wicket.stashed.push(ensured);
                             }
                             Some(Wicket { state: WicketState::Disconnected, .. }) => {
@@ -2339,7 +2411,7 @@ async fn main() {
                             None => {
                                 match spawn_wicket(&r#where) {
                                     Ok(mut child) => {
-                                        log!("easement", "wicket", "spawning", "where": r#where);
+                                        trace!("easement", "wicket", "spawning", "where": r#where);
                                         let main_tx = main_tx.clone();
                                         let where_clone = r#where.clone();
                                         tokio::spawn(async move {
@@ -2359,7 +2431,7 @@ async fn main() {
                                         });
                                     }
                                     Err(e) => {
-                                        log!("easement", "wicket", "spawn_failed", "where": r#where, "error": e.to_string());
+                                        trace!("easement", "wicket", "spawn_failed", "where": r#where, "error": e.to_string());
                                         if let MainEvent::ToolCallEnsured { reply, .. } = ensured {
                                             let _ = reply.send(ToolResult {
                                                 output: format!("failed to spawn wicket on {}: {}", r#where, e),
@@ -2372,7 +2444,7 @@ async fn main() {
                         }
                     }
                     MainEvent::ToolCallEnsured { call_id, slug, transcript, tool, args, reply } => {
-                        log!("easement", "tool", "ensured", "call_id": call_id, "slug": slug, "tool": tool);
+                        trace!("easement", "tool", "ensured", "call_id": call_id, "slug": slug, "tool": tool);
 
                         let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
                         let _ = win.claude_tx.send(ClaudeEvent::FlushSteers { call_id: call_id.clone() });
@@ -2380,11 +2452,11 @@ async fn main() {
                         tool_claims.insert(call_id, ToolClaim { reply, slug, transcript, args });
                     }
                     MainEvent::ToolSteered { call_id } => {
-                        log!("easement", "tool", "steered", "call_id": call_id);
+                        trace!("easement", "tool", "steered", "call_id": call_id);
                         let claim = match tool_claims.remove(&call_id) {
                             Some(c) => c,
                             None => {
-                                log!("easement", "tool", "steer_unknown", "call_id": call_id);
+                                trace!("easement", "tool", "steer_unknown", "call_id": call_id);
                                 continue;
                             }
                         };
@@ -2402,7 +2474,7 @@ async fn main() {
 
                         match socket_tx {
                             Some(tx) => {
-                                log!("easement", "tool", "dispatched", "call_id": call_id, "who": who, "f": f, "where": r#where);
+                                trace!("easement", "tool", "dispatched", "call_id": call_id, "who": who, "f": f, "where": r#where);
                                 let mut flat_args = inner_args.as_object().cloned().unwrap_or_default();
                                 flat_args.insert("f".to_string(), json!(f));
                                 dispatch(tx, Dispatch::Tool {
@@ -2420,7 +2492,7 @@ async fn main() {
                                 });
                             }
                             None => {
-                                log!("easement", "tool", "no_socket", "call_id": call_id, "who": who, "where": r#where);
+                                trace!("easement", "tool", "no_socket", "call_id": call_id, "who": who, "where": r#where);
                                 let _ = claim.reply.send(ToolResult {
                                     output: format!("no connected client for who={} where={}", who, r#where),
                                     exit_code: 1,
@@ -2439,19 +2511,19 @@ async fn main() {
                         match serde_json::from_value::<Packet>(data) {
                             Ok(Packet::Tool(ToolPacket::Claim { call_id })) => {
                                 if let Some(claim) = tool_claims.remove(&call_id) {
-                                    log!("easement", "tool", "claimed", "client_id": client_id, "call_id": call_id);
+                                    trace!("easement", "tool", "claimed", "client_id": client_id, "call_id": call_id);
                                     tool_calls.insert(call_id.clone(), claim);
                                     let _ = timer_tx.send(Delayed {
                                         ms: 86_400_000,
                                         event: MainEvent::ToolCallTimeout { call_id },
                                     });
                                 } else {
-                                    log!("easement", "tool", "stale_claim", "client_id": client_id, "call_id": call_id);
+                                    trace!("easement", "tool", "stale_claim", "client_id": client_id, "call_id": call_id);
                                 }
                             }
                             Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code })) => {
                                 if let Some(claim) = tool_calls.remove(&call_id) {
-                                    log!("easement", "tool", "response", "client_id": client_id, "call_id": call_id, "exit_code": exit_code);
+                                    trace!("easement", "tool", "response", "client_id": client_id, "call_id": call_id, "exit_code": exit_code);
                                     let r#where = claim.args.get("args")
                                         .and_then(|a| a.get("where"))
                                         .and_then(|v| v.as_str())
@@ -2462,7 +2534,7 @@ async fn main() {
                                     }
                                     let _ = claim.reply.send(ToolResult { output, exit_code });
                                 } else {
-                                    log!("easement", "tool", "unknown_response", "client_id": client_id, "call_id": call_id);
+                                    trace!("easement", "tool", "unknown_response", "client_id": client_id, "call_id": call_id);
                                 }
                             }
                             Ok(Packet::Turn(TurnPacket::Start { slug, transcript, turn_id, message, notification })) => {
@@ -2476,12 +2548,12 @@ async fn main() {
                             Ok(Packet::History(HistoryPacket::Replay { slug, transcript, replay_id })) => {
                                 match resolve_transcript(&slug, &transcript).await {
                                     Some(resolved) => {
-                                        log!("easement", "history", "replay", "slug": slug, "transcript": resolved, "replay_id": replay_id);
+                                        trace!("easement", "history", "replay", "slug": slug, "transcript": resolved, "replay_id": replay_id);
                                         let win = window_for(&mut windows, &slug, &resolved, &token, &broadcast_tx, &main_tx);
                                         let _ = win.claude_tx.send(ClaudeEvent::HistoryReplay { replay_id });
                                     }
                                     None => {
-                                        log!("easement", "history", "not_found", "slug": slug, "transcript": transcript);
+                                        trace!("easement", "history", "not_found", "slug": slug, "transcript": transcript);
                                     }
                                 }
                             }
@@ -2504,21 +2576,21 @@ async fn main() {
                                         });
                                     }
                                     None => {
-                                        log!("easement", "shell", "no_wicket", "where": r#where);
+                                        trace!("easement", "shell", "no_wicket", "where": r#where);
                                     }
                                 }
                             }
                             Ok(Packet::Shell(ShellPacket::Claim { id })) => {
-                                log!("easement", "shell", "claimed", "client_id": client_id, "id": id);
+                                trace!("easement", "shell", "claimed", "client_id": client_id, "id": id);
                             }
                             Ok(Packet::Shell(ShellPacket::Response { id, slug: _, transcript: _, output: _, exit_code })) => {
-                                log!("easement", "shell", "response", "client_id": client_id, "id": id, "exit_code": exit_code);
+                                trace!("easement", "shell", "response", "client_id": client_id, "id": id, "exit_code": exit_code);
                                 // TODO: route shell result back to originating client
                             }
                             Ok(Packet::Socket(SocketPacket::Connect { who, r#where, tools })) => {
                                 let toolset = ToolSet { who: who.clone(), tools };
                                 let resolved_where = r#where.clone().unwrap_or_else(|| "localhost".to_string());
-                                log!("easement", "socket", "connect", "client_id": client_id, "who": who, "where": resolved_where, "tools": toolset.tools.len());
+                                trace!("easement", "socket", "connect", "client_id": client_id, "who": who, "where": resolved_where, "tools": toolset.tools.len());
                                 let Some(socket) = sockets.get_mut(&client_id) else {
                                     panic!("socket connect from unknown client {}", client_id);
                                 };
@@ -2532,7 +2604,7 @@ async fn main() {
                                     if let Some(wicket) = wickets.get_mut(&r#where) {
                                         wicket.state = WicketState::Connected { client_id };
                                         let drained: Vec<MainEvent> = wicket.stashed.drain(..).collect();
-                                        log!("easement", "wicket", "connected_draining", "where": r#where, "stashed": drained.len());
+                                        trace!("easement", "wicket", "connected_draining", "where": r#where, "stashed": drained.len());
                                         for event in drained {
                                             let _ = main_tx.send(event);
                                         }
@@ -2545,7 +2617,7 @@ async fn main() {
                                 }
                             }
                             Err(e) => {
-                                log!("easement", "websocket", "unrecognized", "client_id": client_id, "error": e.to_string());
+                                error!("easement", "websocket", "unrecognized", e, "client_id": client_id);
                             }
                         }
                     }
@@ -2553,14 +2625,14 @@ async fn main() {
                         sockets.remove(&client_id);
                         for wicket in wickets.values_mut() {
                             if matches!(wicket.state, WicketState::Connected { client_id: cid } if cid == client_id) {
-                                log!("easement", "wicket", "disconnected", "client_id": client_id);
+                                trace!("easement", "wicket", "disconnected", "client_id": client_id);
                                 wicket.state = WicketState::Disconnected;
                             }
                         }
-                        log!("easement", "websocket", "disconnected", "client_id": client_id);
+                        trace!("easement", "websocket", "disconnected", "client_id": client_id);
                     }
                     MainEvent::WicketExited { host, exit_code } => {
-                        log!("easement", "wicket", "exited", "host": host, "exit_code": exit_code);
+                        trace!("easement", "wicket", "exited", "host": host, "exit_code": exit_code);
                         if let Some(wicket) = wickets.remove(&host) {
                             for event in wicket.stashed {
                                 if let MainEvent::ToolCallEnsured { reply, .. } = event {
@@ -2574,7 +2646,7 @@ async fn main() {
                     }
                     MainEvent::ToolClaimTimeout { call_id } => {
                         if let Some(claim) = tool_claims.remove(&call_id) {
-                            log!("easement", "tool", "claim_timeout", "call_id": call_id);
+                            trace!("easement", "tool", "claim_timeout", "call_id": call_id);
                             let _ = claim.reply.send(ToolResult {
                                 output: "no client claimed this tool call".to_string(),
                                 exit_code: 1,
@@ -2583,7 +2655,7 @@ async fn main() {
                     }
                     MainEvent::ToolCallTimeout { call_id } => {
                         if let Some(claim) = tool_calls.remove(&call_id) {
-                            log!("easement", "tool", "call_timeout", "call_id": call_id);
+                            trace!("easement", "tool", "call_timeout", "call_id": call_id);
                             let _ = claim.reply.send(ToolResult {
                                 output: "tool call timed out".to_string(),
                                 exit_code: 1,
@@ -2599,16 +2671,10 @@ async fn main() {
                             .collect();
                         let _ = reply.send(serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()));
                     }
-                    MainEvent::ShellClaimTimeout { id, slug: _, transcript: _ } => {
-                        if shell_claims.remove(&id) {
-                            log!("easement", "shell", "claim_timeout", "id": id);
-                            // TODO: notify Puzzle of failure
-                        }
-                    }
                     MainEvent::WicketSpawnTimeout { host } => {
-                        if let Some(wicket) = wickets.get_mut(&host) {
-                            if matches!(wicket.state, WicketState::Starting) {
-                                log!("easement", "wicket", "spawn_timeout", "host": host);
+                        if let Some(wicket) = wickets.get_mut(&host) &&
+                             matches!(wicket.state, WicketState::Starting) {
+                                trace!("easement", "wicket", "spawn_timeout", "host": host);
                                 let stashed: Vec<MainEvent> = wicket.stashed.drain(..).collect();
                                 for event in stashed {
                                     if let MainEvent::ToolCallEnsured { reply, .. } = event {
@@ -2617,7 +2683,6 @@ async fn main() {
                                             exit_code: 1,
                                         });
                                     }
-                                }
                             }
                         }
                     }
