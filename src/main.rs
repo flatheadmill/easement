@@ -730,12 +730,6 @@ enum Broadcast {
         #[serde(flatten)]
         event: TurnBroadcast,
     },
-    Lifecycle {
-        slug: String,
-        transcript: String,
-        #[serde(flatten)]
-        event: LifecycleBroadcast,
-    },
     UserMessage {
         slug: String,
         transcript: String,
@@ -761,15 +755,6 @@ enum HistoryBroadcast {
 enum TurnBroadcast {
     Started { turn_id: String },
     Completed { turn_id: String, status: String },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum LifecycleBroadcast {
-    RoundStarted,
-    RoundCompleted,
-    RoundInterrupted,
-    RoundFailed { message: String },
 }
 
 #[derive(Serialize)]
@@ -1257,10 +1242,6 @@ async fn claudep(
                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                 event: TurnBroadcast::Started { turn_id },
                             });
-                            broadcast(&broadcast_tx, Broadcast::Lifecycle {
-                                slug: slug.to_string(), transcript: transcript.to_string(),
-                                event: LifecycleBroadcast::RoundStarted,
-                            });
                             let msg = format_user_message(&text);
                             if let Some(ref mut stdin) = cp.stdin {
                                 let _ = stdin.write_all(msg.as_bytes()).await;
@@ -1351,7 +1332,7 @@ async fn claudep(
                                             // Start the transcript tailer now that we know the session ID and the CLI's file path.
                                             if !tailing {
                                                 tailing = true;
-                                                trace!("easement", "claudep", "tailing", "session_id": sid, "slug": slug, "transcript": transcript);
+                                                trace!("easement", "transcript", "tailing", "session_id": sid, "slug": slug, "transcript": transcript);
 
                                                 let cli_path = cli_transcript_path(slug, sid);
                                                 let tx = transcript_tx.clone();
@@ -1429,10 +1410,6 @@ async fn claudep(
                                     }
 
                                     if is_interrupted {
-                                        broadcast(&broadcast_tx, Broadcast::Lifecycle {
-                                            slug: slug.to_string(), transcript: transcript.to_string(),
-                                            event: LifecycleBroadcast::RoundInterrupted,
-                                        });
                                         if let Some(ref tid) = cp.turn_id {
                                             broadcast(&broadcast_tx, Broadcast::Turn {
                                                 slug: slug.to_string(), transcript: transcript.to_string(),
@@ -1467,10 +1444,6 @@ async fn claudep(
                                         cp.turn_id = None;
 
                                         if !is_interrupted {
-                                            broadcast(&broadcast_tx, Broadcast::Lifecycle {
-                                                slug: slug.to_string(), transcript: transcript.to_string(),
-                                                event: LifecycleBroadcast::RoundCompleted,
-                                            });
                                             if let Some(ref tid) = completed_turn_id {
                                                 broadcast(&broadcast_tx, Broadcast::Turn {
                                                     slug: slug.to_string(), transcript: transcript.to_string(),
@@ -1479,7 +1452,7 @@ async fn claudep(
                                             }
                                         }
 
-                                        trace!("easement", "claudep", "round_completed", "turn_id": completed_turn_id);
+                                        trace!("easement", "claudep", "trun_completed", "turn_id": completed_turn_id);
 
                                         // Dispatch next queued turn if any.
                                         if let Some((next_turn_id, next_message, next_notification)) = turn_queue.pop_front() {
@@ -1494,10 +1467,6 @@ async fn claudep(
                                             broadcast(&broadcast_tx, Broadcast::Turn {
                                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                                 event: TurnBroadcast::Started { turn_id: next_turn_id },
-                                            });
-                                            broadcast(&broadcast_tx, Broadcast::Lifecycle {
-                                                slug: slug.to_string(), transcript: transcript.to_string(),
-                                                event: LifecycleBroadcast::RoundStarted,
                                             });
                                             let msg = format_user_message(&text);
                                             if let Some(ref mut stdin) = cp.stdin {
@@ -1521,10 +1490,7 @@ async fn claudep(
 
                         // Transcript reconciliation is handled by the tailer now.
 
-                        broadcast(&broadcast_tx, Broadcast::Lifecycle {
-                            slug: slug.to_string(), transcript: transcript.to_string(),
-                            event: LifecycleBroadcast::RoundFailed { message: "claude exited unexpectedly".to_string() },
-                        });
+                        trace!("easement", "claudep", "exited_unexpectedly");
                         if let Some(ref tid) = turn_id {
                             broadcast(&broadcast_tx, Broadcast::Turn {
                                 slug: slug.to_string(), transcript: transcript.to_string(),
