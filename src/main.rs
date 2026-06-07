@@ -215,6 +215,10 @@ enum StdoutEvent {
         #[serde(rename = "isReplay")]
         is_replay: bool,
     },
+    StreamEvent {
+        event: Value,
+        session_id: String,
+    },
     RateLimitEvent {
         rate_limit_info: Value,
     },
@@ -647,12 +651,6 @@ fn extract_session_uuid(entries: &[Value]) -> Option<String> {
 }
 
 
-struct ClaudePrint {
-    child: tokio::process::Child,
-    stdin: Option<tokio::process::ChildStdin>,
-    stdout_rx: mpsc::Receiver<StdoutLine>,
-    turn_id: Option<String>,
-}
 
 async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
     let home = env::var("HOME").unwrap_or_default();
@@ -907,7 +905,7 @@ async fn claudep(
     broadcast_tx: broadcast::Sender<String>,
     main_tx: mpsc::UnboundedSender<MainEvent>,
     cancel: tokio_util::sync::CancellationToken,
-) -> Result<ClaudePrint, String> {
+) {
     trace!("easement", "claudep", "started", "slug": slug, "transcript": transcript);
     let home = env::var("HOME").unwrap_or_default();
 
@@ -919,13 +917,7 @@ async fn claudep(
         .join(format!("{}.jsonl", transcript));
     let content = tokio::fs::read_to_string(&transcript_path)
         .await
-        .map_err(|e| {
-            format!(
-                "transcript does not exist at {}: {}",
-                transcript_path.display(),
-                e
-            )
-        })?;
+        .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e));
 
     let mut entries: Vec<Value> = Vec::new();
     for line in content.lines() {
@@ -981,9 +973,8 @@ async fn claudep(
     // round and determines the project slug in ~/.claude/projects/.
     let pane_dir = PathBuf::from(&home).join("pane").join(slug);
     let _ = tokio::fs::create_dir_all(&pane_dir).await;
-    if std::env::set_current_dir(&pane_dir).is_err() {
-        return Err(format!("cannot cd to {}", pane_dir.display()));
-    }
+    std::env::set_current_dir(&pane_dir)
+        .unwrap_or_else(|e| panic!("cannot cd to {}: {}", pane_dir.display(), e));
 
     // Trust injection -- write hasTrustDialogAccepted into ~/.claude.json so claudep does not hang
     // waiting for interactive approval.
@@ -993,13 +984,14 @@ async fn claudep(
         let lock_path = config_path.with_extension("json.lock");
         let locked = tokio::fs::create_dir(&lock_path).await.is_ok();
         if locked {
-            let trust_result = async {
+            async {
                 let mut config: Value = match tokio::fs::read_to_string(&config_path).await {
-                    Ok(content) => serde_json::from_str(&content).map_err(|e| e.to_string())?,
+                    Ok(content) => serde_json::from_str(&content)
+                        .unwrap_or_else(|e| panic!("cannot parse {}: {}", config_path.display(), e)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         Value::Object(serde_json::Map::new())
                     }
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => panic!("cannot read {}: {}", config_path.display(), e),
                 };
 
                 let already = config
@@ -1009,50 +1001,43 @@ async fn claudep(
                     .and_then(|v| v.as_bool())
                     == Some(true);
 
-                if already {
-                    return Ok(());
+                if !already {
+                    let obj = config.as_object_mut().expect("config not an object");
+                    let projects = obj
+                        .entry("projects")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    let project = projects
+                        .as_object_mut()
+                        .expect("projects not an object")
+                        .entry(directory)
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    project
+                        .as_object_mut()
+                        .expect("project entry not an object")
+                        .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
+
+                    let content = serde_json::to_string_pretty(&config).expect("unreachable");
+                    tokio::fs::write(&config_path, &content)
+                        .await
+                        .unwrap_or_else(|e| panic!("cannot write {}: {}", config_path.display(), e));
+
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = tokio::fs::set_permissions(
+                            &config_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .await;
+                    }
+
+                    trace!("easement", "claudep", "trust_injected");
                 }
-
-                let obj = config.as_object_mut().ok_or("config not an object")?;
-                let projects = obj
-                    .entry("projects")
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                let project = projects
-                    .as_object_mut()
-                    .ok_or("projects not an object")?
-                    .entry(directory)
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                project
-                    .as_object_mut()
-                    .ok_or("project entry not an object")?
-                    .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
-
-                let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-                tokio::fs::write(&config_path, &content)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = tokio::fs::set_permissions(
-                        &config_path,
-                        std::fs::Permissions::from_mode(0o600),
-                    )
-                    .await;
-                }
-
-                trace!("easement", "claudep", "trust_injected");
-                Ok(())
-            }
-            .await;
+            }.await;
 
             let _ = tokio::fs::remove_dir(&lock_path).await;
-            if let Err(e) = trust_result {
-                error!("easement", "claudep", "trust_failed", e);
-            }
         } else {
-            return Err("trust lock contention".to_string());
+            panic!("trust lock contention");
         }
     }
 
@@ -1063,7 +1048,8 @@ async fn claudep(
             uuid
         );
         let cli_path = cli_transcript_path(slug, uuid);
-        emplace_transcript(&cli_path, &entries)?;
+        emplace_transcript(&cli_path, &entries)
+            .unwrap_or_else(|e| panic!("emplacement failed: {}", e));
         trace!("easement", "claudep", "emplaced", "uuid": uuid, "path": cli_path.display().to_string(), "entries": entries.len());
         Some(uuid.clone())
     } else {
@@ -1119,9 +1105,8 @@ async fn claudep(
             }
         }
     });
-    if let Err(e) = tokio::fs::write(&mcp_config_path, mcp_config.to_string()).await {
-        return Err(format!("cannot write mcp config: {}", e));
-    }
+    tokio::fs::write(&mcp_config_path, mcp_config.to_string()).await
+        .unwrap_or_else(|e| panic!("cannot write mcp config: {}", e));
     cmd.arg("--mcp-config").arg(&mcp_config_path);
 
     cmd.stdin(Stdio::piped())
@@ -1130,7 +1115,7 @@ async fn claudep(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("cannot spawn claude: {}", e))?;
+        .unwrap_or_else(|e| panic!("cannot spawn claude: {}", e));
 
     let child_stdin = child.stdin.take().expect("stdin was piped");
     let child_stdout = child.stdout.take().expect("stdout was piped");
@@ -1158,7 +1143,7 @@ async fn claudep(
     // Stdout reader task. Reads claudep stdout and pushes typed events onto
     // Stdout reader. Parses JSON, sends the Value. Classification happens in
     // the claudep loop where the logic lives.
-    let (stdout_tx, stdout_rx) = mpsc::channel::<StdoutLine>(256);
+    let (stdout_tx, mut stdout_rx) = mpsc::channel::<StdoutLine>(256);
 
     tokio::spawn(async move {
         let mut reader = BufReader::new(child_stdout);
@@ -1194,14 +1179,7 @@ async fn claudep(
         }
     });
 
-    // The claudep event loop. Reads stdout events and classifies them. This is the code that will
-    // become the claudep task's main loop when it gets its own command channel.
-    let mut cp = ClaudePrint {
-        child,
-        stdin: Some(child_stdin),
-        stdout_rx,
-        turn_id: None,
-    };
+    let mut child_stdin: Option<tokio::process::ChildStdin> = Some(child_stdin);
 
     let (transcript_tx, mut transcript_rx) = mpsc::channel::<TranscriptLine>(256);
 
@@ -1239,14 +1217,13 @@ async fn claudep(
                                 message
                             };
                             active_turn_id = Some(turn_id.clone());
-                            cp.turn_id = Some(turn_id.clone());
                             trace!("easement", "claudep", "turn_started", "turn_id": turn_id);
                             broadcast(&broadcast_tx, Broadcast::Turn {
                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                 event: TurnBroadcast::Started { turn_id },
                             });
                             let msg = format_user_message(&text);
-                            if let Some(ref mut stdin) = cp.stdin {
+                            if let Some(ref mut stdin) = child_stdin {
                                 let _ = stdin.write_all(msg.as_bytes()).await;
                                 let _ = stdin.flush().await;
                                 sent += 1;
@@ -1309,22 +1286,19 @@ async fn claudep(
                     }
                 }
             }
-            Some(line) = cp.stdout_rx.recv() => {
+            Some(line) = stdout_rx.recv() => {
                 match line {
                     StdoutLine::Json(data) => {
                         dump!("easement", "claudep", "stdout", "data": data);
 
-                        let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                        if event_type == "stream_event" {
-                            if let Some(event) = data.get("event") {
-                                broadcast(&broadcast_tx, Broadcast::Delta {
-                                    slug: slug.to_string(), transcript: transcript.to_string(),
-                                    event: event.clone(),
-                                });
-                            }
-                        } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
+                        if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                             match &event {
+                                StdoutEvent::StreamEvent { event, .. } => {
+                                    broadcast(&broadcast_tx, Broadcast::Delta {
+                                        slug: slug.to_string(), transcript: transcript.to_string(),
+                                        event: event.clone(),
+                                    });
+                                }
                                 StdoutEvent::User { is_replay: true, message, session_id: sid, .. } => {
                                     match &session_id {
                                         None => {
@@ -1413,7 +1387,7 @@ async fn claudep(
                                     }
 
                                     if is_interrupted {
-                                        if let Some(ref tid) = cp.turn_id {
+                                        if let Some(ref tid) = active_turn_id {
                                             broadcast(&broadcast_tx, Broadcast::Turn {
                                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                                 event: TurnBroadcast::Completed { turn_id: tid.clone(), status: "interrupted".to_string() },
@@ -1423,13 +1397,12 @@ async fn claudep(
 
                                     if sent == replayed {
                                         if !steer_queue.is_empty() {
-                                            if let Some(ref mut stdin) = cp.stdin {
+                                            if let Some(ref mut stdin) = child_stdin {
                                                 let joined = steer_queue
                                                     .drain(..)
                                                     .collect::<Vec<_>>()
                                                     .join(STEER_SENTINEL);
                                                 let steer_turn_id = uuid::Uuid::new_v4().to_string();
-                                                cp.turn_id = Some(steer_turn_id.clone());
                                                 broadcast(&broadcast_tx, Broadcast::Turn {
                                                     slug: slug.to_string(), transcript: transcript.to_string(),
                                                     event: TurnBroadcast::Started { turn_id: steer_turn_id },
@@ -1444,7 +1417,6 @@ async fn claudep(
                                         }
 
                                         let completed_turn_id = active_turn_id.take();
-                                        cp.turn_id = None;
 
                                         if !is_interrupted {
                                             if let Some(ref tid) = completed_turn_id {
@@ -1465,14 +1437,13 @@ async fn claudep(
                                                 next_message
                                             };
                                             active_turn_id = Some(next_turn_id.clone());
-                                            cp.turn_id = Some(next_turn_id.clone());
                                             trace!("easement", "claudep", "turn_started", "turn_id": next_turn_id, "from_queue": true);
                                             broadcast(&broadcast_tx, Broadcast::Turn {
                                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                                 event: TurnBroadcast::Started { turn_id: next_turn_id },
                                             });
                                             let msg = format_user_message(&text);
-                                            if let Some(ref mut stdin) = cp.stdin {
+                                            if let Some(ref mut stdin) = child_stdin {
                                                 let _ = stdin.write_all(msg.as_bytes()).await;
                                                 let _ = stdin.flush().await;
                                                 sent += 1;
@@ -1486,15 +1457,12 @@ async fn claudep(
                     }
                     StdoutLine::Eof => {
                         trace!("easement", "claudep", "stdout_eof");
-                        let turn_id = cp.turn_id.clone();
 
-                        cp.stdin.take();
-                        let _ = cp.child.wait().await;
-
-                        // Transcript reconciliation is handled by the tailer now.
+                        child_stdin.take();
+                        let _ = child.wait().await;
 
                         trace!("easement", "claudep", "exited_unexpectedly");
-                        if let Some(ref tid) = turn_id {
+                        if let Some(ref tid) = active_turn_id {
                             broadcast(&broadcast_tx, Broadcast::Turn {
                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                 event: TurnBroadcast::Completed { turn_id: tid.clone(), status: "failed".to_string() },
@@ -1607,13 +1575,11 @@ async fn claudep(
             }
             _ = cancel.cancelled() => {
                 trace!("easement", "claudep", "cancelled");
-                cp.stdin.take();
+                child_stdin.take();
                 break;
             }
         }
     }
-
-    Ok(cp)
 }
 
 fn easement_port() -> u16 {
@@ -2191,7 +2157,7 @@ async fn main() {
             let btx = broadcast_tx.clone();
             let mtx = main_tx.clone();
             tokio::spawn(async move {
-                let _ = claudep(&slug_owned, &transcript_owned, claude_rx, btx, mtx, child_token).await;
+                claudep(&slug_owned, &transcript_owned, claude_rx, btx, mtx, child_token).await;
             });
             windows.insert(
                 key.clone(),
