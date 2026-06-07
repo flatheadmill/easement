@@ -659,7 +659,8 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
     let dir = PathBuf::from(&home)
         .join(".local/state/easement")
         .join(slug);
-    let _ = tokio::fs::create_dir_all(&dir).await;
+    tokio::fs::create_dir_all(&dir).await
+        .unwrap_or_else(|e| panic!("cannot create transcript dir {}: {}", dir.display(), e));
     let ts_pattern = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.jsonl$").ok()?;
     let mut transcripts: Vec<String> = Vec::new();
     let mut entries = tokio::fs::read_dir(&dir).await.ok()?;
@@ -675,7 +676,8 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
         "new" => {
             let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
             let path = dir.join(format!("{}.jsonl", ts));
-            let _ = tokio::fs::File::create(&path).await;
+            tokio::fs::File::create(&path).await
+                .unwrap_or_else(|e| panic!("cannot create transcript {}: {}", path.display(), e));
             Some(ts)
         }
         "full" => {
@@ -689,7 +691,8 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
             if transcripts.is_empty() {
                 let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
                 let path = dir.join(format!("{}.jsonl", ts));
-                let _ = tokio::fs::File::create(&path).await;
+                tokio::fs::File::create(&path).await
+                    .unwrap_or_else(|e| panic!("cannot create transcript {}: {}", path.display(), e));
                 Some(ts)
             } else {
                 transcripts.last().cloned()
@@ -1777,7 +1780,9 @@ async fn handle_mcp(
 
             if params.name == "tools" {
                 let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = main_tx.send(MainEvent::ToolsQuery { reply: reply_tx });
+                let _ = main_tx.send(MainEvent::ToolCheck {
+                    event: Box::new(MainEvent::ToolsQuery { reply: reply_tx }),
+                });
                 return make_json_response(match reply_rx.await {
                     Ok(result) => jsonrpc_response(
                         id,
@@ -1814,13 +1819,15 @@ async fn handle_mcp(
 
             let call_id = uuid::Uuid::new_v4().to_string();
             let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = main_tx.send(MainEvent::ToolCall {
-                call_id,
-                slug: slug.to_string(),
-                transcript: ts.to_string(),
-                tool: f.clone(),
-                args: json!({ "who": who, "f": f, "args": args }),
-                reply: reply_tx,
+            let _ = main_tx.send(MainEvent::ToolCheck {
+                event: Box::new(MainEvent::ToolCall {
+                    call_id,
+                    slug: slug.to_string(),
+                    transcript: ts.to_string(),
+                    tool: f.clone(),
+                    args: json!({ "who": who, "f": f, "args": args }),
+                    reply: reply_tx,
+                }),
             });
 
             match reply_rx.await {
@@ -2107,6 +2114,12 @@ enum MainEvent {
     Disconnected {
         client_id: u64,
     },
+    ToolCheck {
+        event: Box<MainEvent>,
+    },
+    ToolsQuery {
+        reply: oneshot::Sender<String>,
+    },
     ToolCall {
         call_id: String,
         slug: String,
@@ -2135,9 +2148,6 @@ enum MainEvent {
     },
     ToolCallTimeout {
         call_id: String,
-    },
-    ToolsQuery {
-        reply: oneshot::Sender<String>,
     },
     WicketSpawnTimeout {
         host: String,
@@ -2217,6 +2227,7 @@ async fn main() {
         transcript: String,
         args: Value,
     }
+    let mut shutdown = false;
     let mut tool_claims: HashMap<String, ToolClaim> = HashMap::new();
     let mut tool_calls: HashMap<String, ToolClaim> = HashMap::new();
     let mut shell_claims: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2333,6 +2344,76 @@ async fn main() {
                             trace!("easement", "websocket", "reader_exited", "client_id": client_id);
                             let _ = main_tx.send(MainEvent::Disconnected { client_id });
                         });
+                    }
+                    MainEvent::ToolCheck { event } => {
+                        if shutdown {
+                            match *event {
+                                MainEvent::ToolCall { reply, .. } => {
+                                    let _ = reply.send(ToolResult {
+                                        output: "[meta] MCP tools and assistant harness shutting down, please end your turn".to_string(),
+                                        exit_code: 1,
+                                    });
+                                }
+                                MainEvent::ToolsQuery { reply } => {
+                                    let _ = reply.send("[meta] MCP tools and assistant harness shutting down, please end your turn".to_string());
+                                }
+                                _ => panic!("unexpected event in ToolCheck"),
+                            }
+                        } else {
+                            let _ = main_tx.send(*event);
+                        }
+                    }
+                    MainEvent::ToolsQuery { reply } => {
+                        let host = "localhost".to_string();
+                        match wickets.get_mut(&host) {
+                            Some(Wicket { state: WicketState::Connected { .. }, .. }) |
+                            Some(Wicket { state: WicketState::Disconnected, .. }) => {
+                                let tools: Vec<Value> = sockets.values()
+                                    .filter_map(|s| s.tools.as_ref())
+                                    .flat_map(|ts| ts.tools.iter().map(|t| {
+                                        json!({ "who": ts.who, "f": t.f, "description": t.description })
+                                    }))
+                                    .collect();
+                                let _ = reply.send(serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()));
+                            }
+                            Some(wicket @ Wicket { state: WicketState::Starting, .. }) => {
+                                wicket.stashed.push(MainEvent::ToolsQuery { reply });
+                            }
+                            None => {
+                                match spawn_wicket(&host) {
+                                    Ok(mut child) => {
+                                        trace!("easement", "wicket", "spawning", "where": host);
+                                        let main_tx = main_tx.clone();
+                                        let where_clone = host.clone();
+                                        tokio::spawn(async move {
+                                            let status = child.wait().await;
+                                            let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                                            let _ = main_tx.send(MainEvent::WicketExited {
+                                                host: where_clone, exit_code: code,
+                                            });
+                                        });
+                                        wickets.insert(host.clone(), Wicket {
+                                            state: WicketState::Starting,
+                                            stashed: vec![MainEvent::ToolsQuery { reply }],
+                                        });
+                                        let _ = timer_tx.send(Delayed {
+                                            ms: 10_000,
+                                            event: MainEvent::WicketSpawnTimeout { host },
+                                        });
+                                    }
+                                    Err(e) => {
+                                        trace!("easement", "wicket", "spawn_failed", "where": host, "error": e.to_string());
+                                        let tools: Vec<Value> = sockets.values()
+                                            .filter_map(|s| s.tools.as_ref())
+                                            .flat_map(|ts| ts.tools.iter().map(|t| {
+                                                json!({ "who": ts.who, "f": t.f, "description": t.description })
+                                            }))
+                                            .collect();
+                                        let _ = reply.send(serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()));
+                                    }
+                                }
+                            }
+                        }
                     }
                     MainEvent::ToolCall { call_id, slug, transcript, tool, args, reply } => {
                         let who = args.get("who").and_then(|v| v.as_str()).unwrap_or("");
@@ -2572,7 +2653,7 @@ async fn main() {
                                         let drained: Vec<MainEvent> = wicket.stashed.drain(..).collect();
                                         trace!("easement", "wicket", "connected_draining", "where": r#where, "stashed": drained.len());
                                         for event in drained {
-                                            let _ = main_tx.send(event);
+                                            let _ = main_tx.send(MainEvent::ToolCheck { event: Box::new(event) });
                                         }
                                     } else {
                                         wickets.insert(r#where.clone(), Wicket {
@@ -2601,12 +2682,7 @@ async fn main() {
                         trace!("easement", "wicket", "exited", "host": host, "exit_code": exit_code);
                         if let Some(wicket) = wickets.remove(&host) {
                             for event in wicket.stashed {
-                                if let MainEvent::ToolCallEnsured { reply, .. } = event {
-                                    let _ = reply.send(ToolResult {
-                                        output: format!("wicket on {} exited with code {}", host, exit_code),
-                                        exit_code: 1,
-                                    });
-                                }
+                                let _ = main_tx.send(MainEvent::ToolCheck { event: Box::new(event) });
                             }
                         }
                     }
@@ -2628,27 +2704,14 @@ async fn main() {
                             });
                         }
                     }
-                    MainEvent::ToolsQuery { reply } => {
-                        let tools: Vec<Value> = sockets.values()
-                            .filter_map(|s| s.tools.as_ref())
-                            .flat_map(|ts| ts.tools.iter().map(|t| {
-                                json!({ "who": ts.who, "f": t.f, "description": t.description })
-                            }))
-                            .collect();
-                        let _ = reply.send(serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()));
-                    }
                     MainEvent::WicketSpawnTimeout { host } => {
                         if let Some(wicket) = wickets.get_mut(&host) &&
                              matches!(wicket.state, WicketState::Starting) {
-                                trace!("easement", "wicket", "spawn_timeout", "host": host);
-                                let stashed: Vec<MainEvent> = wicket.stashed.drain(..).collect();
-                                for event in stashed {
-                                    if let MainEvent::ToolCallEnsured { reply, .. } = event {
-                                        let _ = reply.send(ToolResult {
-                                            output: format!("wicket on {} failed to connect within 10s", host),
-                                            exit_code: 1,
-                                        });
-                                    }
+                            trace!("easement", "wicket", "spawn_timeout", "host": host);
+                            wicket.state = WicketState::Disconnected;
+                            let stashed: Vec<MainEvent> = wicket.stashed.drain(..).collect();
+                            for event in stashed {
+                                let _ = main_tx.send(MainEvent::ToolCheck { event: Box::new(event) });
                             }
                         }
                     }
