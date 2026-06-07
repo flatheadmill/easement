@@ -1558,10 +1558,9 @@ async fn claudep(
                                         .unwrap_or_else(|e| panic!("cannot open transcript for append: {}", e)));
                                 }
                                 rewinding = false;
-                            } else {
-                                assert_eq!(chain_head, parent,
-                                    "chain break: entry {} parent {} does not follow head {}",
-                                    uuid, parent, chain_head);
+                            } else if chain_head != parent {
+                                trace!("easement", "transcript", "branch",
+                                    "uuid": uuid, "parent": parent, "head": chain_head);
                             }
                         }
 
