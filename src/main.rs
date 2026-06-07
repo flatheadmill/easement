@@ -736,6 +736,13 @@ enum Broadcast {
         transcript: String,
         text: String,
     },
+    ToolResult {
+        slug: String,
+        transcript: String,
+        call_id: String,
+        output: String,
+        exit_code: i32,
+    },
 }
 
 #[derive(Serialize)]
@@ -2545,6 +2552,13 @@ async fn main() {
                                     if let Some(win) = windows.get_mut(&key) {
                                         win.shebang_host = r#where.to_string();
                                     }
+                                    broadcast(&broadcast_tx, Broadcast::ToolResult {
+                                        slug: claim.slug.clone(),
+                                        transcript: claim.transcript.clone(),
+                                        call_id: call_id.clone(),
+                                        output: output.clone(),
+                                        exit_code,
+                                    });
                                     let _ = claim.reply.send(ToolResult { output, exit_code });
                                 } else {
                                     trace!("easement", "tool", "unknown_response", "client_id": client_id, "call_id": call_id);
