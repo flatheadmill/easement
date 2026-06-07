@@ -528,64 +528,7 @@ enum TranscriptLine {
 }
 
 
-struct RoundLog {
-    dir: PathBuf,
-}
 
-impl RoundLog {
-    fn begin(slug: &str) -> Self {
-        let home = env::var("HOME").unwrap_or_default();
-        let now = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
-        let pid = std::process::id();
-        let dir = Path::new(&home)
-            .join(".local/state/easement")
-            .join(slug)
-            .join("rounds")
-            .join(format!("{}-{}", now, pid));
-        let _ = std::fs::create_dir_all(&dir);
-        log!("easement", "round", "started", "dir": dir.display().to_string());
-        Self { dir }
-    }
-
-    fn log_sent(&self, entries: &[Value]) {
-        let path = self.dir.join("sent.jsonl");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&path)
-        {
-            for entry in entries {
-                if let Ok(mut line) = serde_json::to_string(entry) {
-                    line.push('\n');
-                    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-                }
-            }
-        }
-    }
-
-    fn log_stdout(&self, raw_line: &str) {
-        let path = self.dir.join("stdout.jsonl");
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let entry = json!({ "ts": now, "line": raw_line });
-        if let Ok(mut line) = serde_json::to_string(&entry) {
-            line.push('\n');
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-            }
-        }
-    }
-
-    fn copy_transcript(&self, cli_transcript: &Path) {
-        let dest = self.dir.join("transcript.jsonl");
-        if let Err(e) = std::fs::copy(cli_transcript, &dest) {
-            log!("easement", "round", "copy_failed", "error": e.to_string());
-        }
-    }
-}
 
 
 fn find_transcript_file(session_id: &str) -> Option<PathBuf> {
@@ -645,7 +588,6 @@ struct ClaudePrint {
     stdin: Option<tokio::process::ChildStdin>,
     stdout_rx: mpsc::Receiver<StdoutLine>,
     turn_id: Option<String>,
-    round_log: Arc<RoundLog>,
 }
 
 async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
@@ -1069,15 +1011,12 @@ async fn claudep(
         }
     }
 
-    let round_log = Arc::new(RoundLog::begin(slug));
-
     let resume_arg: Option<String> = if let Some(ref uuid) = session_uuid {
         assert!(
             !entries.is_empty(),
             "session uuid {} with no transcript entries",
             uuid
         );
-        round_log.log_sent(&entries);
         let cli_path = cli_transcript_path(slug, uuid);
         emplace_transcript(&cli_path, &entries)?;
         log!("easement", "claudep", "emplaced", "uuid": uuid, "path": cli_path.display().to_string(), "entries": entries.len());
@@ -1174,7 +1113,6 @@ async fn claudep(
     // Stdout reader. Parses JSON, sends the Value. Classification happens in
     // the claudep loop where the logic lives.
     let (stdout_tx, stdout_rx) = mpsc::channel::<StdoutLine>(256);
-    let round_log_clone = round_log.clone();
 
     tokio::spawn(async move {
         let mut reader = BufReader::new(child_stdout);
@@ -1192,7 +1130,6 @@ async fn claudep(
                     if trimmed.is_empty() {
                         continue;
                     }
-                    round_log_clone.log_stdout(trimmed);
                     match serde_json::from_str::<Value>(trimmed) {
                         Ok(data) => {
                             let _ = stdout_tx.send(StdoutLine::Json(data)).await;
@@ -1218,7 +1155,6 @@ async fn claudep(
         stdin: Some(child_stdin),
         stdout_rx,
         turn_id: None,
-        round_log,
     };
 
     // Transcript tailer channel. The tailer task is spawned once we know the session ID and can
