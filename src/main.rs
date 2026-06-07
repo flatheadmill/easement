@@ -168,7 +168,7 @@ enum StdoutEvent {
     },
     User {
         message: Value,
-        session_id: Option<String>,
+        session_id: String,
         #[serde(default)]
         #[serde(rename = "isReplay")]
         is_replay: bool,
@@ -929,6 +929,13 @@ async fn claudep(
                 .map(|s| s.to_string())
         })
         .collect();
+    let mut rewinding = !entries.is_empty();
+
+    let mut transcript_file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript_path)
+        .await
+        .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e));
 
     log!("easement", "claudep", "loaded", "slug": slug, "transcript": transcript, "entries": entries.len(), "session_uuid": session_uuid);
 
@@ -1252,27 +1259,13 @@ async fn claudep(
             Some(line) = cp.stdout_rx.recv() => {
                 match line {
                     StdoutLine::Json(data) => {
-                        if let Some(sid) = data.get("session_id").and_then(|v| v.as_str()) {
-                            match &session_id {
-                                None => {
-                                    log!("easement", "claudep", "session_id", "session_id": sid, "slug": slug, "transcript": transcript);
-                                    session_id = Some(sid.to_string());
-                                }
-                                Some(existing) => {
-                                    assert_eq!(existing, sid, "session id changed from {} to {}", existing, sid);
-                                }
-                            }
-                            if session_uuid.is_none() {
-                                if uuid::Uuid::parse_str(sid).is_ok() {
-                                    session_uuid = Some(sid.to_string());
-                                    log!("easement", "claudep", "session_uuid_emplacement", "session_uuid": sid);
-                                }
-                            }
-                            if !tailing {
+                        log!("easement", "claudep", "stdout", "data": data);
+
+                        if !tailing {
+                            if let Some(ref sid) = session_id {
                                 tailing = true;
                                 log!("easement", "claudep", "tailing", "session_id": sid, "slug": slug, "transcript": transcript);
 
-                                // Start the transcript tailer now that we know the file path.
                                 let cli_path = cli_transcript_path(slug, sid);
                                 let tx = transcript_tx.clone();
                                 let tailer_token = cancel.child_token();
@@ -1280,13 +1273,11 @@ async fn claudep(
                                     let mut mux = match linemux::MuxedLines::new() {
                                         Ok(m) => m,
                                         Err(e) => {
-                                            log!("easement", "claudep", "tailer_error", "error": e.to_string());
-                                            return;
+                                            panic!("cannot create tailer: {}", e);
                                         }
                                     };
-                                    if let Err(e) = mux.add_file(&cli_path).await {
-                                        log!("easement", "claudep", "tailer_add_failed", "path": cli_path.display().to_string(), "error": e.to_string());
-                                        return;
+                                    if let Err(e) = mux.add_file_from_start(&cli_path).await {
+                                        panic!("cannot tail transcript at {}: {}", cli_path.display(), e);
                                     }
                                     loop {
                                         tokio::select! {
@@ -1302,8 +1293,7 @@ async fn claudep(
                                                     }
                                                     Ok(None) => break,
                                                     Err(e) => {
-                                                        log!("easement", "claudep", "tailer_error", "error": e.to_string());
-                                                        break;
+                                                        panic!("tailer read error: {}", e);
                                                     }
                                                 }
                                             }
@@ -1325,7 +1315,17 @@ async fn claudep(
                             }
                         } else if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                             match &event {
-                                StdoutEvent::User { is_replay: true, message, .. } => {
+                                StdoutEvent::User { is_replay: true, message, session_id: sid, .. } => {
+                                    match &session_id {
+                                        None => {
+                                            assert!(uuid::Uuid::parse_str(sid).is_ok(), "session_id is not a UUID: {}", sid);
+                                            log!("easement", "claudep", "session_id", "session_id": sid, "slug": slug, "transcript": transcript);
+                                            session_id = Some(sid.clone());
+                                        }
+                                        Some(existing) => {
+                                            assert_eq!(existing.as_str(), sid.as_str(), "session id changed from {} to {}", existing, sid);
+                                        }
+                                    }
                                     replayed += 1;
                                     let is_steer_ack = replayed > 1;
                                     let text = message
@@ -1471,19 +1471,63 @@ async fn claudep(
             Some(line) = transcript_rx.recv() => {
                 match line {
                     TranscriptLine::Entry(data) => {
-                        let uuid = data.get("uuid").and_then(|v| v.as_str());
-                        match uuid {
-                            Some(u) if seen_uuids.contains(u) => {
-                                // replay, skip
-                            }
-                            Some(u) => {
-                                seen_uuids.insert(u.to_string());
-                                entries.push(data);
-                            }
-                            None => {
-                                // no uuid, skip
+                        log!("easement", "claudep", "tailer_entry", "data": data);
+                        let uuid = match data.get("uuid").and_then(|v| v.as_str()) {
+                            Some(u) => u,
+                            None => continue,
+                        };
+                        if seen_uuids.contains(uuid) {
+                            continue;
+                        }
+                        if entries.is_empty() {
+                            log!("easement", "claudep", "transcript_root", "uuid": uuid);
+                        } else {
+                            let parent = data.get("parentUuid").and_then(|v| v.as_str());
+                            let chain_head = entries.iter().rev()
+                                .find_map(|e| e.get("uuid").and_then(|v| v.as_str()));
+
+                            if rewinding {
+                                if let Some(parent) = parent {
+                                    if chain_head != Some(parent) {
+                                        if seen_uuids.contains(parent) {
+                                            let cut = entries.iter().rposition(|e| {
+                                                e.get("uuid").and_then(|v| v.as_str()) == Some(parent)
+                                            }).expect("parent in seen_uuids but not in entries");
+                                            let removed: Vec<Value> = entries.drain(cut + 1..).collect();
+                                            log!("easement", "claudep", "rewind",
+                                                "parent": parent, "cut": removed.len(),
+                                                "slug": slug, "transcript": transcript);
+                                            for r in &removed {
+                                                if let Some(u) = r.get("uuid").and_then(|v| v.as_str()) {
+                                                    seen_uuids.remove(u);
+                                                }
+                                            }
+                                        } else {
+                                            panic!("transcript entry {} chains from unknown parent {}", uuid, parent);
+                                        }
+                                    }
+                                }
+                                rewinding = false;
+                            } else {
+                                if let Some(parent) = parent {
+                                    assert_eq!(chain_head, Some(parent),
+                                        "chain break: entry {} parent {} does not follow head {:?}",
+                                        uuid, parent, chain_head);
+                                }
                             }
                         }
+
+                        log!("easement", "claudep", "transcript_entry", "uuid": uuid);
+                        let entry_line = {
+                            let mut s = serde_json::to_string(&data)
+                                .expect("entry serialization cannot fail");
+                            s.push('\n');
+                            s
+                        };
+                        seen_uuids.insert(uuid.to_string());
+                        entries.push(data);
+                        transcript_file.write_all(entry_line.as_bytes()).await
+                            .expect("transcript write failed");
                     }
                 }
             }
