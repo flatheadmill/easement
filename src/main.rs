@@ -752,7 +752,7 @@ enum Dispatch {
 enum ToolDispatch {
     Run {
         call_id: String,
-        f: String,
+        #[serde(flatten)]
         args: Value,
     },
 }
@@ -875,6 +875,7 @@ async fn claudep(
     transcript: &str,
     mut claude_rx: mpsc::UnboundedReceiver<ClaudeEvent>,
     broadcast_tx: broadcast::Sender<String>,
+    main_tx: mpsc::UnboundedSender<MainEvent>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<ClaudePrint, String> {
     log!("easement", "claudep", "started", "slug": slug, "transcript": transcript);
@@ -1078,7 +1079,8 @@ async fn claudep(
     // The MCP config could be shared across all claudep instances for a slug -- the URL contains
     // the slug and transcript but the transcript could be resolved server-side. One file per slug
     // instead of one per round.
-    let mcp_config_path = std::env::temp_dir().join(format!("easement-mcp-{}.json", slug));
+    let mcp_config_dir = PathBuf::from(&home).join(".local/state/easement").join(slug);
+    let mcp_config_path = mcp_config_dir.join("mcp.json");
     let mcp_config = json!({
         "mcpServers": {
             "o": {
@@ -1229,9 +1231,10 @@ async fn claudep(
                             steer_queue.push_back(message);
                         }
                     }
-                    ClaudeEvent::FlushSteers { call_id: _ } => {
-                        // TODO: flush steer queue to stdin, send ToolSteered back
-                        log!("easement", "claudep", "flush_steers");
+                    ClaudeEvent::FlushSteers { call_id } => {
+                        log!("easement", "claudep", "flush_steers", "call_id": call_id, "queued": steer_queue.len());
+                        // TODO: flush steer queue to stdin before dispatching
+                        let _ = main_tx.send(MainEvent::ToolSteered { call_id });
                     }
                     ClaudeEvent::HistoryReplay { replay_id } => {
                         let last_uuid = entries.iter().rev()
@@ -1493,7 +1496,7 @@ async fn claudep(
             Some(line) = transcript_rx.recv() => {
                 match line {
                     TranscriptLine::Entry(data) => {
-                        log!("easement", "claudep", "tailer_entry", "data": data);
+                        log!("easement", "transcript", "line", "data": data);
                         let uuid = match data.get("uuid").and_then(|v| v.as_str()) {
                             Some(u) => u,
                             None => continue,
@@ -1502,7 +1505,7 @@ async fn claudep(
                             continue;
                         }
                         if entries.is_empty() {
-                            log!("easement", "claudep", "transcript_root", "uuid": uuid);
+                            log!("easement", "transcript", "root", "uuid": uuid);
                         } else {
                             let parent = data.get("parentUuid").and_then(|v| v.as_str());
                             let chain_head = entries.iter().rev()
@@ -1539,7 +1542,7 @@ async fn claudep(
                             }
                         }
 
-                        log!("easement", "claudep", "transcript_entry", "uuid": uuid);
+                        log!("easement", "transcript", "entry", "uuid": uuid);
                         let entry_line = {
                             let mut s = serde_json::to_string(&data)
                                 .expect("entry serialization cannot fail");
@@ -1615,6 +1618,7 @@ async fn handle_mcp(
     transcript: Option<&str>,
     main_tx: mpsc::UnboundedSender<MainEvent>,
 ) -> Response<Full<Bytes>> {
+    log!("easement", "mcp", "request", "slug": slug, "transcript": transcript, "method": req.method().to_string());
     if req.method() != hyper::Method::POST {
         return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -2127,6 +2131,7 @@ async fn main() {
         transcript: &str,
         token: &tokio_util::sync::CancellationToken,
         broadcast_tx: &broadcast::Sender<String>,
+        main_tx: &mpsc::UnboundedSender<MainEvent>,
     ) -> &'a mut Window {
         let key = (slug.to_string(), transcript.to_string());
 
@@ -2136,8 +2141,9 @@ async fn main() {
             let slug_owned = slug.to_string();
             let transcript_owned = transcript.to_string();
             let btx = broadcast_tx.clone();
+            let mtx = main_tx.clone();
             tokio::spawn(async move {
-                let _ = claudep(&slug_owned, &transcript_owned, claude_rx, btx, child_token).await;
+                let _ = claudep(&slug_owned, &transcript_owned, claude_rx, btx, mtx, child_token).await;
             });
             windows.insert(
                 key.clone(),
@@ -2151,11 +2157,11 @@ async fn main() {
         windows.get_mut(&key).expect("just inserted")
     }
 
-    let (_main_tx, mut main_rx) = mpsc::unbounded_channel::<MainEvent>();
+    let (main_tx, mut main_rx) = mpsc::unbounded_channel::<MainEvent>();
     let token = tokio_util::sync::CancellationToken::new();
 
     let (timer_tx, timer_rx) = mpsc::unbounded_channel::<Delayed>();
-    run_timer(timer_rx, _main_tx.clone());
+    run_timer(timer_rx, main_tx.clone());
 
     let mut next_client_id: u64 = 0;
 
@@ -2206,7 +2212,7 @@ async fn main() {
                 };
 
                 let io = TokioIo::new(stream);
-                let main_tx = _main_tx.clone();
+                let main_tx = main_tx.clone();
 
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
@@ -2264,7 +2270,7 @@ async fn main() {
                         });
 
                         // Reader task: WebSocket -> main_tx.
-                        let main_tx = _main_tx.clone();
+                        let main_tx = main_tx.clone();
                         tokio::spawn(async move {
                             while let Some(result) = stream.next().await {
                                 match result {
@@ -2293,7 +2299,7 @@ async fn main() {
                     MainEvent::ToolCall { call_id, slug, transcript, tool, args, reply } => {
                         let who = args.get("who").and_then(|v| v.as_str()).unwrap_or("");
                         if who != "wicket" {
-                            let _ = _main_tx.send(MainEvent::ToolCallEnsured {
+                            let _ = main_tx.send(MainEvent::ToolCallEnsured {
                                 call_id, slug, transcript, tool, args, reply,
                             });
                             continue;
@@ -2316,7 +2322,7 @@ async fn main() {
 
                         match wickets.get_mut(&r#where) {
                             Some(Wicket { state: WicketState::Connected { .. }, .. }) => {
-                                let _ = _main_tx.send(ensured);
+                                let _ = main_tx.send(ensured);
                             }
                             Some(wicket @ Wicket { state: WicketState::Starting, .. }) => {
                                 log!("easement", "tool", "stashed", "call_id": call_id, "where": r#where);
@@ -2334,7 +2340,7 @@ async fn main() {
                                 match spawn_wicket(&r#where) {
                                     Ok(mut child) => {
                                         log!("easement", "wicket", "spawning", "where": r#where);
-                                        let main_tx = _main_tx.clone();
+                                        let main_tx = main_tx.clone();
                                         let where_clone = r#where.clone();
                                         tokio::spawn(async move {
                                             let status = child.wait().await;
@@ -2368,12 +2374,13 @@ async fn main() {
                     MainEvent::ToolCallEnsured { call_id, slug, transcript, tool, args, reply } => {
                         log!("easement", "tool", "ensured", "call_id": call_id, "slug": slug, "tool": tool);
 
-                        let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx);
+                        let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
                         let _ = win.claude_tx.send(ClaudeEvent::FlushSteers { call_id: call_id.clone() });
 
                         tool_claims.insert(call_id, ToolClaim { reply, slug, transcript, args });
                     }
                     MainEvent::ToolSteered { call_id } => {
+                        log!("easement", "tool", "steered", "call_id": call_id);
                         let claim = match tool_claims.remove(&call_id) {
                             Some(c) => c,
                             None => {
@@ -2395,13 +2402,15 @@ async fn main() {
 
                         match socket_tx {
                             Some(tx) => {
+                                log!("easement", "tool", "dispatched", "call_id": call_id, "who": who, "f": f, "where": r#where);
+                                let mut flat_args = inner_args.as_object().cloned().unwrap_or_default();
+                                flat_args.insert("f".to_string(), json!(f));
                                 dispatch(tx, Dispatch::Tool {
                                     slug: claim.slug.clone(),
                                     transcript: claim.transcript.clone(),
                                     event: ToolDispatch::Run {
                                         call_id: call_id.clone(),
-                                        f: f.to_string(),
-                                        args: inner_args,
+                                        args: Value::Object(flat_args),
                                     },
                                 });
                                 tool_calls.insert(call_id.clone(), claim);
@@ -2457,18 +2466,18 @@ async fn main() {
                                 }
                             }
                             Ok(Packet::Turn(TurnPacket::Start { slug, transcript, turn_id, message, notification })) => {
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx);
+                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
                                 let _ = win.claude_tx.send(ClaudeEvent::Turn { turn_id, message, notification });
                             }
                             Ok(Packet::Turn(TurnPacket::Steer { slug, transcript, message, expected_turn_id })) => {
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx);
+                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
                                 let _ = win.claude_tx.send(ClaudeEvent::Steer { message, expected_turn_id });
                             }
                             Ok(Packet::History(HistoryPacket::Replay { slug, transcript, replay_id })) => {
                                 match resolve_transcript(&slug, &transcript).await {
                                     Some(resolved) => {
                                         log!("easement", "history", "replay", "slug": slug, "transcript": resolved, "replay_id": replay_id);
-                                        let win = window_for(&mut windows, &slug, &resolved, &token, &broadcast_tx);
+                                        let win = window_for(&mut windows, &slug, &resolved, &token, &broadcast_tx, &main_tx);
                                         let _ = win.claude_tx.send(ClaudeEvent::HistoryReplay { replay_id });
                                     }
                                     None => {
@@ -2477,7 +2486,7 @@ async fn main() {
                                 }
                             }
                             Ok(Packet::Shell(ShellPacket::Run { slug, transcript, command })) => {
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx);
+                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
                                 let r#where = win.shebang_host.clone();
                                 let shell_id = uuid::Uuid::new_v4().to_string();
                                 let socket_tx = sockets.values()
@@ -2525,7 +2534,7 @@ async fn main() {
                                         let drained: Vec<MainEvent> = wicket.stashed.drain(..).collect();
                                         log!("easement", "wicket", "connected_draining", "where": r#where, "stashed": drained.len());
                                         for event in drained {
-                                            let _ = _main_tx.send(event);
+                                            let _ = main_tx.send(event);
                                         }
                                     } else {
                                         wickets.insert(r#where.clone(), Wicket {
