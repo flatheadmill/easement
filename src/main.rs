@@ -1229,6 +1229,8 @@ async fn claudep(
     let mut active_turn_id: Option<String> = None;
     let mut sent: u64 = 0;
     let mut replayed: u64 = 0;
+    let mut saw_terminal_result = false;
+    let mut replayed_user_since_result = false;
     let mut rewinding = !entries.is_empty();
     let mut transcript_file: Option<tokio::fs::File> = if entries.is_empty() {
         Some(
@@ -1408,6 +1410,7 @@ async fn claudep(
                                         }
                                     }
                                     replayed += 1;
+                                    replayed_user_since_result = true;
                                     let is_steer_ack = replayed > 1;
                                     let text = message
                                         .get("content")
@@ -1481,6 +1484,21 @@ async fn claudep(
                                             });
                                         }
                                     }
+
+                                    if saw_terminal_result
+                                        && !replayed_user_since_result
+                                        && active_turn_id.is_some()
+                                    {
+                                        if sent == replayed + 1 {
+                                            replayed += 1;
+                                            trace!("easement", "claudep", "replay_inferred_from_tape", "sent": sent, "replayed": replayed, "turn_id": active_turn_id);
+                                        } else {
+                                            trace!("easement", "claudep", "replay_gap_not_inferred", "sent": sent, "replayed": replayed, "turn_id": active_turn_id);
+                                        }
+                                    }
+
+                                    saw_terminal_result = true;
+                                    replayed_user_since_result = false;
 
                                     if sent == replayed {
                                         if !steer_queue.is_empty() {
