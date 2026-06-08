@@ -458,6 +458,21 @@ struct NormalizedEntry {
     what: &'static str,
     blocks: Vec<NormalizedBlock>,
     uuid: String,
+    notification: bool,
+}
+
+fn split_user_message_meta(text: &str) -> (&str, bool) {
+    match text.split_once('\x07') {
+        Some((visible, _meta)) => (visible, true),
+        None => (text, false),
+    }
+}
+
+fn join_user_message_meta(message: String, meta: Option<String>) -> String {
+    match meta {
+        Some(meta) if !meta.is_empty() => format!("{}\x07 {}", message, meta),
+        _ => message,
+    }
 }
 
 fn normalize(entry: Entry) -> Option<NormalizedEntry> {
@@ -469,11 +484,16 @@ fn normalize(entry: Entry) -> Option<NormalizedEntry> {
 }
 
 fn normalize_user(entry: UserEntry) -> Option<NormalizedEntry> {
+    let mut notification = false;
     let blocks = match entry.message.content {
-        UserContent::Text(text) => vec![NormalizedBlock {
-            r#type: "text".to_string(),
-            fields: json!({ "text": text }),
-        }],
+        UserContent::Text(text) => {
+            let (visible, is_notification) = split_user_message_meta(&text);
+            notification |= is_notification;
+            vec![NormalizedBlock {
+                r#type: "text".to_string(),
+                fields: json!({ "text": visible }),
+            }]
+        }
         UserContent::Blocks(content_blocks) => {
             let mut blocks = Vec::new();
             for block in content_blocks {
@@ -500,9 +520,11 @@ fn normalize_user(entry: UserEntry) -> Option<NormalizedEntry> {
                         });
                     }
                     UserContentBlock::Text(TextBlock { text }) => {
+                        let (visible, is_notification) = split_user_message_meta(&text);
+                        notification |= is_notification;
                         blocks.push(NormalizedBlock {
                             r#type: "text".to_string(),
-                            fields: json!({ "text": text }),
+                            fields: json!({ "text": visible }),
                         });
                     }
                     UserContentBlock::Unknown => {}
@@ -521,6 +543,7 @@ fn normalize_user(entry: UserEntry) -> Option<NormalizedEntry> {
         what: "message",
         blocks,
         uuid: entry.uuid,
+        notification,
     })
 }
 
@@ -560,6 +583,7 @@ fn normalize_assistant(entry: AssistantEntry) -> Option<NormalizedEntry> {
         what: "message",
         blocks,
         uuid: entry.uuid,
+        notification: false,
     })
 }
 
@@ -734,6 +758,7 @@ enum Broadcast {
         slug: String,
         transcript: String,
         text: String,
+        notification: bool,
     },
     ToolResult {
         slug: String,
@@ -1198,7 +1223,7 @@ async fn claudep(
     let mut session_id: Option<String> = None;
     let mut tailing = false;
     let mut last_usage: Option<Value> = None;
-    let mut turn_queue: std::collections::VecDeque<(String, String, bool)> =
+    let mut turn_queue: std::collections::VecDeque<(String, String)> =
         std::collections::VecDeque::new();
     let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut active_turn_id: Option<String> = None;
@@ -1227,12 +1252,9 @@ async fn claudep(
         tokio::select! {
             Some(event) = claude_rx.recv() => {
                 match event {
-                    ClaudeEvent::Turn { turn_id, message, notification } => {
-                        let text = if notification {
-                            format!("\x07**notification**: {}", message)
-                        } else {
-                            message
-                        };
+                    ClaudeEvent::Turn { turn_id, message } => {
+                        let text = message;
+                        let (visible, notification) = split_user_message_meta(&text);
                         if active_turn_id.is_none() {
                             active_turn_id = Some(turn_id.clone());
                             trace!("easement", "claudep", "turn_started", "turn_id": turn_id);
@@ -1242,6 +1264,14 @@ async fn claudep(
                             });
                         } else {
                             trace!("easement", "claudep", "turn_written_while_active", "turn_id": turn_id, "message": text);
+                        }
+                        if notification {
+                            broadcast(&broadcast_tx, Broadcast::UserMessage {
+                                slug: slug.to_string(),
+                                transcript: transcript.to_string(),
+                                text: visible.to_string(),
+                                notification,
+                            });
                         }
                         let msg = format_user_message(&text);
                         if let Some(ref mut stdin) = child_stdin {
@@ -1391,9 +1421,11 @@ async fn claudep(
                                             let trimmed = part.trim();
                                             if !trimmed.is_empty() {
                                                 trace!("easement", "claudep", "steer_broadcast", "text": trimmed);
+                                                let (visible, notification) = split_user_message_meta(trimmed);
                                                 broadcast(&broadcast_tx, Broadcast::UserMessage {
                                                     slug: slug.to_string(), transcript: transcript.to_string(),
-                                                    text: trimmed.to_string(),
+                                                    text: visible.to_string(),
+                                                    notification,
                                                 });
                                             }
                                         }
@@ -1485,18 +1517,22 @@ async fn claudep(
                                         trace!("easement", "claudep", "trun_completed", "turn_id": completed_turn_id);
 
                                         // Dispatch next queued turn if any.
-                                        if let Some((next_turn_id, next_message, next_notification)) = turn_queue.pop_front() {
-                                            let text = if next_notification {
-                                                format!("\x07**notification**: {}", next_message)
-                                            } else {
-                                                next_message
-                                            };
+                                        if let Some((next_turn_id, text)) = turn_queue.pop_front() {
+                                            let (visible, notification) = split_user_message_meta(&text);
                                             active_turn_id = Some(next_turn_id.clone());
                                             trace!("easement", "claudep", "turn_started", "turn_id": next_turn_id, "from_queue": true);
                                             broadcast(&broadcast_tx, Broadcast::Turn {
                                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                                 event: TurnBroadcast::Started { turn_id: next_turn_id },
                                             });
+                                            if notification {
+                                                broadcast(&broadcast_tx, Broadcast::UserMessage {
+                                                    slug: slug.to_string(),
+                                                    transcript: transcript.to_string(),
+                                                    text: visible.to_string(),
+                                                    notification,
+                                                });
+                                            }
                                             let msg = format_user_message(&text);
                                             if let Some(ref mut stdin) = child_stdin {
                                                 let _ = stdin.write_all(msg.as_bytes()).await;
@@ -2006,7 +2042,6 @@ enum ClaudeEvent {
     Turn {
         turn_id: String,
         message: String,
-        notification: bool,
     },
     Steer {
         message: String,
@@ -2084,6 +2119,18 @@ enum ToolPacket {
         output: String,
         #[serde(default)]
         exit_code: i32,
+    },
+    BackgroundOutput {
+        job_id: String,
+        output_path: String,
+        line: String,
+    },
+    Notification {
+        slug: String,
+        transcript: String,
+        message: String,
+        #[serde(default)]
+        meta: Option<String>,
     },
 }
 
@@ -2605,9 +2652,31 @@ async fn main() {
                                     trace!("easement", "tool", "unknown_response", "client_id": client_id, "call_id": call_id);
                                 }
                             }
+                            Ok(Packet::Tool(ToolPacket::BackgroundOutput { job_id, output_path, line })) => {
+                                trace!("easement", "tool", "background_output", "client_id": client_id, "job_id": job_id, "output_path": output_path, "line": line);
+                            }
+                            Ok(Packet::Tool(ToolPacket::Notification {
+                                slug,
+                                transcript,
+                                message,
+                                meta,
+                            })) => {
+                                trace!("easement", "tool", "notification", "client_id": client_id, "message": message, "has_meta": meta.is_some());
+                                let text = join_user_message_meta(message, meta);
+                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
+                                let _ = win.claude_tx.send(ClaudeEvent::Turn {
+                                    turn_id: uuid::Uuid::new_v4().to_string(),
+                                    message: text,
+                                });
+                            }
                             Ok(Packet::Turn(TurnPacket::Start { slug, transcript, turn_id, message, notification })) => {
                                 let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
-                                let _ = win.claude_tx.send(ClaudeEvent::Turn { turn_id, message, notification });
+                                let message = if notification && !message.contains('\x07') {
+                                    format!("{}\x07", message)
+                                } else {
+                                    message
+                                };
+                                let _ = win.claude_tx.send(ClaudeEvent::Turn { turn_id, message });
                             }
                             Ok(Packet::Turn(TurnPacket::Steer { slug, transcript, message, expected_turn_id })) => {
                                 let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
