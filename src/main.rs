@@ -739,9 +739,10 @@ enum Broadcast {
     ToolResult {
         slug: String,
         transcript: String,
-        call_id: String,
+        tool_use_id: String,
         output: String,
-        exit_code: i32,
+        #[serde(default)]
+        is_error: bool,
     },
 }
 
@@ -954,10 +955,8 @@ async fn claudep(
         if let Some(u) = uuid {
             if let (Some(p), Some(prev)) = (parent, prev_uuid.as_deref()) {
                 if p != prev {
-                    panic!(
-                        "transcript chain broken: entry {} parentUuid {} does not follow {}",
-                        u, p, prev
-                    );
+                    trace!("easement", "transcript", "branch",
+                        "uuid": u, "parent": p, "head": prev);
                 }
             }
             prev_uuid = Some(u.to_string());
@@ -1376,6 +1375,36 @@ async fn claudep(
                                                 broadcast(&broadcast_tx, Broadcast::UserMessage {
                                                     slug: slug.to_string(), transcript: transcript.to_string(),
                                                     text: trimmed.to_string(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                StdoutEvent::User { is_replay: false, message, .. } => {
+                                    if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
+                                        for block in content {
+                                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                                                let tool_use_id = block.get("tool_use_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .expect("tool_result missing tool_use_id")
+                                                    .to_string();
+                                                let is_error = block.get("is_error")
+                                                    .and_then(|v| v.as_bool())
+                                                    .unwrap_or(false);
+                                                let output = match block.get("content") {
+                                                    Some(Value::String(s)) => s.clone(),
+                                                    Some(Value::Array(parts)) => parts.iter()
+                                                        .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                                                        .collect::<Vec<_>>()
+                                                        .join("\n"),
+                                                    _ => String::new(),
+                                                };
+                                                broadcast(&broadcast_tx, Broadcast::ToolResult {
+                                                    slug: slug.to_string(),
+                                                    transcript: transcript.to_string(),
+                                                    tool_use_id,
+                                                    output,
+                                                    is_error,
                                                 });
                                             }
                                         }
@@ -2551,13 +2580,6 @@ async fn main() {
                                     if let Some(win) = windows.get_mut(&key) {
                                         win.shebang_host = r#where.to_string();
                                     }
-                                    broadcast(&broadcast_tx, Broadcast::ToolResult {
-                                        slug: claim.slug.clone(),
-                                        transcript: claim.transcript.clone(),
-                                        call_id: call_id.clone(),
-                                        output: output.clone(),
-                                        exit_code,
-                                    });
                                     let _ = claim.reply.send(ToolResult { output, exit_code });
                                 } else {
                                     trace!("easement", "tool", "unknown_response", "client_id": client_id, "call_id": call_id);
