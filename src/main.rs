@@ -478,12 +478,18 @@ fn normalize_user(entry: UserEntry) -> Option<NormalizedEntry> {
             let mut blocks = Vec::new();
             for block in content_blocks {
                 match block {
-                    UserContentBlock::ToolResult(ToolResultBlock { content, is_error, .. }) => {
+                    UserContentBlock::ToolResult(ToolResultBlock {
+                        content, is_error, ..
+                    }) => {
                         let text = match content {
                             Some(ToolResultContent::Text(s)) => s,
                             Some(ToolResultContent::Blocks(parts)) => parts
                                 .iter()
-                                .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                .filter_map(|b| {
+                                    b.get("text")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                })
                                 .collect::<Vec<_>>()
                                 .join("\n"),
                             None => String::new(),
@@ -557,7 +563,6 @@ fn normalize_assistant(entry: AssistantEntry) -> Option<NormalizedEntry> {
     })
 }
 
-
 #[derive(Debug, Serialize)]
 struct StdinUserMessage {
     r#type: &'static str,
@@ -585,7 +590,6 @@ fn format_user_message(content: &str) -> String {
     s
 }
 
-
 enum StdoutLine {
     Json(Value),
     Eof,
@@ -594,10 +598,6 @@ enum StdoutLine {
 enum TranscriptLine {
     Entry(Value),
 }
-
-
-
-
 
 fn find_transcript_file(session_id: &str) -> Option<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
@@ -614,7 +614,6 @@ fn find_transcript_file(session_id: &str) -> Option<PathBuf> {
     }
     None
 }
-
 
 fn cli_transcript_path(slug: &str, session_uuid: &str) -> PathBuf {
     let home = env::var("HOME").unwrap_or_default();
@@ -650,14 +649,13 @@ fn extract_session_uuid(entries: &[Value]) -> Option<String> {
     })
 }
 
-
-
 async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
     let home = env::var("HOME").unwrap_or_default();
     let dir = PathBuf::from(&home)
         .join(".local/state/easement")
         .join(slug);
-    tokio::fs::create_dir_all(&dir).await
+    tokio::fs::create_dir_all(&dir)
+        .await
         .unwrap_or_else(|e| panic!("cannot create transcript dir {}: {}", dir.display(), e));
     let ts_pattern = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.jsonl$").ok()?;
     let mut transcripts: Vec<String> = Vec::new();
@@ -674,7 +672,8 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
         "new" => {
             let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
             let path = dir.join(format!("{}.jsonl", ts));
-            tokio::fs::File::create(&path).await
+            tokio::fs::File::create(&path)
+                .await
                 .unwrap_or_else(|e| panic!("cannot create transcript {}: {}", path.display(), e));
             Some(ts)
         }
@@ -689,8 +688,9 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
             if transcripts.is_empty() {
                 let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
                 let path = dir.join(format!("{}.jsonl", ts));
-                tokio::fs::File::create(&path).await
-                    .unwrap_or_else(|e| panic!("cannot create transcript {}: {}", path.display(), e));
+                tokio::fs::File::create(&path).await.unwrap_or_else(|e| {
+                    panic!("cannot create transcript {}: {}", path.display(), e)
+                });
                 Some(ts)
             } else {
                 transcripts.last().cloned()
@@ -703,7 +703,6 @@ struct ToolResult {
     output: String,
     exit_code: i32,
 }
-
 
 #[derive(Serialize)]
 #[serde(tag = "what", rename_all = "snake_case")]
@@ -846,7 +845,6 @@ const DISALLOWED_TOOLS: &[&str] = &[
     "ShareOnboardingGuide",
 ];
 
-
 #[derive(Debug, serde::Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -925,7 +923,13 @@ async fn claudep(
         .join(format!("{}.jsonl", transcript));
     let content = tokio::fs::read_to_string(&transcript_path)
         .await
-        .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "transcript does not exist at {}: {}",
+                transcript_path.display(),
+                e
+            )
+        });
 
     let mut entries: Vec<Value> = Vec::new();
     for line in content.lines() {
@@ -992,8 +996,9 @@ async fn claudep(
         if locked {
             async {
                 let mut config: Value = match tokio::fs::read_to_string(&config_path).await {
-                    Ok(content) => serde_json::from_str(&content)
-                        .unwrap_or_else(|e| panic!("cannot parse {}: {}", config_path.display(), e)),
+                    Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+                        panic!("cannot parse {}: {}", config_path.display(), e)
+                    }),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         Value::Object(serde_json::Map::new())
                     }
@@ -1025,7 +1030,9 @@ async fn claudep(
                     let content = serde_json::to_string_pretty(&config).expect("unreachable");
                     tokio::fs::write(&config_path, &content)
                         .await
-                        .unwrap_or_else(|e| panic!("cannot write {}: {}", config_path.display(), e));
+                        .unwrap_or_else(|e| {
+                            panic!("cannot write {}: {}", config_path.display(), e)
+                        });
 
                     #[cfg(unix)]
                     {
@@ -1039,7 +1046,8 @@ async fn claudep(
 
                     trace!("easement", "claudep", "trust_injected");
                 }
-            }.await;
+            }
+            .await;
 
             let _ = tokio::fs::remove_dir(&lock_path).await;
         } else {
@@ -1096,7 +1104,9 @@ async fn claudep(
     // The MCP config could be shared across all claudep instances for a slug -- the URL contains
     // the slug and transcript but the transcript could be resolved server-side. One file per slug
     // instead of one per round.
-    let mcp_config_dir = PathBuf::from(&home).join(".local/state/easement").join(slug);
+    let mcp_config_dir = PathBuf::from(&home)
+        .join(".local/state/easement")
+        .join(slug);
     let mcp_config_path = mcp_config_dir.join("mcp.json");
     let mcp_config = json!({
         "mcpServers": {
@@ -1106,7 +1116,8 @@ async fn claudep(
             }
         }
     });
-    tokio::fs::write(&mcp_config_path, mcp_config.to_string()).await
+    tokio::fs::write(&mcp_config_path, mcp_config.to_string())
+        .await
         .unwrap_or_else(|e| panic!("cannot write mcp config: {}", e));
     cmd.arg("--mcp-config").arg(&mcp_config_path);
 
@@ -1187,18 +1198,27 @@ async fn claudep(
     let mut session_id: Option<String> = None;
     let mut tailing = false;
     let mut last_usage: Option<Value> = None;
-    let mut turn_queue: std::collections::VecDeque<(String, String, bool)> = std::collections::VecDeque::new();
+    let mut turn_queue: std::collections::VecDeque<(String, String, bool)> =
+        std::collections::VecDeque::new();
     let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut active_turn_id: Option<String> = None;
     let mut sent: u64 = 0;
     let mut replayed: u64 = 0;
     let mut rewinding = !entries.is_empty();
     let mut transcript_file: Option<tokio::fs::File> = if entries.is_empty() {
-        Some(tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&transcript_path)
-            .await
-            .unwrap_or_else(|e| panic!("transcript does not exist at {}: {}", transcript_path.display(), e)))
+        Some(
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript_path)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "transcript does not exist at {}: {}",
+                        transcript_path.display(),
+                        e
+                    )
+                }),
+        )
     } else {
         None
     };
@@ -1623,7 +1643,6 @@ fn easement_port() -> u16 {
         .unwrap_or(6502)
 }
 
-
 fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
     let port = easement_port();
     let is_orb = host.contains("orb");
@@ -1653,7 +1672,6 @@ fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
     cmd.spawn()
         .map_err(|e| format!("failed to spawn wicket on {}: {}", host, e))
 }
-
 
 #[derive(Debug, serde::Deserialize)]
 struct ToolCallParams {
@@ -1865,7 +1883,6 @@ async fn handle_mcp(
     make_json_response(response)
 }
 
-
 async fn handle_request(
     mut req: Request<Incoming>,
     main_tx: mpsc::UnboundedSender<MainEvent>,
@@ -1920,7 +1937,6 @@ async fn handle_request(
             .unwrap())
     }
 }
-
 
 struct Delayed {
     ms: u64,
@@ -1986,7 +2002,6 @@ fn run_timer(
     });
 }
 
-
 enum ClaudeEvent {
     Turn {
         turn_id: String,
@@ -2004,7 +2019,6 @@ enum ClaudeEvent {
         replay_id: String,
     },
 }
-
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Tool {
@@ -2154,7 +2168,6 @@ enum MainEvent {
     },
 }
 
-
 #[tokio::main]
 async fn main() {
     init_log();
@@ -2191,7 +2204,15 @@ async fn main() {
             let btx = broadcast_tx.clone();
             let mtx = main_tx.clone();
             tokio::spawn(async move {
-                claudep(&slug_owned, &transcript_owned, claude_rx, btx, mtx, child_token).await;
+                claudep(
+                    &slug_owned,
+                    &transcript_owned,
+                    claude_rx,
+                    btx,
+                    mtx,
+                    child_token,
+                )
+                .await;
             });
             windows.insert(
                 key.clone(),
