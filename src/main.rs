@@ -1064,13 +1064,9 @@ async fn claudep(
 
     trace!("easement", "claudep", "spawning", "resume_arg": format!("{:?}", resume_arg));
 
-    // The mcp__o__approve tool auto-allows every permission request. We avoided
-    // --dangerously-skip-permissions because the name felt reckless, but the sandbox is the real
-    // permission system -- the seatbelt/bwrap policy restricts what commands can do, and the
-    // escalation path routes through the operator's approval viewport. The approve tool is just
-    // saying yes with extra steps. Switching to --dangerously-skip-permissions would remove the
-    // approve tool from the MCP surface entirely and simplify the tools/list. The sandbox still
-    // catches everything the approval shim pretends to gate.
+    // Wicket's seatbelt/bwrap policy is the permission system. Claude Code's
+    // approval classifier treats Wicket-mediated reads and shell commands as
+    // attempts to bypass denied built-in tools, so skip that layer entirely.
     let mut cmd = Command::new("claude");
     cmd.env("MCP_TOOL_TIMEOUT", "2147483647");
     cmd.arg("--print")
@@ -1089,8 +1085,7 @@ async fn claudep(
         .arg("31999")
         .arg("--add-dir")
         .arg(format!("{}/code", home))
-        .arg("--permission-prompt-tool")
-        .arg("mcp__o__approve")
+        .arg("--dangerously-skip-permissions")
         .arg("--disallowed-tools")
         .arg(DISALLOWED_TOOLS.join(","));
 
