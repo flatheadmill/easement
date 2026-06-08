@@ -641,6 +641,17 @@ fn format_user_content_message(content: Value) -> String {
     s
 }
 
+fn format_interrupt_message() -> String {
+    let msg = json!({
+        "type": "control_request",
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "request": { "subtype": "interrupt" },
+    });
+    let mut s = serde_json::to_string(&msg).expect("ControlRequest serialization cannot fail");
+    s.push('\n');
+    s
+}
+
 enum StdoutLine {
     Json(Value),
     Eof,
@@ -1341,6 +1352,18 @@ async fn claudep(
                             sent += 1;
                         }
                     }
+                    ClaudeEvent::Interrupt { turn_id } => {
+                        if turn_id.as_deref().is_some() && turn_id.as_deref() != active_turn_id.as_deref() {
+                            trace!("easement", "claudep", "interrupt_turn_mismatch", "expected": turn_id, "active": active_turn_id);
+                        } else {
+                            trace!("easement", "claudep", "interrupt_written", "turn_id": turn_id, "active": active_turn_id);
+                        }
+                        let msg = format_interrupt_message();
+                        if let Some(ref mut stdin) = child_stdin {
+                            let _ = stdin.write_all(msg.as_bytes()).await;
+                            let _ = stdin.flush().await;
+                        }
+                    }
                     ClaudeEvent::FlushSteers { call_id } => {
                         trace!("easement", "claudep", "flush_steers", "call_id": call_id, "queued": steer_queue.len());
                         // TODO: flush steer queue to stdin before dispatching
@@ -1743,6 +1766,27 @@ fn easement_port() -> u16 {
         .unwrap_or(6502)
 }
 
+struct GcpInternalHost {
+    instance: String,
+    zone: String,
+    project: String,
+}
+
+fn parse_gcp_internal_host(host: &str) -> Option<GcpInternalHost> {
+    let without_suffix = host.strip_suffix(".internal")?;
+    let (before_c, project) = without_suffix.rsplit_once(".c.")?;
+    let (instance, zone) = before_c.split_once('.')?;
+    if instance.is_empty() || zone.is_empty() || project.is_empty() {
+        return None;
+    }
+
+    Some(GcpInternalHost {
+        instance: instance.to_string(),
+        zone: zone.to_string(),
+        project: project.to_string(),
+    })
+}
+
 fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
     let port = easement_port();
     let is_orb = host.contains("orb");
@@ -1753,10 +1797,35 @@ fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
     };
 
     let mut cmd = if host == "localhost" {
+        trace!("easement", "wicket", "spawn_branch", "host": host, "branch": "local");
         let mut c = tokio::process::Command::new("wicket");
         c.arg(&wicket_url).arg(host);
         c
+    } else if let Some(gcp) = parse_gcp_internal_host(host) {
+        trace!(
+            "easement",
+            "wicket",
+            "spawn_branch",
+            "host": host,
+            "branch": "gcp",
+            "instance": gcp.instance,
+            "zone": gcp.zone,
+            "project": gcp.project
+        );
+        let mut c = tokio::process::Command::new("gcloud");
+        c.arg("compute")
+            .arg("ssh")
+            .arg(&gcp.instance)
+            .arg(format!("--project={}", gcp.project))
+            .arg(format!("--zone={}", gcp.zone))
+            .arg(format!("--ssh-flag=-R {}:localhost:{}", port, port))
+            .arg(format!(
+                "--command=PATH=\"$HOME/.local/bin:$PATH\" exec wicket {} {}",
+                wicket_url, host
+            ));
+        c
     } else {
+        trace!("easement", "wicket", "spawn_branch", "host": host, "branch": "ssh");
         let mut c = tokio::process::Command::new("ssh");
         if !is_orb {
             c.arg("-R").arg(format!("{}:localhost:{}", port, port));
@@ -2138,6 +2207,9 @@ enum ClaudeEvent {
         message: String,
         expected_turn_id: String,
     },
+    Interrupt {
+        turn_id: Option<String>,
+    },
     FlushSteers {
         call_id: String,
     },
@@ -2241,6 +2313,12 @@ enum TurnPacket {
         transcript: String,
         message: String,
         expected_turn_id: String,
+    },
+    Interrupt {
+        slug: String,
+        transcript: String,
+        #[serde(default)]
+        turn_id: Option<String>,
     },
 }
 
@@ -2779,6 +2857,10 @@ async fn main() {
                             Ok(Packet::Turn(TurnPacket::Steer { slug, transcript, message, expected_turn_id })) => {
                                 let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
                                 let _ = win.claude_tx.send(ClaudeEvent::Steer { message, expected_turn_id });
+                            }
+                            Ok(Packet::Turn(TurnPacket::Interrupt { slug, transcript, turn_id })) => {
+                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
+                                let _ = win.claude_tx.send(ClaudeEvent::Interrupt { turn_id });
                             }
                             Ok(Packet::History(HistoryPacket::Replay { slug, transcript, replay_id })) => {
                                 match resolve_transcript(&slug, &transcript).await {
