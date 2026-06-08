@@ -1213,35 +1213,39 @@ async fn claudep(
             Some(event) = claude_rx.recv() => {
                 match event {
                     ClaudeEvent::Turn { turn_id, message, notification } => {
-                        if active_turn_id.is_some() {
-                            trace!("easement", "claudep", "turn_queued", "turn_id": turn_id, "message": message);
-                            turn_queue.push_back((turn_id, message, notification));
+                        let text = if notification {
+                            format!("\x07**notification**: {}", message)
                         } else {
-                            let text = if notification {
-                                format!("\x07**notification**: {}", message)
-                            } else {
-                                message
-                            };
+                            message
+                        };
+                        if active_turn_id.is_none() {
                             active_turn_id = Some(turn_id.clone());
                             trace!("easement", "claudep", "turn_started", "turn_id": turn_id);
                             broadcast(&broadcast_tx, Broadcast::Turn {
                                 slug: slug.to_string(), transcript: transcript.to_string(),
                                 event: TurnBroadcast::Started { turn_id },
                             });
-                            let msg = format_user_message(&text);
-                            if let Some(ref mut stdin) = child_stdin {
-                                let _ = stdin.write_all(msg.as_bytes()).await;
-                                let _ = stdin.flush().await;
-                                sent += 1;
-                            }
+                        } else {
+                            trace!("easement", "claudep", "turn_written_while_active", "turn_id": turn_id, "message": text);
+                        }
+                        let msg = format_user_message(&text);
+                        if let Some(ref mut stdin) = child_stdin {
+                            let _ = stdin.write_all(msg.as_bytes()).await;
+                            let _ = stdin.flush().await;
+                            sent += 1;
                         }
                     }
                     ClaudeEvent::Steer { message, expected_turn_id } => {
                         if active_turn_id.as_deref() != Some(&expected_turn_id) {
-                            trace!("easement", "claudep", "steer_rejected", "expected": expected_turn_id, "active": active_turn_id);
+                            trace!("easement", "claudep", "steer_turn_mismatch", "expected": expected_turn_id, "active": active_turn_id);
                         } else {
-                            trace!("easement", "claudep", "steer_queued", "message": message);
-                            steer_queue.push_back(message);
+                            trace!("easement", "claudep", "steer_written", "expected": expected_turn_id, "message": message);
+                        }
+                        let msg = format_user_message(&message);
+                        if let Some(ref mut stdin) = child_stdin {
+                            let _ = stdin.write_all(msg.as_bytes()).await;
+                            let _ = stdin.flush().await;
+                            sent += 1;
                         }
                     }
                     ClaudeEvent::FlushSteers { call_id } => {
