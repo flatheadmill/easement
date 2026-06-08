@@ -600,12 +600,39 @@ struct StdinUserMessageContent {
     content: String,
 }
 
+#[derive(Debug, Serialize)]
+struct StdinUserContentMessage {
+    r#type: &'static str,
+    message: StdinUserContentMessageContent,
+    uuid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StdinUserContentMessageContent {
+    role: &'static str,
+    content: Value,
+}
+
 fn format_user_message(content: &str) -> String {
     let msg = StdinUserMessage {
         r#type: "user",
         message: StdinUserMessageContent {
             role: "user",
             content: content.to_string(),
+        },
+        uuid: uuid::Uuid::new_v4().to_string(),
+    };
+    let mut s = serde_json::to_string(&msg).expect("UserMessage serialization cannot fail");
+    s.push('\n');
+    s
+}
+
+fn format_user_content_message(content: Value) -> String {
+    let msg = StdinUserContentMessage {
+        r#type: "user",
+        message: StdinUserContentMessageContent {
+            role: "user",
+            content,
         },
         uuid: uuid::Uuid::new_v4().to_string(),
     };
@@ -1282,6 +1309,25 @@ async fn claudep(
                             sent += 1;
                         }
                     }
+                    ClaudeEvent::ContentTurn { turn_id, content, reply } => {
+                        if active_turn_id.is_none() {
+                            active_turn_id = Some(turn_id.clone());
+                            trace!("easement", "claudep", "turn_started", "turn_id": turn_id);
+                            broadcast(&broadcast_tx, Broadcast::Turn {
+                                slug: slug.to_string(), transcript: transcript.to_string(),
+                                event: TurnBroadcast::Started { turn_id },
+                            });
+                        } else {
+                            trace!("easement", "claudep", "content_turn_written_while_active", "turn_id": turn_id);
+                        }
+                        let msg = format_user_content_message(content);
+                        if let Some(ref mut stdin) = child_stdin {
+                            let _ = stdin.write_all(msg.as_bytes()).await;
+                            let _ = stdin.flush().await;
+                            sent += 1;
+                        }
+                        let _ = reply.send(());
+                    }
                     ClaudeEvent::Steer { message, expected_turn_id } => {
                         if active_turn_id.as_deref() != Some(&expected_turn_id) {
                             trace!("easement", "claudep", "steer_turn_mismatch", "expected": expected_turn_id, "active": active_turn_id);
@@ -1904,7 +1950,29 @@ async fn handle_mcp(
 
             match reply_rx.await {
                 Ok(result) => {
-                    if (f == "view_image" || f == "screenshot") && result.exit_code == 0 {
+                    if who == "wicket" && f == "read_pdf" && result.exit_code == 0 {
+                        match serde_json::from_str::<Value>(&result.output) {
+                            Ok(content) => {
+                                let (inject_tx, inject_rx) = oneshot::channel();
+                                let _ = main_tx.send(MainEvent::UserContentTurn {
+                                    slug: slug.to_string(),
+                                    transcript: ts.to_string(),
+                                    turn_id: uuid::Uuid::new_v4().to_string(),
+                                    content,
+                                    reply: inject_tx,
+                                });
+                                let _ = inject_rx.await;
+                                jsonrpc_response(
+                                    id,
+                                    json!({ "content": [{ "type": "text", "text": "PDF attached to the conversation." }] }),
+                                )
+                            }
+                            Err(_) => jsonrpc_response(
+                                id,
+                                json!({ "content": [{ "type": "text", "text": result.output }] }),
+                            ),
+                        }
+                    } else if (f == "view_image" || f == "screenshot") && result.exit_code == 0 {
                         match serde_json::from_str::<Value>(&result.output) {
                             Ok(content) => jsonrpc_response(id, json!({ "content": content })),
                             Err(_) => jsonrpc_response(
@@ -2060,6 +2128,11 @@ enum ClaudeEvent {
     Turn {
         turn_id: String,
         message: String,
+    },
+    ContentTurn {
+        turn_id: String,
+        content: Value,
+        reply: oneshot::Sender<()>,
     },
     Steer {
         message: String,
@@ -2227,6 +2300,13 @@ enum MainEvent {
     },
     ToolCallTimeout {
         call_id: String,
+    },
+    UserContentTurn {
+        slug: String,
+        transcript: String,
+        turn_id: String,
+        content: Value,
+        reply: oneshot::Sender<()>,
     },
     WicketSpawnTimeout {
         host: String,
@@ -2774,6 +2854,20 @@ async fn main() {
                             Err(e) => {
                                 error!("easement", "websocket", "unrecognized", e, "client_id": client_id);
                             }
+                        }
+                    }
+                    MainEvent::UserContentTurn { slug, transcript, turn_id, content, reply } => {
+                        let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
+                        let event = ClaudeEvent::ContentTurn {
+                            turn_id,
+                            content,
+                            reply,
+                        };
+                        if let Err(err) = win.claude_tx.send(event) {
+                            let ClaudeEvent::ContentTurn { reply, .. } = err.0 else {
+                                panic!("unexpected claude event returned from content turn send");
+                            };
+                            let _ = reply.send(());
                         }
                     }
                     MainEvent::Disconnected { client_id } => {
