@@ -7,7 +7,7 @@
 // persistence, and client broadcasting. Clients register with the coordinator for their slug and
 // receive normalized entries and lifecycle events.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
@@ -764,6 +764,7 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
 struct ToolResult {
     output: String,
     exit_code: i32,
+    changes: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -803,6 +804,8 @@ enum Broadcast {
         transcript: String,
         tool_use_id: String,
         output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        changes: Option<Value>,
         #[serde(default)]
         is_error: bool,
     },
@@ -1268,9 +1271,9 @@ async fn claudep(
     let mut session_id: Option<String> = None;
     let mut tailing = false;
     let mut last_usage: Option<Value> = None;
-    let mut turn_queue: std::collections::VecDeque<(String, String)> =
-        std::collections::VecDeque::new();
-    let mut steer_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut turn_queue: VecDeque<(String, String)> = VecDeque::new();
+    let mut steer_queue: VecDeque<String> = VecDeque::new();
+    let mut pending_patch_changes: VecDeque<Value> = VecDeque::new();
     let mut active_turn_id: Option<String> = None;
     let mut sent: u64 = 0;
     let mut replayed: u64 = 0;
@@ -1375,6 +1378,10 @@ async fn claudep(
                         trace!("easement", "claudep", "flush_steers", "call_id": call_id, "queued": steer_queue.len());
                         // TODO: flush steer queue to stdin before dispatching
                         let _ = main_tx.send(MainEvent::ToolSteered { call_id });
+                    }
+                    ClaudeEvent::PatchChanges { changes } => {
+                        trace!("easement", "claudep", "patch_changes_queued", "queued": pending_patch_changes.len() + 1);
+                        pending_patch_changes.push_back(changes);
                     }
                     ClaudeEvent::HistoryReplay { replay_id } => {
                         let last_uuid = entries.iter().rev()
@@ -1529,11 +1536,13 @@ async fn claudep(
                                                         .join("\n"),
                                                     _ => String::new(),
                                                 };
+                                                let changes = pending_patch_changes.pop_front();
                                                 broadcast(&broadcast_tx, Broadcast::ToolResult {
                                                     slug: slug.to_string(),
                                                     transcript: transcript.to_string(),
                                                     tool_use_id,
                                                     output,
+                                                    changes,
                                                     is_error,
                                                 });
                                             }
@@ -2220,6 +2229,9 @@ enum ClaudeEvent {
     FlushSteers {
         call_id: String,
     },
+    PatchChanges {
+        changes: Value,
+    },
     HistoryReplay {
         replay_id: String,
     },
@@ -2303,6 +2315,8 @@ enum ToolPacket {
         output: String,
         #[serde(default)]
         exit_code: i32,
+        #[serde(default)]
+        changes: Option<Value>,
     },
     BackgroundOutput {
         job_id: String,
@@ -2623,6 +2637,7 @@ async fn main() {
                                     let _ = reply.send(ToolResult {
                                         output: "[meta] MCP tools and assistant harness shutting down, please end your turn".to_string(),
                                         exit_code: 1,
+                                        changes: None,
                                     });
                                 }
                                 MainEvent::ToolsQuery { reply } => {
@@ -2733,6 +2748,7 @@ async fn main() {
                                 let _ = reply.send(ToolResult {
                                     output: "wicket tool call missing required where argument".to_string(),
                                     exit_code: 1,
+                                    changes: None,
                                 });
                                 continue;
                             }
@@ -2755,6 +2771,7 @@ async fn main() {
                                     let _ = reply.send(ToolResult {
                                         output: format!("wicket on {} disconnected", r#where),
                                         exit_code: 1,
+                                        changes: None,
                                     });
                                 }
                             }
@@ -2786,6 +2803,7 @@ async fn main() {
                                             let _ = reply.send(ToolResult {
                                                 output: format!("failed to spawn wicket on {}: {}", r#where, e),
                                                 exit_code: 1,
+                                                changes: None,
                                             });
                                         }
                                     }
@@ -2846,6 +2864,7 @@ async fn main() {
                                 let _ = claim.reply.send(ToolResult {
                                     output: format!("no connected client for who={} where={}", who, r#where),
                                     exit_code: 1,
+                                    changes: None,
                                 });
                             }
                         }
@@ -2871,7 +2890,7 @@ async fn main() {
                                     trace!("easement", "tool", "stale_claim", "client_id": client_id, "call_id": call_id);
                                 }
                             }
-                            Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code })) => {
+                            Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code, changes })) => {
                                 if let Some(claim) = tool_calls.remove(&call_id) {
                                     trace!("easement", "tool", "response", "client_id": client_id, "call_id": call_id, "exit_code": exit_code);
                                     let r#where = claim.args.get("args")
@@ -2882,7 +2901,16 @@ async fn main() {
                                     if let Some(win) = windows.get_mut(&key) {
                                         win.shebang_host = r#where.to_string();
                                     }
-                                    let _ = claim.reply.send(ToolResult { output, exit_code });
+                                    if let Some(ref changes) = changes {
+                                        if let Some(win) = windows.get_mut(&key) {
+                                            let _ = win.claude_tx.send(ClaudeEvent::PatchChanges {
+                                                changes: changes.clone(),
+                                            });
+                                        } else {
+                                            trace!("easement", "tool", "patch_changes_without_window", "call_id": call_id);
+                                        }
+                                    }
+                                    let _ = claim.reply.send(ToolResult { output, exit_code, changes });
                                 } else {
                                     trace!("easement", "tool", "unknown_response", "client_id": client_id, "call_id": call_id);
                                 }
@@ -3016,6 +3044,7 @@ async fn main() {
                                             "escalation denied by operator".to_string()
                                         }),
                                         exit_code: 1,
+                                        changes: None,
                                     });
                                 } else {
                                     panic!("pending escalation stored non-tool event");
@@ -3064,6 +3093,7 @@ async fn main() {
                             let _ = claim.reply.send(ToolResult {
                                 output: "no client claimed this tool call".to_string(),
                                 exit_code: 1,
+                                changes: None,
                             });
                         }
                     }
@@ -3073,6 +3103,7 @@ async fn main() {
                             let _ = claim.reply.send(ToolResult {
                                 output: "tool call timed out".to_string(),
                                 exit_code: 1,
+                                changes: None,
                             });
                         }
                     }
