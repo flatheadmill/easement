@@ -115,6 +115,11 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn fatal(message: impl std::fmt::Display) -> ! {
+    eprintln!("fatal: {}", message);
+    std::process::abort();
+}
+
 fn init_log() {
     let home = env::var("HOME").expect("HOME not set");
     let log_dir = PathBuf::from(&home).join(".local/state/easement");
@@ -622,7 +627,8 @@ fn format_user_message(content: &str) -> String {
         },
         uuid: uuid::Uuid::new_v4().to_string(),
     };
-    let mut s = serde_json::to_string(&msg).expect("UserMessage serialization cannot fail");
+    let mut s = serde_json::to_string(&msg)
+        .unwrap_or_else(|e| fatal(format!("UserMessage serialization cannot fail: {}", e)));
     s.push('\n');
     s
 }
@@ -636,7 +642,8 @@ fn format_user_content_message(content: Value) -> String {
         },
         uuid: uuid::Uuid::new_v4().to_string(),
     };
-    let mut s = serde_json::to_string(&msg).expect("UserMessage serialization cannot fail");
+    let mut s = serde_json::to_string(&msg)
+        .unwrap_or_else(|e| fatal(format!("UserMessage serialization cannot fail: {}", e)));
     s.push('\n');
     s
 }
@@ -647,7 +654,8 @@ fn format_interrupt_message() -> String {
         "request_id": uuid::Uuid::new_v4().to_string(),
         "request": { "subtype": "interrupt" },
     });
-    let mut s = serde_json::to_string(&msg).expect("ControlRequest serialization cannot fail");
+    let mut s = serde_json::to_string(&msg)
+        .unwrap_or_else(|e| fatal(format!("ControlRequest serialization cannot fail: {}", e)));
     s.push('\n');
     s
 }
@@ -716,9 +724,13 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
     let dir = PathBuf::from(&home)
         .join(".local/state/easement")
         .join(slug);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .unwrap_or_else(|e| panic!("cannot create transcript dir {}: {}", dir.display(), e));
+    tokio::fs::create_dir_all(&dir).await.unwrap_or_else(|e| {
+        fatal(format!(
+            "cannot create transcript dir {}: {}",
+            dir.display(),
+            e
+        ))
+    });
     let ts_pattern = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.jsonl$").ok()?;
     let mut transcripts: Vec<String> = Vec::new();
     let mut entries = tokio::fs::read_dir(&dir).await.ok()?;
@@ -734,9 +746,13 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
         "new" => {
             let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
             let path = dir.join(format!("{}.jsonl", ts));
-            tokio::fs::File::create(&path)
-                .await
-                .unwrap_or_else(|e| panic!("cannot create transcript {}: {}", path.display(), e));
+            tokio::fs::File::create(&path).await.unwrap_or_else(|e| {
+                fatal(format!(
+                    "cannot create transcript {}: {}",
+                    path.display(),
+                    e
+                ))
+            });
             Some(ts)
         }
         "full" => {
@@ -751,7 +767,11 @@ async fn resolve_transcript(slug: &str, intent: &str) -> Option<String> {
                 let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
                 let path = dir.join(format!("{}.jsonl", ts));
                 tokio::fs::File::create(&path).await.unwrap_or_else(|e| {
-                    panic!("cannot create transcript {}: {}", path.display(), e)
+                    fatal(format!(
+                        "cannot create transcript {}: {}",
+                        path.display(),
+                        e
+                    ))
                 });
                 Some(ts)
             } else {
@@ -963,12 +983,13 @@ fn jsonrpc_error(id: Value, code: i32, message: String) -> JsonRpcResponse {
 }
 
 fn make_json_response(resp: JsonRpcResponse) -> Response<Full<Bytes>> {
-    let json = serde_json::to_string(&resp).unwrap();
+    let json = serde_json::to_string(&resp)
+        .unwrap_or_else(|e| fatal(format!("json response serialization failed: {}", e)));
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(json)))
-        .unwrap()
+        .unwrap_or_else(|e| fatal(format!("json response build failed: {}", e)))
 }
 
 // One claudep task per window (slug + transcript). Loads the transcript, emplaces it, spawns
@@ -997,11 +1018,11 @@ async fn claudep(
     let content = tokio::fs::read_to_string(&transcript_path)
         .await
         .unwrap_or_else(|e| {
-            panic!(
+            fatal(format!(
                 "transcript does not exist at {}: {}",
                 transcript_path.display(),
                 e
-            )
+            ))
         });
 
     let mut entries: Vec<Value> = Vec::new();
@@ -1057,7 +1078,7 @@ async fn claudep(
     let pane_dir = PathBuf::from(&home).join("pane").join(slug);
     let _ = tokio::fs::create_dir_all(&pane_dir).await;
     std::env::set_current_dir(&pane_dir)
-        .unwrap_or_else(|e| panic!("cannot cd to {}: {}", pane_dir.display(), e));
+        .unwrap_or_else(|e| fatal(format!("cannot cd to {}: {}", pane_dir.display(), e)));
 
     // Trust injection -- write hasTrustDialogAccepted into ~/.claude.json so claudep does not hang
     // waiting for interactive approval.
@@ -1070,12 +1091,12 @@ async fn claudep(
             async {
                 let mut config: Value = match tokio::fs::read_to_string(&config_path).await {
                     Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
-                        panic!("cannot parse {}: {}", config_path.display(), e)
+                        fatal(format!("cannot parse {}: {}", config_path.display(), e))
                     }),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         Value::Object(serde_json::Map::new())
                     }
-                    Err(e) => panic!("cannot read {}: {}", config_path.display(), e),
+                    Err(e) => fatal(format!("cannot read {}: {}", config_path.display(), e)),
                 };
 
                 let already = config
@@ -1086,25 +1107,29 @@ async fn claudep(
                     == Some(true);
 
                 if !already {
-                    let obj = config.as_object_mut().expect("config not an object");
+                    let Some(obj) = config.as_object_mut() else {
+                        fatal("config not an object");
+                    };
                     let projects = obj
                         .entry("projects")
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    let Some(projects) = projects.as_object_mut() else {
+                        fatal("projects not an object");
+                    };
                     let project = projects
-                        .as_object_mut()
-                        .expect("projects not an object")
                         .entry(directory)
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                    project
-                        .as_object_mut()
-                        .expect("project entry not an object")
-                        .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
+                    let Some(project) = project.as_object_mut() else {
+                        fatal("project entry not an object");
+                    };
+                    project.insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
 
-                    let content = serde_json::to_string_pretty(&config).expect("unreachable");
+                    let content = serde_json::to_string_pretty(&config)
+                        .unwrap_or_else(|e| fatal(format!("unreachable: {}", e)));
                     tokio::fs::write(&config_path, &content)
                         .await
                         .unwrap_or_else(|e| {
-                            panic!("cannot write {}: {}", config_path.display(), e)
+                            fatal(format!("cannot write {}: {}", config_path.display(), e))
                         });
 
                     #[cfg(unix)]
@@ -1124,19 +1149,17 @@ async fn claudep(
 
             let _ = tokio::fs::remove_dir(&lock_path).await;
         } else {
-            panic!("trust lock contention");
+            fatal("trust lock contention");
         }
     }
 
     let resume_arg: Option<String> = if let Some(ref uuid) = session_uuid {
-        assert!(
-            !entries.is_empty(),
-            "session uuid {} with no transcript entries",
-            uuid
-        );
+        if entries.is_empty() {
+            fatal(format!("session uuid {} with no transcript entries", uuid));
+        }
         let cli_path = cli_transcript_path(slug, uuid);
         emplace_transcript(&cli_path, &entries)
-            .unwrap_or_else(|e| panic!("emplacement failed: {}", e));
+            .unwrap_or_else(|e| fatal(format!("emplacement failed: {}", e)));
         trace!("easement", "claudep", "emplaced", "uuid": uuid, "path": cli_path.display().to_string(), "entries": entries.len());
         Some(uuid.clone())
     } else {
@@ -1191,7 +1214,7 @@ async fn claudep(
     });
     tokio::fs::write(&mcp_config_path, mcp_config.to_string())
         .await
-        .unwrap_or_else(|e| panic!("cannot write mcp config: {}", e));
+        .unwrap_or_else(|e| fatal(format!("cannot write mcp config: {}", e)));
     cmd.arg("--mcp-config").arg(&mcp_config_path);
 
     cmd.stdin(Stdio::piped())
@@ -1200,11 +1223,17 @@ async fn claudep(
 
     let mut child = cmd
         .spawn()
-        .unwrap_or_else(|e| panic!("cannot spawn claude: {}", e));
+        .unwrap_or_else(|e| fatal(format!("cannot spawn claude: {}", e)));
 
-    let child_stdin = child.stdin.take().expect("stdin was piped");
-    let child_stdout = child.stdout.take().expect("stdout was piped");
-    let child_stderr = child.stderr.take().expect("stderr was piped");
+    let Some(child_stdin) = child.stdin.take() else {
+        fatal("stdin was piped");
+    };
+    let Some(child_stdout) = child.stdout.take() else {
+        fatal("stdout was piped");
+    };
+    let Some(child_stderr) = child.stderr.take() else {
+        fatal("stderr was piped");
+    };
 
     // Stderr logger.
     tokio::spawn(async move {
@@ -1287,11 +1316,11 @@ async fn claudep(
                 .open(&transcript_path)
                 .await
                 .unwrap_or_else(|e| {
-                    panic!(
+                    fatal(format!(
                         "transcript does not exist at {}: {}",
                         transcript_path.display(),
                         e
-                    )
+                    ))
                 }),
         )
     } else {
@@ -1442,7 +1471,9 @@ async fn claudep(
                                 StdoutEvent::User { is_replay: true, message, session_id: sid, .. } => {
                                     match &session_id {
                                         None => {
-                                            assert!(uuid::Uuid::parse_str(sid).is_ok(), "session_id is not a UUID: {}", sid);
+                                            if uuid::Uuid::parse_str(sid).is_err() {
+                                                fatal(format!("session_id is not a UUID: {}", sid));
+                                            }
                                             trace!("easement", "claudep", "session_id", "session_id": sid, "slug": slug, "transcript": transcript);
                                             session_id = Some(sid.clone());
 
@@ -1458,11 +1489,11 @@ async fn claudep(
                                                     let mut mux = match linemux::MuxedLines::new() {
                                                         Ok(m) => m,
                                                         Err(e) => {
-                                                            panic!("cannot create tailer: {}", e);
+                                                            fatal(format!("cannot create tailer: {}", e));
                                                         }
                                                     };
                                                     if let Err(e) = mux.add_file_from_start(&cli_path).await {
-                                                        panic!("cannot tail transcript at {}: {}", cli_path.display(), e);
+                                                        fatal(format!("cannot tail transcript at {}: {}", cli_path.display(), e));
                                                     }
                                                     loop {
                                                         tokio::select! {
@@ -1471,14 +1502,16 @@ async fn claudep(
                                                                 match result {
                                                                     Ok(Some(line)) => {
                                                                         let text = line.line().trim();
-                                                                        assert!(!text.is_empty(), "empty line in CLI transcript");
+                                                                        if text.is_empty() {
+                                                                            fatal("empty line in CLI transcript");
+                                                                        }
                                                                         let data: Value = serde_json::from_str(text)
-                                                                            .unwrap_or_else(|e| panic!("invalid JSON in CLI transcript: {}", e));
+                                                                            .unwrap_or_else(|e| fatal(format!("invalid JSON in CLI transcript: {}", e)));
                                                                         let _ = tx.send(TranscriptLine::Entry(data)).await;
                                                                     }
                                                                     Ok(None) => break,
                                                                     Err(e) => {
-                                                                        panic!("tailer read error: {}", e);
+                                                                        fatal(format!("tailer read error: {}", e));
                                                                     }
                                                                 }
                                                             }
@@ -1489,7 +1522,12 @@ async fn claudep(
                                             }
                                         }
                                         Some(existing) => {
-                                            assert_eq!(existing.as_str(), sid.as_str(), "session id changed from {} to {}", existing, sid);
+                                            if existing.as_str() != sid.as_str() {
+                                                fatal(format!(
+                                                    "session id changed from {} to {}",
+                                                    existing, sid
+                                                ));
+                                            }
                                         }
                                     }
                                     replayed += 1;
@@ -1521,10 +1559,11 @@ async fn claudep(
                                     if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
                                         for block in content {
                                             if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                                                let tool_use_id = block.get("tool_use_id")
-                                                    .and_then(|v| v.as_str())
-                                                    .expect("tool_result missing tool_use_id")
-                                                    .to_string();
+                                                let Some(tool_use_id) = block.get("tool_use_id")
+                                                    .and_then(|v| v.as_str()) else {
+                                                        fatal("tool_result missing tool_use_id");
+                                                    };
+                                                let tool_use_id = tool_use_id.to_string();
                                                 let is_error = block.get("is_error")
                                                     .and_then(|v| v.as_bool())
                                                     .unwrap_or(false);
@@ -1681,18 +1720,22 @@ async fn claudep(
                         if entries.is_empty() {
                             trace!("easement", "transcript", "root", "uuid": uuid);
                         } else {
-                            let parent = data.get("parentUuid").and_then(|v| v.as_str())
-                                .expect("missing parentUuid on non-root entry");
-                            let chain_head = entries.last()
-                                .and_then(|e| e.get("uuid").and_then(|v| v.as_str()))
-                                .expect("unreachable");
+                            let Some(parent) = data.get("parentUuid").and_then(|v| v.as_str()) else {
+                                fatal("missing parentUuid on non-root entry");
+                            };
+                            let Some(chain_head) = entries.last()
+                                .and_then(|e| e.get("uuid").and_then(|v| v.as_str())) else {
+                                    fatal("unreachable");
+                                };
 
                             if rewinding {
                                 if chain_head != parent {
                                     if seen_uuids.contains(parent) {
-                                        let cut = entries.iter().rposition(|e| {
+                                        let Some(cut) = entries.iter().rposition(|e| {
                                             e.get("uuid").and_then(|v| v.as_str()) == Some(parent)
-                                        }).expect("parent in seen_uuids but not in entries");
+                                        }) else {
+                                            fatal("parent in seen_uuids but not in entries");
+                                        };
                                         let removed: Vec<Value> = entries.drain(cut + 1..).collect();
                                         trace!("easement", "transcript", "rewind",
                                             "parent": parent, "cut": removed.len(),
@@ -1710,39 +1753,40 @@ async fn claudep(
                                             .join("rewind")
                                             .join(transcript);
                                         tokio::fs::create_dir_all(&rewind_dir).await
-                                            .unwrap_or_else(|e| panic!("cannot create rewind dir: {}", e));
+                                            .unwrap_or_else(|e| fatal(format!("cannot create rewind dir: {}", e)));
                                         let rewind_ts = chrono::Local::now()
                                             .format("%Y-%m-%d-%H-%M-%S").to_string();
                                         let rewind_path = rewind_dir.join(format!("{}.jsonl", rewind_ts));
-                                        assert!(!rewind_path.exists(),
-                                            "rewind file already exists: {}", rewind_path.display());
+                                        if rewind_path.exists() {
+                                            fatal(format!("rewind file already exists: {}", rewind_path.display()));
+                                        }
                                         tokio::fs::rename(&transcript_path, &rewind_path).await
-                                            .unwrap_or_else(|e| panic!("cannot move transcript to rewind: {}", e));
+                                            .unwrap_or_else(|e| fatal(format!("cannot move transcript to rewind: {}", e)));
 
                                         let mut content = String::new();
                                         for e in &entries {
                                             let line = serde_json::to_string(e)
-                                                .expect("entry serialization cannot fail");
+                                                .unwrap_or_else(|e| fatal(format!("entry serialization cannot fail: {}", e)));
                                             content.push_str(&line);
                                             content.push('\n');
                                         }
                                         tokio::fs::write(&transcript_path, &content).await
-                                            .unwrap_or_else(|e| panic!("cannot write rewound transcript: {}", e));
+                                            .unwrap_or_else(|e| fatal(format!("cannot write rewound transcript: {}", e)));
 
                                         transcript_file = Some(tokio::fs::OpenOptions::new()
                                             .append(true)
                                             .open(&transcript_path)
                                             .await
-                                            .unwrap_or_else(|e| panic!("cannot open transcript for append: {}", e)));
+                                            .unwrap_or_else(|e| fatal(format!("cannot open transcript for append: {}", e))));
                                     } else {
-                                        panic!("transcript entry {} chains from unknown parent {}", uuid, parent);
+                                        fatal(format!("transcript entry {} chains from unknown parent {}", uuid, parent));
                                     }
                                 } else {
                                     transcript_file = Some(tokio::fs::OpenOptions::new()
                                         .append(true)
                                         .open(&transcript_path)
                                         .await
-                                        .unwrap_or_else(|e| panic!("cannot open transcript for append: {}", e)));
+                                        .unwrap_or_else(|e| fatal(format!("cannot open transcript for append: {}", e))));
                                 }
                                 rewinding = false;
                             } else if chain_head != parent {
@@ -1754,15 +1798,18 @@ async fn claudep(
                         wire!("easement", "transcript", "entry", "data": data);
                         let entry_line = {
                             let mut s = serde_json::to_string(&data)
-                                .expect("entry serialization cannot fail");
+                                .unwrap_or_else(|e| fatal(format!("entry serialization cannot fail: {}", e)));
                             s.push('\n');
                             s
                         };
                         seen_uuids.insert(uuid.to_string());
                         entries.push(data);
-                        transcript_file.as_mut().expect("unreachable")
+                        let Some(transcript_file) = transcript_file.as_mut() else {
+                            fatal("unreachable");
+                        };
+                        transcript_file
                             .write_all(entry_line.as_bytes()).await
-                            .expect("transcript write failed");
+                            .unwrap_or_else(|e| fatal(format!("transcript write failed: {}", e)));
                     }
                 }
             }
@@ -1875,7 +1922,7 @@ async fn handle_mcp(
         return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(Full::new(Bytes::new()))
-            .unwrap();
+            .unwrap_or_else(|e| fatal(format!("method-not-allowed response build failed: {}", e)));
     }
 
     let body = match req.collect().await {
@@ -1884,7 +1931,7 @@ async fn handle_mcp(
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::new(Bytes::from("failed to read body")))
-                .unwrap();
+                .unwrap_or_else(|e| fatal(format!("bad-request response build failed: {}", e)));
         }
     };
     let body_str = String::from_utf8_lossy(&body);
@@ -1974,7 +2021,9 @@ async fn handle_mcp(
                     "behavior": "allow",
                     "updatedInput": updated_input
                 });
-                let text = serde_json::to_string(&text).unwrap();
+                let text = serde_json::to_string(&text).unwrap_or_else(|e| {
+                    fatal(format!("approval response serialization failed: {}", e))
+                });
                 return make_json_response(jsonrpc_response(
                     id,
                     json!({ "content": [{ "type": "text", "text": text }] }),
@@ -2115,7 +2164,9 @@ async fn handle_request(
                 Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from(format!("upgrade error: {}", e))))
-                    .unwrap())
+                    .unwrap_or_else(|e| {
+                        fatal(format!("websocket upgrade response build failed: {}", e))
+                    }))
             }
         }
     } else if let Some(rest) = path.strip_prefix("/mcp/") {
@@ -2126,7 +2177,7 @@ async fn handle_request(
                 .body(Full::new(Bytes::from(
                     "missing slug in /mcp/<slug>/<transcript>",
                 )))
-                .unwrap())
+                .unwrap_or_else(|e| fatal(format!("missing-slug response build failed: {}", e))))
         } else {
             let slug = parts[0].to_string();
             let transcript = parts.get(1).map(|s| s.to_string());
@@ -2136,12 +2187,12 @@ async fn handle_request(
         Ok(Response::builder()
             .status(StatusCode::OK)
             .body(Full::new(Bytes::from("ok")))
-            .unwrap())
+            .unwrap_or_else(|e| fatal(format!("health response build failed: {}", e))))
     } else {
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("not found")))
-            .unwrap())
+            .unwrap_or_else(|e| fatal(format!("not-found response build failed: {}", e))))
     }
 }
 
@@ -2187,7 +2238,10 @@ fn run_timer(
                     let should_reset = heap.peek().map_or(true, |top| when < top.when);
                     heap.push(Deadline { when, event: delayed.event });
                     if should_reset {
-                        sleep.as_mut().reset(heap.peek().unwrap().when);
+                        let Some(top) = heap.peek() else {
+                            fatal("timer heap missing after push");
+                        };
+                        sleep.as_mut().reset(top.when);
                     }
                 }
                 () = &mut sleep => {
@@ -2196,7 +2250,9 @@ fn run_timer(
                         if top.when > now {
                             break;
                         }
-                        let deadline = heap.pop().unwrap();
+                        let Some(deadline) = heap.pop() else {
+                            fatal("timer heap missing after peek");
+                        };
                         let _ = main_tx.send(deadline.event);
                     }
                     let next = heap.peek()
@@ -2440,7 +2496,7 @@ async fn main() {
             l
         }
         Err(e) => {
-            panic!("failed to bind {}: {}", addr, e);
+            fatal(format!("failed to bind {}: {}", addr, e));
         }
     };
 
