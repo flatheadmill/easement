@@ -829,6 +829,13 @@ enum Broadcast {
         #[serde(default)]
         is_error: bool,
     },
+    ShellResult {
+        slug: String,
+        transcript: String,
+        id: String,
+        output: String,
+        exit_code: i32,
+    },
     Approval {
         slug: String,
         transcript: String,
@@ -2227,6 +2234,8 @@ struct Delayed {
     event: MainEvent,
 }
 
+const SHELL_COMMAND_TIMEOUT_MS: u64 = 60_000;
+
 struct Deadline {
     when: tokio::time::Instant,
     event: MainEvent,
@@ -2359,12 +2368,10 @@ enum ApprovalPacket {
 #[serde(tag = "why", rename_all = "snake_case")]
 enum ShellPacket {
     Run {
+        id: String,
         slug: String,
         transcript: String,
         command: String,
-    },
-    Claim {
-        id: String,
     },
     Response {
         id: String,
@@ -2496,6 +2503,9 @@ enum MainEvent {
     ToolCallTimeout {
         call_id: String,
     },
+    ShellTimeout {
+        id: String,
+    },
     UserContentTurn {
         slug: String,
         transcript: String,
@@ -2591,13 +2601,18 @@ async fn main() {
     struct PendingEscalation {
         event: MainEvent,
     }
+    struct PendingShell {
+        slug: String,
+        transcript: String,
+        r#where: String,
+    }
     let mut shutdown = false;
     let mut tool_claims: HashMap<String, ToolClaim> = HashMap::new();
     let mut tool_calls: HashMap<String, ToolClaim> = HashMap::new();
     let mut pending_escalations: HashMap<String, PendingEscalation> = HashMap::new();
     let mut approved_escalations: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let mut shell_claims: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending_shells: HashMap<String, PendingShell> = HashMap::new();
     struct Window {
         claude_tx: mpsc::UnboundedSender<ClaudeEvent>,
         shebang_host: String,
@@ -3043,35 +3058,58 @@ async fn main() {
                                     }
                                 }
                             }
-                            Ok(Packet::Shell(ShellPacket::Run { slug, transcript, command })) => {
+                            Ok(Packet::Shell(ShellPacket::Run { id, slug, transcript, command })) => {
                                 let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
                                 let r#where = win.shebang_host.clone();
-                                let shell_id = uuid::Uuid::new_v4().to_string();
                                 let socket_tx = sockets.values()
                                     .find(|s| s.who.as_deref() == Some("wicket") && s.r#where == r#where)
                                     .map(|s| &s.tx);
                                 match socket_tx {
                                     Some(tx) => {
                                         dispatch(tx, Dispatch::Shell {
-                                            slug, transcript,
+                                            slug: slug.clone(),
+                                            transcript: transcript.clone(),
                                             event: ShellDispatch::Run {
-                                                id: shell_id,
+                                                id: id.clone(),
                                                 command,
-                                                r#where,
+                                                r#where: r#where.clone(),
                                             },
+                                        });
+                                        pending_shells.insert(id.clone(), PendingShell {
+                                            slug,
+                                            transcript,
+                                            r#where: r#where.clone(),
+                                        });
+                                        let _ = timer_tx.send(Delayed {
+                                            ms: SHELL_COMMAND_TIMEOUT_MS,
+                                            event: MainEvent::ShellTimeout { id },
                                         });
                                     }
                                     None => {
-                                        trace!("easement", "shell", "no_wicket", "where": r#where);
+                                        trace!("easement", "shell", "no_wicket", "id": id, "where": r#where);
+                                        broadcast(&broadcast_tx, Broadcast::ShellResult {
+                                            slug,
+                                            transcript,
+                                            id,
+                                            output: format!("no connected Wicket for host {}", r#where),
+                                            exit_code: 1,
+                                        });
                                     }
                                 }
                             }
-                            Ok(Packet::Shell(ShellPacket::Claim { id })) => {
-                                trace!("easement", "shell", "claimed", "client_id": client_id, "id": id);
-                            }
-                            Ok(Packet::Shell(ShellPacket::Response { id, slug: _, transcript: _, output: _, exit_code })) => {
-                                trace!("easement", "shell", "response", "client_id": client_id, "id": id, "exit_code": exit_code);
-                                // TODO: route shell result back to originating client
+                            Ok(Packet::Shell(ShellPacket::Response { id, slug, transcript, output, exit_code })) => {
+                                if let Some(pending) = pending_shells.remove(&id) {
+                                    trace!("easement", "shell", "response", "client_id": client_id, "id": id, "exit_code": exit_code);
+                                    broadcast(&broadcast_tx, Broadcast::ShellResult {
+                                        slug: pending.slug,
+                                        transcript: pending.transcript,
+                                        id,
+                                        output,
+                                        exit_code,
+                                    });
+                                } else {
+                                    trace!("easement", "shell", "stale_response", "client_id": client_id, "id": id, "slug": slug, "transcript": transcript, "exit_code": exit_code);
+                                }
                             }
                             Ok(Packet::Socket(SocketPacket::Connect { who, r#where, tools })) => {
                                 let toolset = ToolSet { who: who.clone(), tools };
@@ -3186,6 +3224,22 @@ async fn main() {
                                 output: "tool call timed out".to_string(),
                                 exit_code: 1,
                                 changes: None,
+                            });
+                        }
+                    }
+                    MainEvent::ShellTimeout { id } => {
+                        if let Some(pending) = pending_shells.remove(&id) {
+                            let seconds = SHELL_COMMAND_TIMEOUT_MS / 1000;
+                            trace!("easement", "shell", "timeout", "id": id, "where": pending.r#where);
+                            broadcast(&broadcast_tx, Broadcast::ShellResult {
+                                slug: pending.slug,
+                                transcript: pending.transcript,
+                                id,
+                                output: format!(
+                                    "shell command timed out after {}s on {} (process may still be running)",
+                                    seconds, pending.r#where
+                                ),
+                                exit_code: 1,
                             });
                         }
                     }
