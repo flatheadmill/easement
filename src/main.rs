@@ -999,6 +999,39 @@ fn make_json_response(resp: JsonRpcResponse) -> Response<Full<Bytes>> {
         .unwrap_or_else(|e| fatal(format!("json response build failed: {}", e)))
 }
 
+// Easement configuration, read from ~/.config/easement/config.json. The model
+// is a reliable default with optional per-slug overrides, so day-job slugs stay
+// on a tried-and-true model while other slugs can run fable. A missing or
+// malformed config falls back to the default rather than taking down the server.
+#[derive(serde::Deserialize, Default)]
+struct EasementConfig {
+    model: Option<String>,
+    #[serde(default)]
+    slugs: HashMap<String, String>,
+}
+
+async fn launch_model(home: &str, slug: &str) -> String {
+    let default = || "claude-opus-4-6[1m]".to_string();
+    let path = PathBuf::from(home).join(".config/easement/config.json");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(t) => t,
+        Err(_) => return default(),
+    };
+    let config: EasementConfig = match serde_json::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            trace!("easement", "config", "parse_error", "path": path.display().to_string(), "error": e.to_string());
+            return default();
+        }
+    };
+    config
+        .slugs
+        .get(slug)
+        .cloned()
+        .or(config.model)
+        .unwrap_or_else(default)
+}
+
 // One claudep task per window (slug + transcript). Loads the transcript, emplaces it, spawns
 // Claude, and enters the select loop. History replay comes from the already-loaded entries.
 // Claude is running because Easement is a live authorized bridge around a CLI session, not a
@@ -1178,6 +1211,11 @@ async fn claudep(
     // Wicket's seatbelt/bwrap policy is the permission system. Claude Code's
     // approval classifier treats Wicket-mediated reads and shell commands as
     // attempts to bypass denied built-in tools, so skip that layer entirely.
+    // The launch model comes from the Easement config: a reliable default with
+    // optional per-slug overrides. No --fallback-model is set, so an overloaded
+    // model surfaces as a visible error rather than a silent switch.
+    let model = launch_model(&home, slug).await;
+
     let mut cmd = Command::new("claude");
     cmd.env("MCP_TOOL_TIMEOUT", "2147483647");
     cmd.arg("--print")
@@ -1189,7 +1227,7 @@ async fn claudep(
         .arg("--replay-user-messages")
         .arg("--verbose")
         .arg("--model")
-        .arg("claude-opus-4-6[1m]")
+        .arg(&model)
         .arg("--thinking-display")
         .arg("summarized")
         .arg("--effort")
