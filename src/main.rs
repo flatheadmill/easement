@@ -1723,9 +1723,26 @@ async fn claudep(
                             let Some(parent) = data.get("parentUuid").and_then(|v| v.as_str()) else {
                                 fatal("missing parentUuid on non-root entry");
                             };
-                            let Some(chain_head) = entries.last()
-                                .and_then(|e| e.get("uuid").and_then(|v| v.as_str())) else {
-                                    fatal("unreachable");
+                            // Walk backward past entries without UUIDs (last-prompt, mode,
+                            // permission-mode) that appear at the end of CCCLI-converted
+                            // transcripts.
+                            let Some(chain_head) = entries.iter()
+                                .rev()
+                                .find_map(|e| e.get("uuid").and_then(|v| v.as_str())) else {
+                                    let last_entry = entries.last().cloned().unwrap_or(Value::Null);
+                                    fatal(format!(
+                                        "unreachable: non-empty transcript has no uuid-bearing chain head; \
+                                         slug={} transcript={} incoming_type={} incoming_uuid={} parent={} \
+                                         entries={} rewinding={} last_entry={}",
+                                        slug,
+                                        transcript,
+                                        data.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                                        uuid,
+                                        parent,
+                                        entries.len(),
+                                        rewinding,
+                                        last_entry
+                                    ));
                                 };
 
                             if rewinding {
@@ -1805,7 +1822,16 @@ async fn claudep(
                         seen_uuids.insert(uuid.to_string());
                         entries.push(data);
                         let Some(transcript_file) = transcript_file.as_mut() else {
-                            fatal("unreachable");
+                            let last_entry = entries.last().cloned().unwrap_or(Value::Null);
+                            fatal(format!(
+                                "unreachable: transcript_file missing before append; \
+                                 slug={} transcript={} entries={} rewinding={} last_entry={}",
+                                slug,
+                                transcript,
+                                entries.len(),
+                                rewinding,
+                                last_entry
+                            ));
                         };
                         transcript_file
                             .write_all(entry_line.as_bytes()).await
