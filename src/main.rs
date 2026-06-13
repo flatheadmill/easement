@@ -1080,7 +1080,7 @@ struct EasementConfig {
 }
 
 async fn launch_model(home: &str, slug: &str) -> String {
-    let default = || "claude-opus-4-6[1m]".to_string();
+    let default = || "claude-opus-4-8".to_string();
     let path = PathBuf::from(home)
         .join(".local/state/easement")
         .join(slug)
