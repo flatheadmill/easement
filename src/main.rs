@@ -13,7 +13,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -207,6 +207,11 @@ enum StdoutEvent {
     System {
         subtype: Option<String>,
         session_id: Option<String>,
+        content: Option<String>,
+        original_model: Option<String>,
+        fallback_model: Option<String>,
+        trigger: Option<String>,
+        request_id: Option<String>,
     },
     Assistant {
         message: Value,
@@ -229,6 +234,58 @@ enum StdoutEvent {
     },
     #[serde(other)]
     Unknown,
+}
+
+fn claude_model_fallback_warning(data: &Value) -> Option<(String, String, Value)> {
+    let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let subtype = data.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    let trigger = data.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+    let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+    let known_refusal_fallback =
+        event_type == "system" && subtype == "model_refusal_fallback" && trigger == "refusal";
+    let model_switch = event_type == "system"
+        && data
+            .get("original_model")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| !m.trim().is_empty())
+        && data
+            .get("fallback_model")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| !m.trim().is_empty());
+
+    if (!known_refusal_fallback && !model_switch) || content.trim().is_empty() {
+        return None;
+    }
+
+    let code = if subtype.is_empty() {
+        "claude_model_fallback".to_string()
+    } else {
+        subtype.to_string()
+    };
+    Some((code, content.to_string(), data.clone()))
+}
+
+fn claude_model_result_error(
+    data: &Value,
+    expected_model: &str,
+) -> Option<(String, String, Value)> {
+    let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let result = data.get("result").and_then(|v| v.as_str()).unwrap_or("");
+
+    let expected_issue = format!(
+        "There's an issue with the selected model ({})",
+        expected_model
+    );
+    if event_type != "result" || !result.starts_with(&expected_issue) {
+        return None;
+    }
+
+    Some((
+        "claude_model_unavailable".to_string(),
+        result.to_string(),
+        data.clone(),
+    ))
 }
 
 // Transcript entry types from the Claude CLI's JSONL files and the Codex TUI's
@@ -835,6 +892,15 @@ enum Broadcast {
         id: String,
         output: String,
         exit_code: i32,
+    },
+    Error {
+        slug: String,
+        transcript: String,
+        code: String,
+        message: String,
+        recoverable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
     },
     Approval {
         slug: String,
@@ -1507,6 +1573,50 @@ async fn claudep(
 
                         if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                             match &event {
+                                StdoutEvent::System { subtype, .. } => {
+                                    if let Some((code, message, details)) = claude_model_fallback_warning(&data) {
+                                        trace!(
+                                            "easement", "claudep", "system_warning",
+                                            "subtype": subtype.as_deref().unwrap_or(""),
+                                            "message": message.clone(),
+                                        );
+                                        broadcast(&broadcast_tx, Broadcast::Error {
+                                            slug: slug.to_string(),
+                                            transcript: transcript.to_string(),
+                                            code,
+                                            message,
+                                            recoverable: false,
+                                            details: Some(details),
+                                        });
+                                        trace!(
+                                            "easement",
+                                            "claudep",
+                                            "model_switch_exiting",
+                                            "slug": slug,
+                                            "transcript": transcript,
+                                        );
+                                        if let Some(ref tid) = active_turn_id {
+                                            broadcast(&broadcast_tx, Broadcast::Turn {
+                                                slug: slug.to_string(),
+                                                transcript: transcript.to_string(),
+                                                event: TurnBroadcast::Completed {
+                                                    turn_id: tid.clone(),
+                                                    status: "failed".to_string(),
+                                                },
+                                            });
+                                        }
+                                        child_stdin.take();
+                                        if let Err(e) = child.kill().await {
+                                            error!("easement", "claudep", "kill_after_model_switch", e);
+                                        }
+                                        let _ = child.wait().await;
+                                        let _ = main_tx.send(MainEvent::ClaudeExited {
+                                            slug: slug.to_string(),
+                                            transcript: transcript.to_string(),
+                                        });
+                                        break;
+                                    }
+                                }
                                 StdoutEvent::StreamEvent { event, .. } => {
                                     broadcast(&broadcast_tx, Broadcast::Delta {
                                         slug: slug.to_string(), transcript: transcript.to_string(),
@@ -1645,6 +1755,48 @@ async fn claudep(
                                         last_usage = usage;
                                     }
 
+                                    if let Some((code, message, details)) =
+                                        claude_model_result_error(&data, &model)
+                                    {
+                                        trace!(
+                                            "easement",
+                                            "claudep",
+                                            "model_result_error",
+                                            "slug": slug,
+                                            "transcript": transcript,
+                                            "model": model.clone(),
+                                            "message": message.clone(),
+                                        );
+                                        broadcast(&broadcast_tx, Broadcast::Error {
+                                            slug: slug.to_string(),
+                                            transcript: transcript.to_string(),
+                                            code,
+                                            message,
+                                            recoverable: false,
+                                            details: Some(details),
+                                        });
+                                        if let Some(ref tid) = active_turn_id {
+                                            broadcast(&broadcast_tx, Broadcast::Turn {
+                                                slug: slug.to_string(),
+                                                transcript: transcript.to_string(),
+                                                event: TurnBroadcast::Completed {
+                                                    turn_id: tid.clone(),
+                                                    status: "failed".to_string(),
+                                                },
+                                            });
+                                        }
+                                        child_stdin.take();
+                                        if let Err(e) = child.kill().await {
+                                            error!("easement", "claudep", "kill_after_model_result_error", e);
+                                        }
+                                        let _ = child.wait().await;
+                                        let _ = main_tx.send(MainEvent::ClaudeExited {
+                                            slug: slug.to_string(),
+                                            transcript: transcript.to_string(),
+                                        });
+                                        break;
+                                    }
+
                                     if is_interrupted {
                                         if let Some(ref tid) = active_turn_id {
                                             broadcast(&broadcast_tx, Broadcast::Turn {
@@ -1746,6 +1898,10 @@ async fn claudep(
                                 event: TurnBroadcast::Completed { turn_id: tid.clone(), status: "failed".to_string() },
                             });
                         }
+                        let _ = main_tx.send(MainEvent::ClaudeExited {
+                            slug: slug.to_string(),
+                            transcript: transcript.to_string(),
+                        });
 
                         break;
                     }
@@ -2554,6 +2710,10 @@ enum MainEvent {
     WicketSpawnTimeout {
         host: String,
     },
+    ClaudeExited {
+        slug: String,
+        transcript: String,
+    },
 }
 
 #[tokio::main]
@@ -3225,6 +3385,18 @@ async fn main() {
                                 panic!("unexpected claude event returned from content turn send");
                             };
                             let _ = reply.send(());
+                        }
+                    }
+                    MainEvent::ClaudeExited { slug, transcript } => {
+                        let key = (slug.clone(), transcript.clone());
+                        if windows.remove(&key).is_some() {
+                            trace!(
+                                "easement",
+                                "claudep",
+                                "window_removed",
+                                "slug": slug,
+                                "transcript": transcript,
+                            );
                         }
                     }
                     MainEvent::Disconnected { client_id } => {
