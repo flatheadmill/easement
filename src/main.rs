@@ -1069,20 +1069,22 @@ fn make_json_response(resp: JsonRpcResponse) -> Response<Full<Bytes>> {
         .unwrap_or_else(|e| fatal(format!("json response build failed: {}", e)))
 }
 
-// Easement configuration, read from ~/.config/easement/config.json. The model
-// is a reliable default with optional per-slug overrides, so day-job slugs stay
-// on a tried-and-true model while other slugs can run fable. A missing or
-// malformed config falls back to the default rather than taking down the server.
+// Per-collaboration Easement configuration, read from
+// ~/.local/state/easement/<slug>/config.json. The file is intentionally flat:
+// a slug that needs a special launch model can say { "model": "..." }, and a
+// slug with no file gets the default Opus model. Easement never creates these
+// files on its own; absence is the normal path.
 #[derive(serde::Deserialize, Default)]
 struct EasementConfig {
     model: Option<String>,
-    #[serde(default)]
-    slugs: HashMap<String, String>,
 }
 
 async fn launch_model(home: &str, slug: &str) -> String {
     let default = || "claude-opus-4-6[1m]".to_string();
-    let path = PathBuf::from(home).join(".config/easement/config.json");
+    let path = PathBuf::from(home)
+        .join(".local/state/easement")
+        .join(slug)
+        .join("config.json");
     let text = match tokio::fs::read_to_string(&path).await {
         Ok(t) => t,
         Err(_) => return default(),
@@ -1094,12 +1096,7 @@ async fn launch_model(home: &str, slug: &str) -> String {
             return default();
         }
     };
-    config
-        .slugs
-        .get(slug)
-        .cloned()
-        .or(config.model)
-        .unwrap_or_else(default)
+    config.model.unwrap_or_else(default)
 }
 
 // One claudep task per window (slug + transcript). Loads the transcript, emplaces it, spawns
@@ -1290,9 +1287,9 @@ async fn claudep(
     // Wicket's seatbelt/bwrap policy is the permission system. Claude Code's
     // approval classifier treats Wicket-mediated reads and shell commands as
     // attempts to bypass denied built-in tools, so skip that layer entirely.
-    // The launch model comes from the Easement config: a reliable default with
-    // optional per-slug overrides. No --fallback-model is set, so an overloaded
-    // model surfaces as a visible error rather than a silent switch.
+    // The launch model comes from the slug's state config when present, otherwise
+    // Opus. No --fallback-model is set, so an overloaded or unavailable model
+    // surfaces as a visible error rather than a silent switch.
     let model = launch_model(&home, slug).await;
 
     let mut cmd = Command::new("claude");
