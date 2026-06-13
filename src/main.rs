@@ -266,23 +266,27 @@ fn claude_model_fallback_warning(data: &Value) -> Option<(String, String, Value)
     Some((code, content.to_string(), data.clone()))
 }
 
-fn claude_model_result_error(
-    data: &Value,
-    expected_model: &str,
-) -> Option<(String, String, Value)> {
+fn claude_result_error(data: &Value) -> Option<(String, String, Value)> {
     let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let is_error = data
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let result = data.get("result").and_then(|v| v.as_str()).unwrap_or("");
 
-    let expected_issue = format!(
-        "There's an issue with the selected model ({})",
-        expected_model
-    );
-    if event_type != "result" || !result.starts_with(&expected_issue) {
+    if event_type != "result" || !is_error || result.trim().is_empty() {
         return None;
     }
 
+    let subtype = data.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    let code = if subtype.trim().is_empty() {
+        "claude_result_error"
+    } else {
+        subtype
+    };
+
     Some((
-        "claude_model_unavailable".to_string(),
+        code.to_string(),
         result.to_string(),
         data.clone(),
     ))
@@ -1101,9 +1105,18 @@ async fn launch_model(home: &str, slug: &str) -> String {
 // One claudep task per window (slug + transcript). Loads the transcript, emplaces it, spawns
 // Claude, and enters the select loop. History replay comes from the already-loaded entries.
 // Claude is running because Easement is a live authorized bridge around a CLI session, not a
-// transcript server. If all anyone wants is the history they can jq the transcript file. The
-// reconciliation after each round adapts to whatever the CLI did to the chain, so the logic
-// lives here next to the code that deals with the consequences, not in a separate module.
+// transcript server. If all anyone wants is the history they can jq the transcript file.
+//
+// This looks like it should be a simple stream pump, but the stream is tea leaves and chicken
+// gizzards from a proprietary CLI. The code below is intentionally close to the observations
+// that produced it: model fallbacks can arrive as system warnings, model access failures can
+// arrive as terminal results whose subtype says "success" while is_error is true, and the
+// transcript chain can rewind under resume. When the black box violates an assumption, prefer
+// a loud branch that surfaces the raw message and stops the process over a graceful-looking
+// recovery that hides what happened.
+//
+// The reconciliation after each round adapts to whatever the CLI did to the chain, so the
+// logic lives here next to the code that deals with the consequences, not in a separate module.
 async fn claudep(
     slug: &str,
     transcript: &str,
@@ -1574,6 +1587,9 @@ async fn claudep(
                         if let Ok(event) = serde_json::from_value::<StdoutEvent>(data.clone()) {
                             match &event {
                                 StdoutEvent::System { subtype, .. } => {
+                                    // This is not a recoverable notice for us. If the CLI says the
+                                    // requested model fell back or changed, the operator needs to see
+                                    // the exact upstream warning and the live bridge needs to stop.
                                     if let Some((code, message, details)) = claude_model_fallback_warning(&data) {
                                         trace!(
                                             "easement", "claudep", "system_warning",
@@ -1755,13 +1771,15 @@ async fn claudep(
                                         last_usage = usage;
                                     }
 
-                                    if let Some((code, message, details)) =
-                                        claude_model_result_error(&data, &model)
-                                    {
+                                    // Observed from Claude CLI: a terminal result can report
+                                    // subtype "success" and still carry is_error: true. Trust the
+                                    // explicit error bit, not the cheerful subtype, and preserve the
+                                    // raw result text for Puzzle.
+                                    if let Some((code, message, details)) = claude_result_error(&data) {
                                         trace!(
                                             "easement",
                                             "claudep",
-                                            "model_result_error",
+                                            "result_error",
                                             "slug": slug,
                                             "transcript": transcript,
                                             "model": model.clone(),
@@ -1785,9 +1803,12 @@ async fn claudep(
                                                 },
                                             });
                                         }
+                                        // This abandons claudep-local queues. A model/access failure
+                                        // poisons the live bridge; the active turn is failed visibly
+                                        // and later turns create a fresh claudep through the window table.
                                         child_stdin.take();
                                         if let Err(e) = child.kill().await {
-                                            error!("easement", "claudep", "kill_after_model_result_error", e);
+                                            error!("easement", "claudep", "kill_after_result_error", e);
                                         }
                                         let _ = child.wait().await;
                                         let _ = main_tx.send(MainEvent::ClaudeExited {
