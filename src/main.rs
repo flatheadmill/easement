@@ -3127,10 +3127,12 @@ async fn main() {
                     MainEvent::ToolCallEnsured { call_id, slug, transcript, tool, args, reply } => {
                         trace!("easement", "tool", "ensured", "call_id": call_id, "slug": slug, "tool": tool);
 
-                        let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
-                        let _ = win.claude_tx.send(ClaudeEvent::FlushSteers { call_id: call_id.clone() });
-
-                        tool_claims.insert(call_id, ToolClaim { reply, slug, transcript, args });
+                        // The tool path no longer routes through claudep. The window/FlushSteers
+                        // detour existed only to flush queued steers into claude --print's stdin
+                        // before a tool ran. With CCCLI as the client there is no claudep and no
+                        // steers, so dispatch directly: insert the claim, then steer it.
+                        tool_claims.insert(call_id.clone(), ToolClaim { reply, slug, transcript, args });
+                        let _ = main_tx.send(MainEvent::ToolSteered { call_id });
                     }
                     MainEvent::ToolSteered { call_id } => {
                         trace!("easement", "tool", "steered", "call_id": call_id);
