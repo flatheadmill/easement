@@ -906,13 +906,6 @@ enum Broadcast {
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
     },
-    Approval {
-        slug: String,
-        transcript: String,
-        call_id: String,
-        tool_name: String,
-        input: Value,
-    },
 }
 
 #[derive(Serialize)]
@@ -2560,20 +2553,6 @@ enum Packet {
     History(HistoryPacket),
     Socket(SocketPacket),
     Shell(ShellPacket),
-    Approval(ApprovalPacket),
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum ApprovalPacket {
-    Response {
-        slug: String,
-        transcript: String,
-        call_id: String,
-        behavior: String,
-        #[serde(default)]
-        message: Option<String>,
-    },
 }
 
 #[derive(serde::Deserialize)]
@@ -2814,9 +2793,6 @@ async fn main() {
         transcript: String,
         args: Value,
     }
-    struct PendingEscalation {
-        event: MainEvent,
-    }
     struct PendingShell {
         slug: String,
         transcript: String,
@@ -2825,9 +2801,6 @@ async fn main() {
     let mut shutdown = false;
     let mut tool_claims: HashMap<String, ToolClaim> = HashMap::new();
     let mut tool_calls: HashMap<String, ToolClaim> = HashMap::new();
-    let mut pending_escalations: HashMap<String, PendingEscalation> = HashMap::new();
-    let mut approved_escalations: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
     let mut pending_shells: HashMap<String, PendingShell> = HashMap::new();
     struct Window {
         claude_tx: mpsc::UnboundedSender<ClaudeEvent>,
@@ -3016,37 +2989,6 @@ async fn main() {
                     }
                     MainEvent::ToolCall { call_id, slug, transcript, tool, args, reply } => {
                         let who = args.get("who").and_then(|v| v.as_str()).unwrap_or("");
-                        let inner_args = args.get("args").cloned().unwrap_or(json!({}));
-                        let escalate = inner_args
-                            .get("escalate")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-
-                        if escalate && !approved_escalations.remove(&call_id) {
-                            let f = args.get("f").and_then(|v| v.as_str()).unwrap_or("");
-                            trace!("easement", "approval", "requested", "call_id": call_id, "slug": slug, "transcript": transcript, "who": who, "tool": f);
-                            broadcast(&broadcast_tx, Broadcast::Approval {
-                                slug: slug.clone(),
-                                transcript: transcript.clone(),
-                                call_id: call_id.clone(),
-                                tool_name: f.to_string(),
-                                input: inner_args,
-                            });
-                            pending_escalations.insert(
-                                call_id.clone(),
-                                PendingEscalation {
-                                    event: MainEvent::ToolCall {
-                                        call_id,
-                                        slug,
-                                        transcript,
-                                        tool,
-                                        args,
-                                        reply,
-                                    },
-                                },
-                            );
-                            continue;
-                        }
 
                         if who != "wicket" {
                             let _ = main_tx.send(MainEvent::ToolCallEnsured {
@@ -3356,36 +3298,6 @@ async fn main() {
                                             stashed: Vec::new(),
                                         });
                                     }
-                                }
-                            }
-                            Ok(Packet::Approval(ApprovalPacket::Response {
-                                slug,
-                                transcript,
-                                call_id,
-                                behavior,
-                                message,
-                            })) => {
-                                trace!("easement", "approval", "response", "client_id": client_id, "call_id": call_id, "slug": slug, "transcript": transcript, "behavior": behavior);
-                                let Some(pending) = pending_escalations.remove(&call_id) else {
-                                    trace!("easement", "approval", "unknown_response", "client_id": client_id, "call_id": call_id);
-                                    continue;
-                                };
-
-                                if behavior == "allow" {
-                                    approved_escalations.insert(call_id.clone());
-                                    let _ = main_tx.send(MainEvent::ToolCheck {
-                                        event: Box::new(pending.event),
-                                    });
-                                } else if let MainEvent::ToolCall { reply, .. } = pending.event {
-                                    let _ = reply.send(ToolResult {
-                                        output: message.unwrap_or_else(|| {
-                                            "escalation denied by operator".to_string()
-                                        }),
-                                        exit_code: 1,
-                                        changes: None,
-                                    });
-                                } else {
-                                    panic!("pending escalation stored non-tool event");
                                 }
                             }
                             Err(e) => {
