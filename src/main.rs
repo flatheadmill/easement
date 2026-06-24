@@ -7,7 +7,7 @@
 // persistence, and client broadcasting. Clients register with the coordinator for their slug and
 // receive normalized entries and lifecycle events.
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
@@ -2545,6 +2545,26 @@ struct ToolSet {
     tools: Vec<Tool>,
 }
 
+// Collapse the tool manifests from every connected socket into one discovery
+// listing, deduplicated by (who, f). Several Wickets on different hosts each
+// advertise the same `who: "wicket"` manifest; the caller selects the host with
+// the `where` argument to `call`, so a capability should appear once here rather
+// than once per connected instance. Dedup on (who, f) rather than collapsing by
+// who alone so that two clients sharing a name but differing in capabilities
+// would still surface the union, each function listed a single time.
+fn collect_tools<'a>(toolsets: impl Iterator<Item = &'a ToolSet>) -> Vec<Value> {
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut out = Vec::new();
+    for ts in toolsets {
+        for t in &ts.tools {
+            if seen.insert((ts.who.as_str(), t.f.as_str())) {
+                out.push(json!({ "who": ts.who, "f": t.f, "description": t.description }));
+            }
+        }
+    }
+    out
+}
+
 #[derive(serde::Deserialize)]
 #[serde(tag = "what", rename_all = "snake_case")]
 enum Packet {
@@ -2940,12 +2960,7 @@ async fn main() {
                         match wickets.get_mut(&host) {
                             Some(Wicket { state: WicketState::Connected { .. }, .. }) |
                             Some(Wicket { state: WicketState::Disconnected, .. }) => {
-                                let tools: Vec<Value> = sockets.values()
-                                    .filter_map(|s| s.tools.as_ref())
-                                    .flat_map(|ts| ts.tools.iter().map(|t| {
-                                        json!({ "who": ts.who, "f": t.f, "description": t.description })
-                                    }))
-                                    .collect();
+                                let tools = collect_tools(sockets.values().filter_map(|s| s.tools.as_ref()));
                                 let _ = reply.send(serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()));
                             }
                             Some(wicket @ Wicket { state: WicketState::Starting, .. }) => {
@@ -2975,12 +2990,7 @@ async fn main() {
                                     }
                                     Err(e) => {
                                         trace!("easement", "wicket", "spawn_failed", "where": host, "error": e.to_string());
-                                        let tools: Vec<Value> = sockets.values()
-                                            .filter_map(|s| s.tools.as_ref())
-                                            .flat_map(|ts| ts.tools.iter().map(|t| {
-                                                json!({ "who": ts.who, "f": t.f, "description": t.description })
-                                            }))
-                                            .collect();
+                                        let tools = collect_tools(sockets.values().filter_map(|s| s.tools.as_ref()));
                                         let _ = reply.send(serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()));
                                     }
                                 }
