@@ -2813,6 +2813,10 @@ async fn main() {
         transcript: String,
         args: Value,
     }
+    struct ToolCall {
+        claim: ToolClaim,
+        client_id: u64,
+    }
     struct PendingShell {
         slug: String,
         transcript: String,
@@ -2820,7 +2824,7 @@ async fn main() {
     }
     let mut shutdown = false;
     let mut tool_claims: HashMap<String, ToolClaim> = HashMap::new();
-    let mut tool_calls: HashMap<String, ToolClaim> = HashMap::new();
+    let mut tool_calls: HashMap<String, ToolCall> = HashMap::new();
     let mut pending_shells: HashMap<String, PendingShell> = HashMap::new();
     struct Window {
         claude_tx: mpsc::UnboundedSender<ClaudeEvent>,
@@ -3103,12 +3107,12 @@ async fn main() {
                             .unwrap_or("localhost");
                         let inner_args = claim.args.get("args").cloned().unwrap_or(json!({}));
 
-                        let socket_tx = sockets.values()
-                            .find(|s| s.who.as_deref() == Some(who) && s.r#where == r#where)
-                            .map(|s| &s.tx);
+                        let socket = sockets.iter()
+                            .find(|(_, s)| s.who.as_deref() == Some(who) && s.r#where == r#where)
+                            .map(|(client_id, s)| (*client_id, &s.tx));
 
-                        match socket_tx {
-                            Some(tx) => {
+                        match socket {
+                            Some((client_id, tx)) => {
                                 trace!("easement", "tool", "dispatched", "call_id": call_id, "who": who, "f": f, "where": r#where);
                                 let mut flat_args = inner_args.as_object().cloned().unwrap_or_default();
                                 flat_args.insert("f".to_string(), json!(f));
@@ -3120,7 +3124,7 @@ async fn main() {
                                         args: Value::Object(flat_args),
                                     },
                                 });
-                                tool_calls.insert(call_id.clone(), claim);
+                                tool_calls.insert(call_id.clone(), ToolCall { claim, client_id });
                                 let _ = timer_tx.send(Delayed {
                                     ms: 86_400_000,
                                     event: MainEvent::ToolCallTimeout { call_id },
@@ -3148,7 +3152,7 @@ async fn main() {
                             Ok(Packet::Tool(ToolPacket::Claim { call_id })) => {
                                 if let Some(claim) = tool_claims.remove(&call_id) {
                                     trace!("easement", "tool", "claimed", "client_id": client_id, "call_id": call_id);
-                                    tool_calls.insert(call_id.clone(), claim);
+                                    tool_calls.insert(call_id.clone(), ToolCall { claim, client_id });
                                     let _ = timer_tx.send(Delayed {
                                         ms: 86_400_000,
                                         event: MainEvent::ToolCallTimeout { call_id },
@@ -3158,7 +3162,8 @@ async fn main() {
                                 }
                             }
                             Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code, changes })) => {
-                                if let Some(claim) = tool_calls.remove(&call_id) {
+                                if let Some(call) = tool_calls.remove(&call_id) {
+                                    let claim = call.claim;
                                     trace!("easement", "tool", "response", "client_id": client_id, "call_id": call_id, "exit_code": exit_code);
                                     let r#where = claim.args.get("args")
                                         .and_then(|a| a.get("where"))
@@ -3342,11 +3347,53 @@ async fn main() {
                         }
                     }
                     MainEvent::Disconnected { client_id } => {
-                        sockets.remove(&client_id);
+                        let disconnected_where = sockets
+                            .remove(&client_id)
+                            .map(|socket| socket.r#where)
+                            .unwrap_or_else(|| "unknown".to_string());
                         for wicket in wickets.values_mut() {
                             if matches!(wicket.state, WicketState::Connected { client_id: cid } if cid == client_id) {
                                 trace!("easement", "wicket", "disconnected", "client_id": client_id);
                                 wicket.state = WicketState::Disconnected;
+                            }
+                        }
+                        // A dispatched call belongs to the socket it was sent to. Once that
+                        // socket hangs up, the command may have completed, partially run, or
+                        // never started; Easement cannot know. Do not replay it on reconnect.
+                        // Fail it honestly and let the model/operator decide whether retrying is
+                        // safe.
+                        let hung_up: Vec<String> = tool_calls.iter()
+                            .filter_map(|(call_id, call)| {
+                                (call.client_id == client_id).then(|| call_id.clone())
+                            })
+                            .collect();
+                        for call_id in hung_up {
+                            if let Some(call) = tool_calls.remove(&call_id) {
+                                let claim = call.claim;
+                                let who = claim.args.get("who")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let r#where = claim.args.get("args")
+                                    .and_then(|a| a.get("where"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&disconnected_where);
+                                let output = if who == "wicket" {
+                                    format!(
+                                        "wicket on {} hung up while running tool call; command may or may not have completed",
+                                        r#where
+                                    )
+                                } else {
+                                    format!(
+                                        "client who={} where={} hung up while running tool call; operation may or may not have completed",
+                                        who, r#where
+                                    )
+                                };
+                                trace!("easement", "tool", "hung_up", "client_id": client_id, "call_id": call_id, "who": who, "where": r#where);
+                                let _ = claim.reply.send(ToolResult {
+                                    output,
+                                    exit_code: 1,
+                                    changes: None,
+                                });
                             }
                         }
                         trace!("easement", "websocket", "disconnected", "client_id": client_id);
@@ -3370,7 +3417,8 @@ async fn main() {
                         }
                     }
                     MainEvent::ToolCallTimeout { call_id } => {
-                        if let Some(claim) = tool_calls.remove(&call_id) {
+                        if let Some(call) = tool_calls.remove(&call_id) {
+                            let claim = call.claim;
                             trace!("easement", "tool", "call_timeout", "call_id": call_id);
                             let _ = claim.reply.send(ToolResult {
                                 output: "tool call timed out".to_string(),
