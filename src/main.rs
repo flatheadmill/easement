@@ -3196,13 +3196,16 @@ async fn main() {
                                 message,
                                 meta,
                             })) => {
-                                trace!("easement", "tool", "notification", "client_id": client_id, "message": message, "has_meta": meta.is_some());
-                                let text = join_user_message_meta(message, meta);
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
-                                let _ = win.claude_tx.send(ClaudeEvent::Turn {
-                                    turn_id: uuid::Uuid::new_v4().to_string(),
-                                    message: text,
-                                });
+                                trace!(
+                                    "easement",
+                                    "tool",
+                                    "notification",
+                                    "client_id": client_id,
+                                    "slug": slug,
+                                    "transcript": transcript,
+                                    "message": message,
+                                    "has_meta": meta.is_some()
+                                );
                             }
                             Ok(Packet::Turn(TurnPacket::Start { slug, transcript, turn_id, message, notification })) => {
                                 let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
