@@ -2120,6 +2120,7 @@ fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
             .arg(format!("--project={}", gcp.project))
             .arg(format!("--zone={}", gcp.zone))
             .arg(format!("--ssh-flag=-R {}:localhost:{}", port, port))
+            .arg("--ssh-flag=-A")
             .arg(format!(
                 "--command=PATH=\"$HOME/.local/bin:$PATH\" exec wicket {} {}",
                 wicket_url, host
@@ -2128,6 +2129,9 @@ fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
     } else {
         trace!("easement", "wicket", "spawn_branch", "host": host, "branch": "ssh");
         let mut c = tokio::process::Command::new("ssh");
+        // Forward the ssh agent so the remote Wicket can authenticate onward
+        // (git pushes, further ssh hops) with the operator's keys.
+        c.arg("-A");
         if !is_orb {
             c.arg("-R").arg(format!("{}:localhost:{}", port, port));
         }
