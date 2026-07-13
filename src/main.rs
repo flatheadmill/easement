@@ -2326,29 +2326,7 @@ async fn handle_mcp(
 
             match reply_rx.await {
                 Ok(result) => {
-                    if who == "wicket" && f == "read_pdf" && result.exit_code == 0 {
-                        match serde_json::from_str::<Value>(&result.output) {
-                            Ok(content) => {
-                                let (inject_tx, inject_rx) = oneshot::channel();
-                                let _ = main_tx.send(MainEvent::UserContentTurn {
-                                    slug: slug.to_string(),
-                                    transcript: ts.to_string(),
-                                    turn_id: uuid::Uuid::new_v4().to_string(),
-                                    content,
-                                    reply: inject_tx,
-                                });
-                                let _ = inject_rx.await;
-                                jsonrpc_response(
-                                    id,
-                                    json!({ "content": [{ "type": "text", "text": "PDF attached to the conversation." }] }),
-                                )
-                            }
-                            Err(_) => jsonrpc_response(
-                                id,
-                                json!({ "content": [{ "type": "text", "text": result.output }] }),
-                            ),
-                        }
-                    } else if (f == "view_image" || f == "screenshot") && result.exit_code == 0 {
+                    if (f == "view_image" || f == "screenshot") && result.exit_code == 0 {
                         match serde_json::from_str::<Value>(&result.output) {
                             Ok(content) => jsonrpc_response(id, json!({ "content": content })),
                             Err(_) => jsonrpc_response(
