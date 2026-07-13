@@ -937,12 +937,6 @@ enum Dispatch {
         #[serde(flatten)]
         event: ToolDispatch,
     },
-    Shell {
-        slug: String,
-        transcript: String,
-        #[serde(flatten)]
-        event: ShellDispatch,
-    },
 }
 
 #[derive(Serialize)]
@@ -952,16 +946,6 @@ enum ToolDispatch {
         call_id: String,
         #[serde(flatten)]
         args: Value,
-    },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum ShellDispatch {
-    Run {
-        id: String,
-        command: String,
-        r#where: String,
     },
 }
 
@@ -2421,8 +2405,6 @@ struct Delayed {
     event: MainEvent,
 }
 
-const SHELL_COMMAND_TIMEOUT_MS: u64 = 60_000;
-
 struct Deadline {
     when: tokio::time::Instant,
     event: MainEvent,
@@ -2551,29 +2533,7 @@ fn collect_tools<'a>(toolsets: impl Iterator<Item = &'a ToolSet>) -> Vec<Value> 
 #[serde(tag = "what", rename_all = "snake_case")]
 enum Packet {
     Tool(ToolPacket),
-    Turn(TurnPacket),
-    History(HistoryPacket),
     Socket(SocketPacket),
-    Shell(ShellPacket),
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum ShellPacket {
-    Run {
-        id: String,
-        slug: String,
-        transcript: String,
-        command: String,
-    },
-    Response {
-        id: String,
-        slug: String,
-        transcript: String,
-        output: String,
-        #[serde(default)]
-        exit_code: i32,
-    },
 }
 
 #[derive(serde::Deserialize)]
@@ -2611,41 +2571,6 @@ enum ToolPacket {
         message: String,
         #[serde(default)]
         meta: Option<String>,
-    },
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum TurnPacket {
-    Start {
-        slug: String,
-        transcript: String,
-        turn_id: String,
-        message: String,
-        #[serde(default)]
-        notification: bool,
-    },
-    Steer {
-        slug: String,
-        transcript: String,
-        message: String,
-        expected_turn_id: String,
-    },
-    Interrupt {
-        slug: String,
-        transcript: String,
-        #[serde(default)]
-        turn_id: Option<String>,
-    },
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum HistoryPacket {
-    Replay {
-        slug: String,
-        transcript: String,
-        replay_id: String,
     },
 }
 
@@ -2695,9 +2620,6 @@ enum MainEvent {
     },
     ToolCallTimeout {
         call_id: String,
-    },
-    ShellTimeout {
-        id: String,
     },
     UserContentTurn {
         slug: String,
@@ -2765,7 +2687,6 @@ async fn main() {
                 key.clone(),
                 Window {
                     claude_tx,
-                    shebang_host: "localhost".to_string(),
                 },
             );
         }
@@ -2799,18 +2720,11 @@ async fn main() {
         claim: ToolClaim,
         client_id: u64,
     }
-    struct PendingShell {
-        slug: String,
-        transcript: String,
-        r#where: String,
-    }
     let mut shutdown = false;
     let mut tool_claims: HashMap<String, ToolClaim> = HashMap::new();
     let mut tool_calls: HashMap<String, ToolCall> = HashMap::new();
-    let mut pending_shells: HashMap<String, PendingShell> = HashMap::new();
     struct Window {
         claude_tx: mpsc::UnboundedSender<ClaudeEvent>,
-        shebang_host: String,
     }
     let mut windows: HashMap<(String, String), Window> = HashMap::new();
 
@@ -3147,22 +3061,8 @@ async fn main() {
                                 if let Some(call) = tool_calls.remove(&call_id) {
                                     let claim = call.claim;
                                     trace!("easement", "tool", "response", "client_id": client_id, "call_id": call_id, "exit_code": exit_code);
-                                    let r#where = claim.args.get("args")
-                                        .and_then(|a| a.get("where"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("localhost");
-                                    let key = (claim.slug.clone(), claim.transcript.clone());
-                                    if let Some(win) = windows.get_mut(&key) {
-                                        win.shebang_host = r#where.to_string();
-                                    }
-                                    if let Some(ref changes) = changes {
-                                        if let Some(win) = windows.get_mut(&key) {
-                                            let _ = win.claude_tx.send(ClaudeEvent::PatchChanges {
-                                                changes: changes.clone(),
-                                            });
-                                        } else {
-                                            trace!("easement", "tool", "patch_changes_without_window", "call_id": call_id);
-                                        }
+                                    if changes.is_some() {
+                                        trace!("easement", "tool", "patch_changes_retired", "call_id": call_id);
                                     }
                                     let _ = claim.reply.send(ToolResult { output, exit_code, changes });
                                 } else {
@@ -3188,88 +3088,6 @@ async fn main() {
                                     "message": message,
                                     "has_meta": meta.is_some()
                                 );
-                            }
-                            Ok(Packet::Turn(TurnPacket::Start { slug, transcript, turn_id, message, notification })) => {
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
-                                let message = if notification && !message.contains('\x07') {
-                                    format!("{}\x07", message)
-                                } else {
-                                    message
-                                };
-                                let _ = win.claude_tx.send(ClaudeEvent::Turn { turn_id, message });
-                            }
-                            Ok(Packet::Turn(TurnPacket::Steer { slug, transcript, message, expected_turn_id })) => {
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
-                                let _ = win.claude_tx.send(ClaudeEvent::Steer { message, expected_turn_id });
-                            }
-                            Ok(Packet::Turn(TurnPacket::Interrupt { slug, transcript, turn_id })) => {
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
-                                let _ = win.claude_tx.send(ClaudeEvent::Interrupt { turn_id });
-                            }
-                            Ok(Packet::History(HistoryPacket::Replay { slug, transcript, replay_id })) => {
-                                match resolve_transcript(&slug, &transcript).await {
-                                    Some(resolved) => {
-                                        trace!("easement", "history", "replay", "slug": slug, "transcript": resolved, "replay_id": replay_id);
-                                        let win = window_for(&mut windows, &slug, &resolved, &token, &broadcast_tx, &main_tx);
-                                        let _ = win.claude_tx.send(ClaudeEvent::HistoryReplay { replay_id });
-                                    }
-                                    None => {
-                                        trace!("easement", "history", "not_found", "slug": slug, "transcript": transcript);
-                                    }
-                                }
-                            }
-                            Ok(Packet::Shell(ShellPacket::Run { id, slug, transcript, command })) => {
-                                let win = window_for(&mut windows, &slug, &transcript, &token, &broadcast_tx, &main_tx);
-                                let r#where = win.shebang_host.clone();
-                                let socket_tx = sockets.values()
-                                    .find(|s| s.who.as_deref() == Some("wicket") && s.r#where == r#where)
-                                    .map(|s| &s.tx);
-                                match socket_tx {
-                                    Some(tx) => {
-                                        dispatch(tx, Dispatch::Shell {
-                                            slug: slug.clone(),
-                                            transcript: transcript.clone(),
-                                            event: ShellDispatch::Run {
-                                                id: id.clone(),
-                                                command,
-                                                r#where: r#where.clone(),
-                                            },
-                                        });
-                                        pending_shells.insert(id.clone(), PendingShell {
-                                            slug,
-                                            transcript,
-                                            r#where: r#where.clone(),
-                                        });
-                                        let _ = timer_tx.send(Delayed {
-                                            ms: SHELL_COMMAND_TIMEOUT_MS,
-                                            event: MainEvent::ShellTimeout { id },
-                                        });
-                                    }
-                                    None => {
-                                        trace!("easement", "shell", "no_wicket", "id": id, "where": r#where);
-                                        broadcast(&broadcast_tx, Broadcast::ShellResult {
-                                            slug,
-                                            transcript,
-                                            id,
-                                            output: format!("no connected Wicket for host {}", r#where),
-                                            exit_code: 1,
-                                        });
-                                    }
-                                }
-                            }
-                            Ok(Packet::Shell(ShellPacket::Response { id, slug, transcript, output, exit_code })) => {
-                                if let Some(pending) = pending_shells.remove(&id) {
-                                    trace!("easement", "shell", "response", "client_id": client_id, "id": id, "exit_code": exit_code);
-                                    broadcast(&broadcast_tx, Broadcast::ShellResult {
-                                        slug: pending.slug,
-                                        transcript: pending.transcript,
-                                        id,
-                                        output,
-                                        exit_code,
-                                    });
-                                } else {
-                                    trace!("easement", "shell", "stale_response", "client_id": client_id, "id": id, "slug": slug, "transcript": transcript, "exit_code": exit_code);
-                                }
                             }
                             Ok(Packet::Socket(SocketPacket::Connect { who, r#where, tools })) => {
                                 let toolset = ToolSet { who: who.clone(), tools };
@@ -3409,22 +3227,6 @@ async fn main() {
                                 output: "tool call timed out".to_string(),
                                 exit_code: 1,
                                 changes: None,
-                            });
-                        }
-                    }
-                    MainEvent::ShellTimeout { id } => {
-                        if let Some(pending) = pending_shells.remove(&id) {
-                            let seconds = SHELL_COMMAND_TIMEOUT_MS / 1000;
-                            trace!("easement", "shell", "timeout", "id": id, "where": pending.r#where);
-                            broadcast(&broadcast_tx, Broadcast::ShellResult {
-                                slug: pending.slug,
-                                transcript: pending.transcript,
-                                id,
-                                output: format!(
-                                    "shell command timed out after {}s on {} (process may still be running)",
-                                    seconds, pending.r#where
-                                ),
-                                exit_code: 1,
                             });
                         }
                     }
