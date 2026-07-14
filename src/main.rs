@@ -67,32 +67,6 @@ macro_rules! trace {
     };
 }
 
-macro_rules! wire {
-    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(1, LogMessage {
-            when: now(),
-            level: 1,
-            who: $who,
-            what: $what,
-            why: $why,
-            payload: serde_json::json!({ $($key: $val),* }),
-        })
-    };
-}
-
-macro_rules! dump {
-    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(2, LogMessage {
-            when: now(),
-            level: 2,
-            who: $who,
-            what: $what,
-            why: $why,
-            payload: serde_json::json!({ $($key: $val),* }),
-        })
-    };
-}
-
 macro_rules! error {
     ($who:expr, $what:expr, $how:expr, $error:expr $(, $key:tt: $val:expr)* $(,)?) => {
         crate::log(0, LogMessage {
@@ -190,86 +164,6 @@ struct ToolResult {
 
 #[derive(Serialize)]
 #[serde(tag = "what", rename_all = "snake_case")]
-enum Broadcast {
-    History {
-        slug: String,
-        transcript: String,
-        #[serde(flatten)]
-        event: HistoryBroadcast,
-    },
-    Delta {
-        slug: String,
-        transcript: String,
-        event: Value,
-    },
-    Usage {
-        slug: String,
-        transcript: String,
-        #[serde(flatten)]
-        usage: Value,
-    },
-    Turn {
-        slug: String,
-        transcript: String,
-        #[serde(flatten)]
-        event: TurnBroadcast,
-    },
-    UserMessage {
-        slug: String,
-        transcript: String,
-        text: String,
-        notification: bool,
-    },
-    ToolResult {
-        slug: String,
-        transcript: String,
-        tool_use_id: String,
-        output: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        changes: Option<Value>,
-        #[serde(default)]
-        is_error: bool,
-    },
-    ShellResult {
-        slug: String,
-        transcript: String,
-        id: String,
-        output: String,
-        exit_code: i32,
-    },
-    Error {
-        slug: String,
-        transcript: String,
-        code: String,
-        message: String,
-        recoverable: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        details: Option<Value>,
-    },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum HistoryBroadcast {
-    Begin {
-        replay_id: String,
-        last_uuid: Option<String>,
-    },
-    Entry {
-        replay_id: String,
-        entry: Value,
-    },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum TurnBroadcast {
-    Started { turn_id: String },
-    Completed { turn_id: String, status: String },
-}
-
-#[derive(Serialize)]
-#[serde(tag = "what", rename_all = "snake_case")]
 enum Dispatch {
     Tool {
         slug: String,
@@ -290,12 +184,6 @@ enum ToolDispatch {
 }
 
 fn dispatch(tx: &mpsc::UnboundedSender<String>, msg: Dispatch) {
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = tx.send(json);
-    }
-}
-
-fn broadcast(tx: &broadcast::Sender<String>, msg: Broadcast) {
     if let Ok(json) = serde_json::to_string(&msg) {
         let _ = tx.send(json);
     }
@@ -832,9 +720,6 @@ enum SocketPacket {
 #[derive(serde::Deserialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum ToolPacket {
-    Claim {
-        call_id: String,
-    },
     Response {
         call_id: String,
         output: String,
@@ -910,7 +795,6 @@ enum MainEvent {
 async fn main() {
     init_log();
 
-    let (broadcast_tx, _) = broadcast::channel::<String>(65536);
     let port = easement_port();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
@@ -1013,21 +897,10 @@ async fn main() {
                         let (socket_tx, mut socket_rx) = mpsc::unbounded_channel::<String>();
                         sockets.insert(client_id, Socket { tx: socket_tx, who: None, r#where: "localhost".to_string(), tools: None });
 
-                        let mut broadcast_rx = broadcast_tx.subscribe();
                         tokio::spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    Some(msg) = socket_rx.recv() => {
-                                        if sink.send(Message::text(msg)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Ok(msg) = broadcast_rx.recv() => {
-                                        if sink.send(Message::text(msg)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    else => break,
+                            while let Some(msg) = socket_rx.recv().await {
+                                if sink.send(Message::text(msg)).await.is_err() {
+                                    break;
                                 }
                             }
                         });
@@ -1061,6 +934,10 @@ async fn main() {
                     }
                     MainEvent::ToolCheck { event } => {
                         if shutdown {
+                            // Shutdown is not currently settable. If it becomes real,
+                            // handle every event that can be stashed behind ToolCheck,
+                            // including ToolCallEnsured drained after a Wicket reconnect;
+                            // otherwise this branch will panic during shutdown cleanup.
                             match *event {
                                 MainEvent::ToolCall { reply, .. } => {
                                     let _ = reply.send(ToolResult {
@@ -1258,27 +1135,11 @@ async fn main() {
                             }
                         }
                     }
-                    // Tool call lifecycle: broadcast goes out, one client claims, that client
-                    // sends the response. We assume one claim per call_id. If two clients claim
-                    // the same call, something is wrong with the network topology -- two Wickets
-                    // on different hosts both handling the same slug, or a stale Wicket that
-                    // should have been killed. A duplicate claim in production could mean a
-                    // destructive command reaches the wrong host. We log and panic because
-                    // silent corruption is worse than a crash.
+                    // Tool runs are directed to one socket by (who, where). Current clients
+                    // answer with a response for that call_id; the old broadcast-and-claim
+                    // lifecycle is retired.
                     MainEvent::Packet { client_id, data } => {
                         match serde_json::from_value::<Packet>(data) {
-                            Ok(Packet::Tool(ToolPacket::Claim { call_id })) => {
-                                if let Some(claim) = tool_claims.remove(&call_id) {
-                                    trace!("easement", "tool", "claimed", "client_id": client_id, "call_id": call_id);
-                                    tool_calls.insert(call_id.clone(), ToolCall { claim, client_id });
-                                    let _ = timer_tx.send(Delayed {
-                                        ms: 86_400_000,
-                                        event: MainEvent::ToolCallTimeout { call_id },
-                                    });
-                                } else {
-                                    trace!("easement", "tool", "stale_claim", "client_id": client_id, "call_id": call_id);
-                                }
-                            }
                             Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code, changes })) => {
                                 if let Some(call) = tool_calls.remove(&call_id) {
                                     let claim = call.claim;
