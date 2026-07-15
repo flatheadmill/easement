@@ -434,7 +434,6 @@ async fn handle_mcp(
             };
 
             trace!("easement", "mcp", "tools_call", "tool": params.name, "arguments": params.arguments);
-            let ts = transcript.unwrap_or("");
 
             if params.name == "approve" {
                 let updated_input = params
@@ -500,7 +499,6 @@ async fn handle_mcp(
                 event: Box::new(MainEvent::ToolCall {
                     call_id,
                     slug: slug.to_string(),
-                    transcript: ts.to_string(),
                     tool: f.clone(),
                     args: json!({ "who": who, "f": f, "args": args }),
                     reply: reply_tx,
@@ -763,7 +761,6 @@ enum MainEvent {
     ToolCall {
         call_id: String,
         slug: String,
-        transcript: String,
         tool: String,
         args: Value,
         reply: oneshot::Sender<ToolResult>,
@@ -771,7 +768,6 @@ enum MainEvent {
     ToolCallEnsured {
         call_id: String,
         slug: String,
-        transcript: String,
         tool: String,
         args: Value,
         reply: oneshot::Sender<ToolResult>,
@@ -825,7 +821,6 @@ async fn main() {
     struct ToolClaim {
         reply: oneshot::Sender<ToolResult>,
         slug: String,
-        transcript: String,
         args: Value,
     }
     struct ToolCall {
@@ -997,12 +992,12 @@ async fn main() {
                             }
                         }
                     }
-                    MainEvent::ToolCall { call_id, slug, transcript, tool, args, reply } => {
+                    MainEvent::ToolCall { call_id, slug, tool, args, reply } => {
                         let who = args.get("who").and_then(|v| v.as_str()).unwrap_or("");
 
                         if who != "wicket" {
                             let _ = main_tx.send(MainEvent::ToolCallEnsured {
-                                call_id, slug, transcript, tool, args, reply,
+                                call_id, slug, tool, args, reply,
                             });
                             continue;
                         }
@@ -1019,8 +1014,7 @@ async fn main() {
                             }
                         };
                         let ensured = MainEvent::ToolCallEnsured {
-                            call_id: call_id.clone(), slug: slug.clone(),
-                            transcript: transcript.clone(), tool, args, reply,
+                            call_id: call_id.clone(), slug: slug.clone(), tool, args, reply,
                         };
 
                         match wickets.get_mut(&r#where) {
@@ -1076,13 +1070,13 @@ async fn main() {
                             }
                         }
                     }
-                    MainEvent::ToolCallEnsured { call_id, slug, transcript, tool, args, reply } => {
+                    MainEvent::ToolCallEnsured { call_id, slug, tool, args, reply } => {
                         trace!("easement", "tool", "ensured", "call_id": call_id, "slug": slug, "tool": tool);
 
                         // The tool path now dispatches directly. The retired print engine
                         // used to receive queued steers before tools ran; CCCLI owns the
                         // conversation now, so Easement only inserts the claim and steers it.
-                        tool_claims.insert(call_id.clone(), ToolClaim { reply, slug, transcript, args });
+                        tool_claims.insert(call_id.clone(), ToolClaim { reply, slug, args });
                         let _ = main_tx.send(MainEvent::ToolSteered { call_id });
                     }
                     MainEvent::ToolSteered { call_id } => {
@@ -1113,7 +1107,7 @@ async fn main() {
                                 flat_args.insert("f".to_string(), json!(f));
                                 dispatch(tx, Dispatch::Tool {
                                     slug: claim.slug.clone(),
-                                    transcript: claim.transcript.clone(),
+                                    transcript: "".to_string(),
                                     event: ToolDispatch::Run {
                                         call_id: call_id.clone(),
                                         args: Value::Object(flat_args),
