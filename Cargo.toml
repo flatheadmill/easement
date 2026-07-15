@@ -15,6 +15,4 @@ http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"
 tokio-tungstenite = "0.24"
-base64 = "0.22"
 chrono = "0.4"
-tokio-util = { version = "0.7", features = ["rt"] }
