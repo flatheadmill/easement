@@ -167,7 +167,6 @@ struct ToolResult {
 enum Dispatch {
     Tool {
         slug: String,
-        transcript: String,
         #[serde(flatten)]
         event: ToolDispatch,
     },
@@ -733,11 +732,67 @@ enum ToolPacket {
     },
     Notification {
         slug: String,
+        #[serde(default)]
         transcript: String,
         message: String,
         #[serde(default)]
         meta: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_tool_omits_transcript() {
+        let msg = Dispatch::Tool {
+            slug: "puzzle".to_string(),
+            event: ToolDispatch::Run {
+                call_id: "call-1".to_string(),
+                args: json!({ "f": "zsh", "where": "localhost" }),
+            },
+        };
+        let value = serde_json::to_value(msg).unwrap();
+
+        assert_eq!(value.get("what").and_then(|v| v.as_str()), Some("tool"));
+        assert_eq!(value.get("why").and_then(|v| v.as_str()), Some("run"));
+        assert_eq!(value.get("slug").and_then(|v| v.as_str()), Some("puzzle"));
+        assert!(value.get("transcript").is_none());
+    }
+
+    #[test]
+    fn notification_decodes_with_and_without_transcript() {
+        let with_transcript = json!({
+            "what": "tool",
+            "why": "notification",
+            "slug": "puzzle",
+            "transcript": "",
+            "message": "Background job exited."
+        });
+        let without_transcript = json!({
+            "what": "tool",
+            "why": "notification",
+            "slug": "puzzle",
+            "message": "Background job exited."
+        });
+
+        let with: Packet = serde_json::from_value(with_transcript).unwrap();
+        let without: Packet = serde_json::from_value(without_transcript).unwrap();
+
+        match with {
+            Packet::Tool(ToolPacket::Notification { transcript, .. }) => {
+                assert_eq!(transcript, "");
+            }
+            _ => panic!("expected tool notification"),
+        }
+        match without {
+            Packet::Tool(ToolPacket::Notification { transcript, .. }) => {
+                assert_eq!(transcript, "");
+            }
+            _ => panic!("expected tool notification"),
+        }
+    }
 }
 
 enum MainEvent {
@@ -1107,7 +1162,6 @@ async fn main() {
                                 flat_args.insert("f".to_string(), json!(f));
                                 dispatch(tx, Dispatch::Tool {
                                     slug: claim.slug.clone(),
-                                    transcript: "".to_string(),
                                     event: ToolDispatch::Run {
                                         call_id: call_id.clone(),
                                         args: Value::Object(flat_args),
