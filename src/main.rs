@@ -82,10 +82,6 @@ macro_rules! log_fields {
         $with.insert(stringify!($key).to_string(), serde_json::json!($value));
         log_fields!($record, $with, $($rest)*);
     };
-    ($record:ident, $with:ident, $key:literal: $value:expr, $($rest:tt)*) => {
-        $with.insert($key.to_string(), serde_json::json!($value));
-        log_fields!($record, $with, $($rest)*);
-    };
 }
 
 macro_rules! log_record {
@@ -100,6 +96,7 @@ macro_rules! log_record {
             noise: $noise,
             r#with: Value::Null,
         };
+        #[allow(unused_mut)]
         let mut details = serde_json::Map::new();
         log_fields!(record, details, $($key: $value,)*);
         record.r#with = Value::Object(details);
@@ -111,22 +108,11 @@ macro_rules! trace {
     ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
         crate::log(log_record!(0, $who, $what $(, $key: $value)*))
     };
-    ($who:expr, $what:expr, $legacy_why:expr $(, $key:tt: $value:expr)* $(,)?) => {
-        crate::log(log_record!(0, $who, $what, why: $legacy_why $(, $key: $value)*))
-    };
 }
 
 macro_rules! error {
     ($who:expr, $what:expr, $error:expr $(, $key:ident: $value:expr)* $(,)?) => {
         crate::log(log_record!(0, $who, $what, why: $error.to_string() $(, $key: $value)*))
-    };
-    ($who:expr, $what:expr, $legacy_how:expr, $error:expr $(, $key:tt: $value:expr)* $(,)?) => {
-        crate::log(log_record!(0, $who, $what,
-            why: "error",
-            how: $legacy_how,
-            error: $error.to_string()
-            $(, $key: $value)*
-        ))
     };
 }
 
@@ -328,20 +314,24 @@ fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
     };
 
     let mut cmd = if host == "localhost" {
-        trace!("easement", "wicket", "spawn_branch", "host": host, "branch": "local");
+        trace!("wicket", "spawn",
+            whom: "wicket",
+            where: host,
+            how: "local",
+        );
         let mut c = tokio::process::Command::new("wicket");
         c.arg(&wicket_url).arg(host);
         c
     } else if let Some(gcp) = parse_gcp_internal_host(host) {
         trace!(
-            "easement",
             "wicket",
-            "spawn_branch",
-            "host": host,
-            "branch": "gcp",
-            "instance": gcp.instance,
-            "zone": gcp.zone,
-            "project": gcp.project
+            "spawn",
+            whom: "wicket",
+            where: host,
+            how: "gcloud",
+            instance: gcp.instance,
+            zone: gcp.zone,
+            project: gcp.project,
         );
         let mut c = tokio::process::Command::new("gcloud");
         c.arg("compute")
@@ -357,7 +347,11 @@ fn spawn_wicket(host: &str) -> Result<tokio::process::Child, String> {
             ));
         c
     } else {
-        trace!("easement", "wicket", "spawn_branch", "host": host, "branch": "ssh");
+        trace!("wicket", "spawn",
+            whom: "wicket",
+            where: host,
+            how: "ssh",
+        );
         let mut c = tokio::process::Command::new("ssh");
         // Forward the ssh agent so the remote Wicket can authenticate onward
         // (git pushes, further ssh hops) with the operator's keys.
@@ -389,7 +383,12 @@ async fn handle_mcp(
     transcript: Option<&str>,
     main_tx: mpsc::UnboundedSender<MainEvent>,
 ) -> Response<Full<Bytes>> {
-    trace!("easement", "mcp", "request", "slug": slug, "transcript": transcript, "method": req.method().to_string());
+    trace!("mcp", "request",
+        how: "http",
+        slug: slug,
+        transcript: transcript,
+        method: req.method().to_string(),
+    );
     if req.method() != hyper::Method::POST {
         return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -480,7 +479,11 @@ async fn handle_mcp(
                 }
             };
 
-            trace!("easement", "mcp", "tools_call", "tool": params.name, "arguments": params.arguments);
+            trace!("mcp", "call",
+                how: "http",
+                tool: params.name,
+                arguments: params.arguments,
+            );
 
             if params.name == "approve" {
                 let updated_input = params
@@ -608,7 +611,11 @@ async fn handle_request(
                 Ok(response)
             }
             Err(e) => {
-                error!("easement", "websocket", "upgrade_error", e);
+                error!("websocket", "fail_upgrade", e,
+                    whom: "client",
+                    where: peer,
+                    how: "websocket",
+                );
                 Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from(format!("upgrade error: {}", e))))
@@ -793,27 +800,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_entry_uses_the_record_envelope_grammar() {
-        let entry = LogEntry {
-            when: "2026-07-15T12:00:00.000Z".to_string(),
-            who: "easement",
-            what: log_record!(0, "easement", "dispatch",
-                whom: "wicket",
-                where: "localhost",
-                why: "the tool call matched a connected client",
-                how: "websocket",
-                call_id: "call-1",
-                client_id: 7,
-                f: "zsh",
-            ),
+    fn log_entries_use_the_record_envelope_grammar() {
+        let render = |record| {
+            serde_json::to_string(&LogEntry {
+                when: "2026-07-16T12:00:00.000Z".to_string(),
+                who: "easement",
+                what: record,
+            })
+            .unwrap()
         };
-        let line = serde_json::to_string(&entry).unwrap();
+
+        let dispatch = render(log_record!(0, "tool", "dispatch",
+            whom: "wicket",
+            where: "localhost",
+            why: "the tool call matched a connected client",
+            how: "websocket",
+            call_id: "call-1",
+            client_id: 7,
+            f: "zsh",
+        ));
+        let spawn = render(log_record!(0, "wicket", "spawn",
+            whom: "wicket",
+            where: "yolo@orb",
+            how: "ssh",
+        ));
+        let connect = render(log_record!(0, "websocket", "connect",
+            whom: "wicket",
+            where: "localhost",
+            why: "the client advertised its tool manifest",
+            how: "websocket",
+            client_id: 7,
+            tools: 8,
+        ));
 
         assert_eq!(
-            line,
-            r#"{"when":"2026-07-15T12:00:00.000Z","who":"easement","what":{"who":"easement","whom":"wicket","what":"dispatch","where":"localhost","why":"the tool call matched a connected client","how":"websocket","noise":0,"with":{"call_id":"call-1","client_id":7,"f":"zsh"}}}"#
+            dispatch,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"tool","whom":"wicket","what":"dispatch","where":"localhost","why":"the tool call matched a connected client","how":"websocket","noise":0,"with":{"call_id":"call-1","client_id":7,"f":"zsh"}}}"#
         );
-        println!("{line}");
+        assert_eq!(
+            spawn,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"wicket","whom":"wicket","what":"spawn","where":"yolo@orb","how":"ssh","noise":0,"with":{}}}"#
+        );
+        assert_eq!(
+            connect,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"websocket","whom":"wicket","what":"connect","where":"localhost","why":"the client advertised its tool manifest","how":"websocket","noise":0,"with":{"client_id":7,"tools":8}}}"#
+        );
+
+        for line in [dispatch, spawn, connect] {
+            println!("{line}");
+        }
     }
 
     #[test]
@@ -923,7 +958,11 @@ async fn main() {
 
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
-            trace!("easement", "lifecycle", "started", "port": port, "addr": addr.to_string());
+            trace!("lifecycle", "start",
+                where: addr,
+                how: "tcp",
+                port: port,
+            );
             l
         }
         Err(e) => {
@@ -975,7 +1014,11 @@ async fn main() {
                 let (stream, peer) = match result {
                     Ok(s) => s,
                     Err(e) => {
-                        error!("easement", "lifecycle", "accept_error", e);
+                        error!("lifecycle", "fail_accept", e,
+                            whom: "client",
+                            where: addr,
+                            how: "tcp",
+                        );
                         continue;
                     }
                 };
@@ -994,7 +1037,11 @@ async fn main() {
                         .with_upgrades()
                         .await
                     {
-                        trace!("easement", "websocket", "connection_error", "peer": peer.to_string(), "error": e.to_string());
+                        error!("websocket", "fail_connection", e,
+                            whom: "client",
+                            where: peer,
+                            how: "http",
+                        );
                     }
                 });
             }
@@ -1004,14 +1051,23 @@ async fn main() {
                         let ws_stream = match ws.await {
                             Ok(s) => s,
                             Err(e) => {
-                                error!("easement", "websocket", "upgrade_failed", e, "peer": peer.to_string());
+                                error!("websocket", "fail_upgrade", e,
+                                    whom: "client",
+                                    where: peer,
+                                    how: "websocket",
+                                );
                                 continue;
                             }
                         };
 
                         let client_id = next_client_id;
                         next_client_id += 1;
-                        trace!("easement", "websocket", "connected", "client_id": client_id, "peer": peer.to_string());
+                        trace!("websocket", "connect",
+                            whom: "client",
+                            where: peer,
+                            how: "websocket",
+                            client_id: client_id,
+                        );
 
                         let (mut sink, mut stream) = ws_stream.split();
 
@@ -1038,19 +1094,34 @@ async fn main() {
                                                 let _ = main_tx.send(MainEvent::Packet { client_id, data });
                                             }
                                             Err(e) => {
-                                                error!("easement", "websocket", "bad_json", e, "client_id": client_id);
+                                                error!("websocket", "reject", e,
+                                                    whom: "client",
+                                                    where: peer,
+                                                    how: "json",
+                                                    client_id: client_id,
+                                                );
                                             }
                                         }
                                     }
                                     Ok(Message::Close(_)) => break,
                                     Err(e) => {
-                                        error!("easement", "websocket", "stream", e, "client_id": client_id);
+                                        error!("websocket", "fail_stream", e,
+                                            whom: "client",
+                                            where: peer,
+                                            how: "websocket",
+                                            client_id: client_id,
+                                        );
                                         break;
                                     }
                                     _ => {}
                                 }
                             }
-                            trace!("easement", "websocket", "reader_exited", "client_id": client_id);
+                            trace!("websocket", "exit",
+                                whom: "client",
+                                where: peer,
+                                how: "websocket",
+                                client_id: client_id,
+                            );
                             let _ = main_tx.send(MainEvent::Disconnected { client_id });
                         });
                     }
@@ -1091,7 +1162,11 @@ async fn main() {
                             None => {
                                 match spawn_wicket(&host) {
                                     Ok(mut child) => {
-                                        trace!("easement", "wicket", "spawning", "where": host);
+                                        trace!("wicket", "spawn",
+                                            whom: "wicket",
+                                            where: host,
+                                            why: "tool discovery found no wicket process",
+                                        );
                                         let main_tx = main_tx.clone();
                                         let where_clone = host.clone();
                                         tokio::spawn(async move {
@@ -1111,7 +1186,10 @@ async fn main() {
                                         });
                                     }
                                     Err(e) => {
-                                        trace!("easement", "wicket", "spawn_failed", "where": host, "error": e.to_string());
+                                        error!("wicket", "fail_spawn", e,
+                                            whom: "wicket",
+                                            where: host,
+                                        );
                                         let tools = collect_tools(sockets.values().filter_map(|s| s.tools.as_ref()));
                                         let _ = reply.send(serde_json::to_string_pretty(&tools).unwrap_or_else(|_| "[]".to_string()));
                                     }
@@ -1149,7 +1227,12 @@ async fn main() {
                                 let _ = main_tx.send(ensured);
                             }
                             Some(wicket @ Wicket { state: WicketState::Starting, .. }) => {
-                                trace!("easement", "tool", "stashed", "call_id": call_id, "where": r#where);
+                                trace!("tool", "stash",
+                                    whom: "wicket",
+                                    where: r#where,
+                                    why: "the wicket process is starting",
+                                    call_id: call_id,
+                                );
                                 wicket.stashed.push(ensured);
                             }
                             Some(Wicket { state: WicketState::Disconnected, .. }) => {
@@ -1164,7 +1247,11 @@ async fn main() {
                             None => {
                                 match spawn_wicket(&r#where) {
                                     Ok(mut child) => {
-                                        trace!("easement", "wicket", "spawning", "where": r#where);
+                                        trace!("wicket", "spawn",
+                                            whom: "wicket",
+                                            where: r#where,
+                                            why: "a tool call found no wicket process",
+                                        );
                                         let main_tx = main_tx.clone();
                                         let where_clone = r#where.clone();
                                         tokio::spawn(async move {
@@ -1184,7 +1271,10 @@ async fn main() {
                                         });
                                     }
                                     Err(e) => {
-                                        trace!("easement", "wicket", "spawn_failed", "where": r#where, "error": e.to_string());
+                                        error!("wicket", "fail_spawn", e,
+                                            whom: "wicket",
+                                            where: r#where,
+                                        );
                                         if let MainEvent::ToolCallEnsured { reply, .. } = ensured {
                                             let _ = reply.send(ToolResult {
                                                 output: format!("failed to spawn wicket on {}: {}", r#where, e),
@@ -1198,7 +1288,11 @@ async fn main() {
                         }
                     }
                     MainEvent::ToolCallEnsured { call_id, slug, tool, args, reply } => {
-                        trace!("easement", "tool", "ensured", "call_id": call_id, "slug": slug, "tool": tool);
+                        trace!("tool", "ensure",
+                            call_id: call_id,
+                            slug: slug,
+                            tool: tool,
+                        );
 
                         // The tool path now dispatches directly. The retired print engine
                         // used to receive queued steers before tools ran; CCCLI owns the
@@ -1207,11 +1301,16 @@ async fn main() {
                         let _ = main_tx.send(MainEvent::ToolSteered { call_id });
                     }
                     MainEvent::ToolSteered { call_id } => {
-                        trace!("easement", "tool", "steered", "call_id": call_id);
+                        trace!("tool", "steer",
+                            call_id: call_id,
+                        );
                         let claim = match tool_claims.remove(&call_id) {
                             Some(c) => c,
                             None => {
-                                trace!("easement", "tool", "steer_unknown", "call_id": call_id);
+                                trace!("tool", "reject_steer",
+                                    why: "no pending tool claim matched the steer",
+                                    call_id: call_id,
+                                );
                                 continue;
                             }
                         };
@@ -1229,7 +1328,7 @@ async fn main() {
 
                         match socket {
                             Some((client_id, tx)) => {
-                                trace!("easement", "dispatch",
+                                trace!("tool", "dispatch",
                                     whom: who,
                                     where: r#where,
                                     why: "the tool call matched a connected client",
@@ -1254,7 +1353,7 @@ async fn main() {
                                 });
                             }
                             None => {
-                                trace!("easement", "reject",
+                                trace!("tool", "reject",
                                     whom: who,
                                     where: r#where,
                                     why: "no connected socket matched the tool target",
@@ -1276,17 +1375,33 @@ async fn main() {
                             Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code, changes })) => {
                                 if let Some(call) = tool_calls.remove(&call_id) {
                                     let claim = call.claim;
-                                    trace!("easement", "tool", "response", "client_id": client_id, "call_id": call_id, "exit_code": exit_code);
+                                    trace!("tool", "respond",
+                                        client_id: client_id,
+                                        call_id: call_id,
+                                        exit_code: exit_code,
+                                    );
                                     if changes.is_some() {
-                                        trace!("easement", "tool", "patch_changes_retired", "call_id": call_id);
+                                        trace!("tool", "ignore_changes",
+                                            why: "patch-change processing is retired",
+                                            call_id: call_id,
+                                        );
                                     }
                                     let _ = claim.reply.send(ToolResult { output, exit_code, changes });
                                 } else {
-                                    trace!("easement", "tool", "unknown_response", "client_id": client_id, "call_id": call_id);
+                                    trace!("tool", "reject_response",
+                                        why: "no in-flight tool call matched the response",
+                                        client_id: client_id,
+                                        call_id: call_id,
+                                    );
                                 }
                             }
                             Ok(Packet::Tool(ToolPacket::BackgroundOutput { job_id, output_path, line })) => {
-                                trace!("easement", "tool", "background_output", "client_id": client_id, "job_id": job_id, "output_path": output_path, "line": line);
+                                trace!("tool", "receive_output",
+                                    client_id: client_id,
+                                    job_id: job_id,
+                                    output_path: output_path,
+                                    line: line,
+                                );
                             }
                             Ok(Packet::Tool(ToolPacket::Notification {
                                 slug,
@@ -1295,21 +1410,20 @@ async fn main() {
                                 meta,
                             })) => {
                                 trace!(
-                                    "easement",
                                     "tool",
-                                    "notification",
-                                    "client_id": client_id,
-                                    "slug": slug,
-                                    "transcript": transcript,
-                                    "message": message,
-                                    "has_meta": meta.is_some()
+                                    "notify",
+                                    client_id: client_id,
+                                    slug: slug,
+                                    transcript: transcript,
+                                    message: message,
+                                    has_meta: meta.is_some(),
                                 );
                             }
                             Ok(Packet::Socket(SocketPacket::Connect { who, r#where, tools })) => {
                                 let toolset = ToolSet { who: who.clone(), tools };
                                 let resolved_where = r#where.clone().unwrap_or_else(|| "localhost".to_string());
-                                trace!(who, "connect",
-                                    whom: "easement",
+                                trace!("websocket", "connect",
+                                    whom: who,
                                     where: resolved_where,
                                     why: "the client advertised its tool manifest",
                                     how: "websocket",
@@ -1329,7 +1443,12 @@ async fn main() {
                                     if let Some(wicket) = wickets.get_mut(&r#where) {
                                         wicket.state = WicketState::Connected { client_id };
                                         let drained: Vec<MainEvent> = wicket.stashed.drain(..).collect();
-                                        trace!("easement", "wicket", "connected_draining", "where": r#where, "stashed": drained.len());
+                                        trace!("wicket", "drain",
+                                            whom: "wicket",
+                                            where: r#where,
+                                            why: "the wicket connected with work stashed",
+                                            stashed: drained.len(),
+                                        );
                                         for event in drained {
                                             let _ = main_tx.send(MainEvent::ToolCheck { event: Box::new(event) });
                                         }
@@ -1342,7 +1461,11 @@ async fn main() {
                                 }
                             }
                             Err(e) => {
-                                error!("easement", "websocket", "unrecognized", e, "client_id": client_id);
+                                error!("websocket", "reject", e,
+                                    whom: "client",
+                                    how: "json",
+                                    client_id: client_id,
+                                );
                             }
                         }
                     }
@@ -1353,7 +1476,13 @@ async fn main() {
                             .unwrap_or_else(|| "unknown".to_string());
                         for wicket in wickets.values_mut() {
                             if matches!(wicket.state, WicketState::Connected { client_id: cid } if cid == client_id) {
-                                trace!("easement", "wicket", "disconnected", "client_id": client_id);
+                                trace!("wicket", "disconnect",
+                                    whom: "wicket",
+                                    where: disconnected_where,
+                                    why: "the websocket disconnected",
+                                    how: "websocket",
+                                    client_id: client_id,
+                                );
                                 wicket.state = WicketState::Disconnected;
                             }
                         }
@@ -1388,8 +1517,8 @@ async fn main() {
                                         who, r#where
                                     )
                                 };
-                                trace!(who, "hang_up",
-                                    whom: "easement",
+                                trace!("websocket", "hang_up",
+                                    whom: who,
                                     where: r#where,
                                     why: "the socket closed while a tool call was in flight",
                                     how: "websocket",
@@ -1403,10 +1532,20 @@ async fn main() {
                                 });
                             }
                         }
-                        trace!("easement", "websocket", "disconnected", "client_id": client_id);
+                        trace!("websocket", "disconnect",
+                            whom: "client",
+                            where: disconnected_where,
+                            how: "websocket",
+                            client_id: client_id,
+                        );
                     }
                     MainEvent::WicketExited { host, exit_code } => {
-                        trace!("easement", "wicket", "exited", "host": host, "exit_code": exit_code);
+                        trace!("wicket", "exit",
+                            whom: "wicket",
+                            where: host,
+                            how: "process",
+                            exit_code: exit_code,
+                        );
                         if let Some(wicket) = wickets.remove(&host) {
                             for event in wicket.stashed {
                                 let _ = main_tx.send(MainEvent::ToolCheck { event: Box::new(event) });
@@ -1416,7 +1555,10 @@ async fn main() {
                     MainEvent::ToolCallTimeout { call_id } => {
                         if let Some(call) = tool_calls.remove(&call_id) {
                             let claim = call.claim;
-                            trace!("easement", "tool", "call_timeout", "call_id": call_id);
+                            trace!("tool", "timeout",
+                                why: "the tool call did not respond before its deadline",
+                                call_id: call_id,
+                            );
                             let _ = claim.reply.send(ToolResult {
                                 output: "tool call timed out".to_string(),
                                 exit_code: 1,
@@ -1427,7 +1569,11 @@ async fn main() {
                     MainEvent::WicketSpawnTimeout { host } => {
                         if let Some(wicket) = wickets.get_mut(&host) &&
                              matches!(wicket.state, WicketState::Starting) {
-                            trace!("easement", "wicket", "spawn_timeout", "host": host);
+                            trace!("wicket", "timeout_spawn",
+                                whom: "wicket",
+                                where: host,
+                                why: "the wicket did not connect before its deadline",
+                            );
                             wicket.state = WicketState::Disconnected;
                             let stashed: Vec<MainEvent> = wicket.stashed.drain(..).collect();
                             for event in stashed {
