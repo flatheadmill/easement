@@ -30,53 +30,103 @@ use tokio_tungstenite::tungstenite::Message;
 // automatically and reports how many messages were dropped via RecvError::Lagged(n).
 
 #[derive(Clone, Serialize)]
-struct LogMessage {
-    when: String,
-    level: u8,
-    who: &'static str,
-    what: &'static str,
-    why: &'static str,
-    #[serde(flatten)]
-    payload: Value,
+struct LogRecord {
+    who: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    whom: Option<String>,
+    what: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    r#where: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    why: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    how: Option<String>,
+    noise: u8,
+    r#with: Value,
 }
 
 #[derive(Serialize)]
 struct LogEntry {
     when: String,
-    what: LogMessage,
+    who: &'static str,
+    what: LogRecord,
 }
 
-static LOG: OnceLock<broadcast::Sender<LogMessage>> = OnceLock::new();
+static LOG: OnceLock<broadcast::Sender<LogRecord>> = OnceLock::new();
 
-fn log(level: u8, msg: LogMessage) {
+fn log(record: LogRecord) {
     if let Some(tx) = LOG.get() {
-        let _ = tx.send(LogMessage { level, ..msg });
+        let _ = tx.send(record);
     }
 }
 
+macro_rules! log_fields {
+    ($record:ident, $with:ident,) => {};
+    ($record:ident, $with:ident, whom: $value:expr, $($rest:tt)*) => {
+        $record.whom = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, where: $value:expr, $($rest:tt)*) => {
+        $record.r#where = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, why: $value:expr, $($rest:tt)*) => {
+        $record.why = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, how: $value:expr, $($rest:tt)*) => {
+        $record.how = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, $key:ident: $value:expr, $($rest:tt)*) => {
+        $with.insert(stringify!($key).to_string(), serde_json::json!($value));
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, $key:literal: $value:expr, $($rest:tt)*) => {
+        $with.insert($key.to_string(), serde_json::json!($value));
+        log_fields!($record, $with, $($rest)*);
+    };
+}
+
+macro_rules! log_record {
+    ($noise:expr, $who:expr, $what:expr $(, $key:tt: $value:expr)* $(,)?) => {{
+        let mut record = LogRecord {
+            who: ($who).to_string(),
+            whom: None,
+            what: ($what).to_string(),
+            r#where: None,
+            why: None,
+            how: None,
+            noise: $noise,
+            r#with: Value::Null,
+        };
+        let mut details = serde_json::Map::new();
+        log_fields!(record, details, $($key: $value,)*);
+        record.r#with = Value::Object(details);
+        record
+    }};
+}
+
 macro_rules! trace {
-    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(0, LogMessage {
-            when: now(),
-            level: 0,
-            who: $who,
-            what: $what,
-            why: $why,
-            payload: serde_json::json!({ $($key: $val),* }),
-        })
+    ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
+        crate::log(log_record!(0, $who, $what $(, $key: $value)*))
+    };
+    ($who:expr, $what:expr, $legacy_why:expr $(, $key:tt: $value:expr)* $(,)?) => {
+        crate::log(log_record!(0, $who, $what, why: $legacy_why $(, $key: $value)*))
     };
 }
 
 macro_rules! error {
-    ($who:expr, $what:expr, $how:expr, $error:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(0, LogMessage {
-            when: now(),
-            level: 0,
-            who: $who,
-            what: $what,
+    ($who:expr, $what:expr, $error:expr $(, $key:ident: $value:expr)* $(,)?) => {
+        crate::log(log_record!(0, $who, $what, why: $error.to_string() $(, $key: $value)*))
+    };
+    ($who:expr, $what:expr, $legacy_how:expr, $error:expr $(, $key:tt: $value:expr)* $(,)?) => {
+        crate::log(log_record!(0, $who, $what,
             why: "error",
-            payload: serde_json::json!({ "how": $how, "error": $error.to_string() $(, $key: $val)* }),
-        })
+            how: $legacy_how,
+            error: $error.to_string()
+            $(, $key: $value)*
+        ))
     };
 }
 
@@ -102,7 +152,7 @@ fn init_log() {
     };
     let log_path = log_dir.join(log_name);
 
-    let (tx, _) = broadcast::channel::<LogMessage>(4096);
+    let (tx, _) = broadcast::channel::<LogRecord>(4096);
     let mut rx = tx.subscribe();
     LOG.set(tx).expect("log already initialized");
 
@@ -126,6 +176,7 @@ fn init_log() {
                 Ok(msg) => {
                     let entry = LogEntry {
                         when: now(),
+                        who: "easement",
                         what: msg,
                     };
                     if let Ok(mut line) = serde_json::to_string(&entry) {
@@ -136,14 +187,11 @@ fn init_log() {
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     let shed = LogEntry {
                         when: now(),
-                        what: LogMessage {
-                            when: now(),
-                            level: 0,
-                            who: "log",
-                            what: "lifecycle",
-                            why: "shed",
-                            payload: json!({ "count": n }),
-                        },
+                        who: "easement",
+                        what: log_record!(0, "log", "shed",
+                            why: "the log writer fell behind its channel",
+                            count: n,
+                        ),
                     };
                     if let Ok(mut line) = serde_json::to_string(&shed) {
                         line.push('\n');
@@ -745,6 +793,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn log_entry_uses_the_record_envelope_grammar() {
+        let entry = LogEntry {
+            when: "2026-07-15T12:00:00.000Z".to_string(),
+            who: "easement",
+            what: log_record!(0, "easement", "dispatch",
+                whom: "wicket",
+                where: "localhost",
+                why: "the tool call matched a connected client",
+                how: "websocket",
+                call_id: "call-1",
+                client_id: 7,
+                f: "zsh",
+            ),
+        };
+        let line = serde_json::to_string(&entry).unwrap();
+
+        assert_eq!(
+            line,
+            r#"{"when":"2026-07-15T12:00:00.000Z","who":"easement","what":{"who":"easement","whom":"wicket","what":"dispatch","where":"localhost","why":"the tool call matched a connected client","how":"websocket","noise":0,"with":{"call_id":"call-1","client_id":7,"f":"zsh"}}}"#
+        );
+        println!("{line}");
+    }
+
+    #[test]
     fn dispatch_tool_omits_transcript() {
         let msg = Dispatch::Tool {
             slug: "puzzle".to_string(),
@@ -1157,7 +1229,15 @@ async fn main() {
 
                         match socket {
                             Some((client_id, tx)) => {
-                                trace!("easement", "tool", "dispatched", "call_id": call_id, "who": who, "f": f, "where": r#where);
+                                trace!("easement", "dispatch",
+                                    whom: who,
+                                    where: r#where,
+                                    why: "the tool call matched a connected client",
+                                    how: "websocket",
+                                    call_id: call_id,
+                                    client_id: client_id,
+                                    f: f,
+                                );
                                 let mut flat_args = inner_args.as_object().cloned().unwrap_or_default();
                                 flat_args.insert("f".to_string(), json!(f));
                                 dispatch(tx, Dispatch::Tool {
@@ -1174,7 +1254,12 @@ async fn main() {
                                 });
                             }
                             None => {
-                                trace!("easement", "tool", "no_socket", "call_id": call_id, "who": who, "where": r#where);
+                                trace!("easement", "reject",
+                                    whom: who,
+                                    where: r#where,
+                                    why: "no connected socket matched the tool target",
+                                    call_id: call_id,
+                                );
                                 let _ = claim.reply.send(ToolResult {
                                     output: format!("no connected client for who={} where={}", who, r#where),
                                     exit_code: 1,
@@ -1223,7 +1308,14 @@ async fn main() {
                             Ok(Packet::Socket(SocketPacket::Connect { who, r#where, tools })) => {
                                 let toolset = ToolSet { who: who.clone(), tools };
                                 let resolved_where = r#where.clone().unwrap_or_else(|| "localhost".to_string());
-                                trace!("easement", "socket", "connect", "client_id": client_id, "who": who, "where": resolved_where, "tools": toolset.tools.len());
+                                trace!(who, "connect",
+                                    whom: "easement",
+                                    where: resolved_where,
+                                    why: "the client advertised its tool manifest",
+                                    how: "websocket",
+                                    client_id: client_id,
+                                    tools: toolset.tools.len(),
+                                );
                                 let Some(socket) = sockets.get_mut(&client_id) else {
                                     panic!("socket connect from unknown client {}", client_id);
                                 };
@@ -1296,7 +1388,14 @@ async fn main() {
                                         who, r#where
                                     )
                                 };
-                                trace!("easement", "tool", "hung_up", "client_id": client_id, "call_id": call_id, "who": who, "where": r#where);
+                                trace!(who, "hang_up",
+                                    whom: "easement",
+                                    where: r#where,
+                                    why: "the socket closed while a tool call was in flight",
+                                    how: "websocket",
+                                    client_id: client_id,
+                                    call_id: call_id,
+                                );
                                 let _ = claim.reply.send(ToolResult {
                                     output,
                                     exit_code: 1,
