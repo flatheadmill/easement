@@ -1092,7 +1092,7 @@ async fn main() {
                                                 let _ = main_tx.send(MainEvent::Packet { client_id, data });
                                             }
                                             Err(e) => {
-                                                error!("websocket", "reject", e,
+                                                error!("wire", "reject", e,
                                                     whom: "client",
                                                     where: peer,
                                                     how: "json",
@@ -1459,7 +1459,7 @@ async fn main() {
                                 }
                             }
                             Err(e) => {
-                                error!("websocket", "reject", e,
+                                error!("wire", "unrecognized", e,
                                     whom: "client",
                                     how: "json",
                                     client_id: client_id,
