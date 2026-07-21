@@ -765,6 +765,7 @@ enum SocketPacket {
         r#where: Option<String>,
         tools: Vec<Tool>,
     },
+    Heartbeat,
 }
 
 #[derive(serde::Deserialize)]
@@ -897,6 +898,17 @@ mod tests {
             }
             _ => panic!("expected tool notification"),
         }
+    }
+
+    #[test]
+    fn socket_heartbeat_decodes() {
+        let packet: Packet = serde_json::from_value(json!({
+            "what": "socket",
+            "why": "heartbeat"
+        }))
+        .unwrap();
+
+        assert!(matches!(packet, Packet::Socket(SocketPacket::Heartbeat)));
     }
 }
 
@@ -1458,6 +1470,7 @@ async fn main() {
                                     }
                                 }
                             }
+                            Ok(Packet::Socket(SocketPacket::Heartbeat)) => {}
                             Err(e) => {
                                 error!("wire", "unrecognized", e,
                                     whom: "client",
