@@ -41,7 +41,6 @@ struct LogRecord {
     why: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     how: Option<String>,
-    noise: u8,
     r#with: Value,
 }
 
@@ -85,7 +84,7 @@ macro_rules! log_fields {
 }
 
 macro_rules! log_record {
-    ($noise:expr, $who:expr, $what:expr $(, $key:tt: $value:expr)* $(,)?) => {{
+    ($who:expr, $what:expr $(, $key:tt: $value:expr)* $(,)?) => {{
         let mut record = LogRecord {
             who: ($who).to_string(),
             whom: None,
@@ -93,7 +92,6 @@ macro_rules! log_record {
             r#where: None,
             why: None,
             how: None,
-            noise: $noise,
             r#with: Value::Null,
         };
         #[allow(unused_mut)]
@@ -106,13 +104,13 @@ macro_rules! log_record {
 
 macro_rules! trace {
     ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
-        crate::log(log_record!(0, $who, $what $(, $key: $value)*))
+        crate::log(log_record!($who, $what $(, $key: $value)*))
     };
 }
 
 macro_rules! error {
     ($who:expr, $what:expr, $error:expr $(, $key:ident: $value:expr)* $(,)?) => {
-        crate::log(log_record!(0, $who, $what, why: $error.to_string() $(, $key: $value)*))
+        crate::log(log_record!($who, $what, why: $error.to_string() $(, $key: $value)*))
     };
 }
 
@@ -174,7 +172,7 @@ fn init_log() {
                     let shed = LogEntry {
                         when: now(),
                         who: "easement",
-                        what: log_record!(0, "log", "shed",
+                        what: log_record!("log", "shed",
                             why: "the log writer fell behind its channel",
                             count: n,
                         ),
@@ -810,7 +808,7 @@ mod tests {
             .unwrap()
         };
 
-        let dispatch = render(log_record!(0, "tool", "dispatch",
+        let dispatch = render(log_record!("tool", "dispatch",
             whom: "wicket",
             where: "localhost",
             why: "the tool call matched a connected client",
@@ -819,12 +817,12 @@ mod tests {
             client_id: 7,
             f: "zsh",
         ));
-        let spawn = render(log_record!(0, "wicket", "spawn",
+        let spawn = render(log_record!("wicket", "spawn",
             whom: "wicket",
             where: "yolo@orb",
             how: "ssh",
         ));
-        let connect = render(log_record!(0, "websocket", "connect",
+        let connect = render(log_record!("websocket", "connect",
             whom: "wicket",
             where: "localhost",
             why: "the client advertised its tool manifest",
@@ -835,15 +833,15 @@ mod tests {
 
         assert_eq!(
             dispatch,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"tool","whom":"wicket","what":"dispatch","where":"localhost","why":"the tool call matched a connected client","how":"websocket","noise":0,"with":{"call_id":"call-1","client_id":7,"f":"zsh"}}}"#
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"tool","whom":"wicket","what":"dispatch","where":"localhost","why":"the tool call matched a connected client","how":"websocket","with":{"call_id":"call-1","client_id":7,"f":"zsh"}}}"#
         );
         assert_eq!(
             spawn,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"wicket","whom":"wicket","what":"spawn","where":"yolo@orb","how":"ssh","noise":0,"with":{}}}"#
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"wicket","whom":"wicket","what":"spawn","where":"yolo@orb","how":"ssh","with":{}}}"#
         );
         assert_eq!(
             connect,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"websocket","whom":"wicket","what":"connect","where":"localhost","why":"the client advertised its tool manifest","how":"websocket","noise":0,"with":{"client_id":7,"tools":8}}}"#
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"easement","what":{"who":"websocket","whom":"wicket","what":"connect","where":"localhost","why":"the client advertised its tool manifest","how":"websocket","with":{"client_id":7,"tools":8}}}"#
         );
 
         for line in [dispatch, spawn, connect] {
