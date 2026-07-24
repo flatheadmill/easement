@@ -8,6 +8,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -47,16 +48,30 @@ struct LogRecord {
 #[derive(Serialize)]
 struct LogEntry {
     when: String,
-    who: &'static str,
-    what: LogRecord,
+    who: String,
+    what: Value,
 }
 
-static LOG: OnceLock<broadcast::Sender<LogRecord>> = OnceLock::new();
+#[derive(Clone)]
+struct LogSubmission {
+    program: String,
+    record: Value,
+}
+
+static LOG: OnceLock<broadcast::Sender<LogSubmission>> = OnceLock::new();
+
+fn submit_log(program: impl Into<String>, record: Value) {
+    if let Some(tx) = LOG.get() {
+        let _ = tx.send(LogSubmission {
+            program: program.into(),
+            record,
+        });
+    }
+}
 
 fn log(record: LogRecord) {
-    if let Some(tx) = LOG.get() {
-        let _ = tx.send(record);
-    }
+    let record = serde_json::to_value(record).expect("LogRecord must serialize to a JSON value");
+    submit_log("easement", record);
 }
 
 macro_rules! log_fields {
@@ -123,10 +138,39 @@ fn fatal(message: impl std::fmt::Display) -> ! {
     std::process::abort();
 }
 
-fn init_log() {
+impl LogEntry {
+    fn land(submission: LogSubmission) -> Self {
+        Self::land_at(submission, now())
+    }
+
+    fn land_at(submission: LogSubmission, when: String) -> Self {
+        Self {
+            when,
+            who: submission.program,
+            what: submission.record,
+        }
+    }
+}
+
+async fn init_log() {
     let home = env::var("HOME").expect("HOME not set");
     let log_dir = PathBuf::from(&home).join(".local/state/easement");
-    let _ = std::fs::create_dir_all(&log_dir);
+    let mut dir = tokio::fs::DirBuilder::new();
+    dir.recursive(true).mode(0o700);
+    if let Err(e) = dir.create(&log_dir).await {
+        eprintln!("cannot create log directory {}: {}", log_dir.display(), e);
+        return;
+    }
+    if let Err(e) =
+        tokio::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700)).await
+    {
+        eprintln!(
+            "cannot set log directory permissions {}: {}",
+            log_dir.display(),
+            e
+        );
+        return;
+    }
 
     let port = easement_port();
     let log_name = if port == 6502 {
@@ -136,50 +180,58 @@ fn init_log() {
     };
     let log_path = log_dir.join(log_name);
 
-    let (tx, _) = broadcast::channel::<LogRecord>(4096);
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).append(true).mode(0o600);
+    let mut file = match options.open(&log_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("cannot open log file {}: {}", log_path.display(), e);
+            return;
+        }
+    };
+    if let Err(e) =
+        tokio::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).await
+    {
+        eprintln!(
+            "cannot set log file permissions {}: {}",
+            log_path.display(),
+            e
+        );
+        return;
+    }
+
+    let (tx, _) = broadcast::channel::<LogSubmission>(4096);
     let mut rx = tx.subscribe();
     LOG.set(tx).expect("log already initialized");
 
     tokio::spawn(async move {
-        let mut file = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .await
-        {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("cannot open log file {}: {}", log_path.display(), e);
-                return;
-            }
-        };
-
         use tokio::io::AsyncWriteExt;
         loop {
             match rx.recv().await {
                 Ok(msg) => {
-                    let entry = LogEntry {
-                        when: now(),
-                        who: "easement",
-                        what: msg,
-                    };
+                    let entry = LogEntry::land(msg);
                     if let Ok(mut line) = serde_json::to_string(&entry) {
                         line.push('\n');
-                        let _ = file.write_all(line.as_bytes()).await;
+                        if let Err(e) = file.write_all(line.as_bytes()).await {
+                            eprintln!("cannot write log file {}: {}", log_path.display(), e);
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let shed = LogEntry {
-                        when: now(),
-                        who: "easement",
-                        what: log_record!("log", "shed",
-                            why: "the log writer fell behind its channel",
-                            count: n,
-                        ),
-                    };
+                    let record = serde_json::to_value(log_record!("log", "shed",
+                        why: "the log writer fell behind its channel",
+                        count: n,
+                    ))
+                    .expect("log shed record must serialize to a JSON value");
+                    let shed = LogEntry::land(LogSubmission {
+                        program: "easement".to_string(),
+                        record,
+                    });
                     if let Ok(mut line) = serde_json::to_string(&shed) {
                         line.push('\n');
-                        let _ = file.write_all(line.as_bytes()).await;
+                        if let Err(e) = file.write_all(line.as_bytes()).await {
+                            eprintln!("cannot write log file {}: {}", log_path.display(), e);
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -755,6 +807,7 @@ fn collect_tools<'a>(toolsets: impl Iterator<Item = &'a ToolSet>) -> Vec<Value> 
 enum Packet {
     Tool(ToolPacket),
     Socket(SocketPacket),
+    Log(LogPacket),
 }
 
 #[derive(serde::Deserialize)]
@@ -766,6 +819,16 @@ enum SocketPacket {
         tools: Vec<Tool>,
     },
     Heartbeat,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "why", rename_all = "snake_case")]
+enum LogPacket {
+    Write {
+        whom: String,
+        #[serde(rename = "with")]
+        record: Value,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -794,6 +857,25 @@ enum ToolPacket {
     },
 }
 
+fn validate_log_record(record: &Value) -> Result<(), &'static str> {
+    let Some(record) = record.as_object() else {
+        return Err("the routed log record is not an object");
+    };
+    let Some(who) = record.get("who").and_then(Value::as_str) else {
+        return Err("the routed log record has no string who");
+    };
+    if who.is_empty() {
+        return Err("the routed log record has an empty who");
+    }
+    let Some(what) = record.get("what").and_then(Value::as_str) else {
+        return Err("the routed log record has no string what");
+    };
+    if what.is_empty() {
+        return Err("the routed log record has an empty what");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,12 +883,15 @@ mod tests {
     #[test]
     fn log_entries_use_the_record_envelope_grammar() {
         let render = |record| {
-            serde_json::to_string(&LogEntry {
-                when: "2026-07-16T12:00:00.000Z".to_string(),
-                who: "easement",
-                what: record,
-            })
-            .unwrap()
+            let record = serde_json::to_value(record).unwrap();
+            let entry = LogEntry::land_at(
+                LogSubmission {
+                    program: "easement".to_string(),
+                    record,
+                },
+                "2026-07-16T12:00:00.000Z".to_string(),
+            );
+            serde_json::to_string(&entry).unwrap()
         };
 
         let dispatch = render(log_record!("tool", "dispatch",
@@ -848,6 +933,75 @@ mod tests {
         for line in [dispatch, spawn, connect] {
             println!("{line}");
         }
+    }
+
+    #[test]
+    fn log_write_decodes_with_an_opaque_record() {
+        let record = json!({
+            "who": "wire",
+            "what": "unrecognized",
+            "future_anchor": "preserved",
+            "with": {
+                "raw": { "what": "history", "why": "replay" }
+            }
+        });
+        let packet: Packet = serde_json::from_value(json!({
+            "what": "log",
+            "why": "write",
+            "whom": "shotgun",
+            "with": record.clone()
+        }))
+        .unwrap();
+
+        match packet {
+            Packet::Log(LogPacket::Write {
+                whom,
+                record: decoded,
+            }) => {
+                assert_eq!(whom, "shotgun");
+                assert_eq!(decoded, record);
+            }
+            _ => panic!("expected log write"),
+        }
+    }
+
+    #[test]
+    fn routed_log_requires_an_object_with_who_and_what() {
+        for record in [
+            Value::Null,
+            json!({}),
+            json!({ "who": "", "what": "run" }),
+            json!({ "who": "tool", "what": "" }),
+            json!({ "who": 7, "what": "run" }),
+            json!({ "who": "tool", "what": false }),
+        ] {
+            assert!(validate_log_record(&record).is_err(), "accepted {record}");
+        }
+    }
+
+    #[test]
+    fn routed_log_lands_with_sink_envelope() {
+        let record = json!({
+            "who": "tool",
+            "what": "fail_run",
+            "why": "CDP capture returned no data",
+            "with": { "call_id": "call-1" }
+        });
+        assert!(validate_log_record(&record).is_ok());
+
+        let entry = LogEntry::land_at(
+            LogSubmission {
+                program: "shotgun".to_string(),
+                record: record.clone(),
+            },
+            "2026-07-23T12:00:00.000Z".to_string(),
+        );
+        let landed = serde_json::to_value(&entry).unwrap();
+
+        assert_eq!(landed["when"], "2026-07-23T12:00:00.000Z");
+        assert_eq!(landed["who"], "shotgun");
+        assert_eq!(landed["what"], record);
+        println!("{}", serde_json::to_string(&entry).unwrap());
     }
 
     #[test]
@@ -961,7 +1115,7 @@ enum MainEvent {
 
 #[tokio::main]
 async fn main() {
-    init_log();
+    init_log().await;
 
     let port = easement_port();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -1382,6 +1536,32 @@ async fn main() {
                     // lifecycle is retired.
                     MainEvent::Packet { client_id, data } => {
                         match serde_json::from_value::<Packet>(data) {
+                            Ok(Packet::Log(LogPacket::Write { whom, record })) => {
+                                if let Err(reason) = validate_log_record(&record) {
+                                    trace!("wire", "reject",
+                                        whom: "client",
+                                        why: reason,
+                                        how: "json",
+                                        client_id: client_id,
+                                        claimed_whom: whom,
+                                    );
+                                } else {
+                                    let socket_who = sockets
+                                        .get(&client_id)
+                                        .and_then(|socket| socket.who.as_deref());
+                                    if socket_who != Some(whom.as_str()) {
+                                        trace!("wire", "whom_mismatch",
+                                            whom: "client",
+                                            why: "the routed log program differs from the socket identity",
+                                            how: "websocket",
+                                            client_id: client_id,
+                                            claimed_whom: whom,
+                                            socket_who: socket_who,
+                                        );
+                                    }
+                                    submit_log(whom, record);
+                                }
+                            }
                             Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code, changes })) => {
                                 if let Some(call) = tool_calls.remove(&call_id) {
                                     let claim = call.claim;
