@@ -633,7 +633,16 @@ async fn handle_mcp(
                 ),
             }
         }
-        "notifications/initialized" => jsonrpc_response(id, json!({})),
+        // JSON-RPC notifications have no response body. Streamable HTTP
+        // acknowledges receipt without inventing a response for a null id.
+        "notifications/initialized" => {
+            return Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .body(Full::new(Bytes::new()))
+                .unwrap_or_else(|e| {
+                    fatal(format!("notification acknowledgment build failed: {}", e))
+                });
+        }
         other => jsonrpc_error(id, -32601, format!("Method not found: {}", other)),
     };
 
