@@ -1,0 +1,16 @@
+[package]
+name = "easement-screenshot-integration"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+wicket = { path = "../../wicket" }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+sha2 = "0.10"
+png = "0.18"

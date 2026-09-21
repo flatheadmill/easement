@@ -27,6 +27,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
+mod screenshot;
+
 // NDJSON log. One channel, one file, queryable with jq. The broadcast channel sheds load
 // automatically and reports how many messages were dropped via RecvError::Lagged(n).
 
@@ -266,10 +268,9 @@ enum ToolDispatch {
     },
 }
 
-fn dispatch(tx: &mpsc::UnboundedSender<String>, msg: Dispatch) {
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = tx.send(json);
-    }
+fn dispatch(tx: &mpsc::Sender<String>, msg: Dispatch) -> bool {
+    let json = serde_json::to_string(&msg).expect("dispatch serializes");
+    tx.try_send(json).is_ok()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -890,6 +891,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wrong_socket_response_cannot_remove_or_complete_an_ordinary_tool_call() {
+        let (tx, mut rx) = oneshot::channel();
+        let mut calls = HashMap::new();
+        calls.insert(
+            "call-1".into(),
+            ToolCall {
+                client_id: 7,
+                claim: ToolClaim {
+                    reply: tx,
+                    slug: "test".into(),
+                    args: json!({}),
+                },
+            },
+        );
+        assert!(take_owned_call(&mut calls, "call-1", 8).is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let call = take_owned_call(&mut calls, "call-1", 7).unwrap();
+        assert!(
+            call.claim
+                .reply
+                .send(ToolResult {
+                    output: "owned".into(),
+                    exit_code: 0,
+                    changes: None
+                })
+                .is_ok()
+        );
+        assert_eq!(rx.try_recv().unwrap().output, "owned");
+    }
+
+    #[test]
     fn log_entries_use_the_record_envelope_grammar() {
         let render = |record| {
             let record = serde_json::to_value(record).unwrap();
@@ -1122,6 +1157,86 @@ enum MainEvent {
     },
 }
 
+struct Socket {
+    tx: mpsc::Sender<String>,
+    who: Option<String>,
+    r#where: String,
+    tools: Option<ToolSet>,
+    closed: bool,
+    reader: tokio::task::AbortHandle,
+    writer: tokio::task::AbortHandle,
+}
+
+struct ToolClaim {
+    reply: oneshot::Sender<ToolResult>,
+    slug: String,
+    args: Value,
+}
+
+struct ToolCall {
+    claim: ToolClaim,
+    client_id: u64,
+}
+
+fn take_owned_call(
+    calls: &mut HashMap<String, ToolCall>,
+    call_id: &str,
+    client_id: u64,
+) -> Option<ToolCall> {
+    if calls
+        .get(call_id)
+        .is_some_and(|call| call.client_id == client_id)
+    {
+        calls.remove(call_id)
+    } else {
+        None
+    }
+}
+
+fn screenshot_effects(
+    effects: Vec<screenshot::Effect>,
+    sockets: &mut HashMap<u64, Socket>,
+    calls: &mut HashMap<String, ToolCall>,
+    main_tx: &mpsc::UnboundedSender<MainEvent>,
+) {
+    for effect in effects {
+        match effect {
+            screenshot::Effect::Send { socket, packet } => {
+                if let Some(peer) = sockets.get_mut(&socket)
+                    && !peer.closed
+                    && peer.tx.try_send(packet.to_string()).is_err()
+                {
+                    // Backpressure is a lost route, never evidence about publication.
+                    peer.closed = true;
+                    peer.reader.abort();
+                    peer.writer.abort();
+                    let _ = main_tx.send(MainEvent::Disconnected { client_id: socket });
+                }
+            }
+            screenshot::Effect::Complete { call_id, packet } => {
+                if let Some(call) = calls.remove(&call_id) {
+                    let exit_code = if packet["why"] == "stored" { 0 } else { 1 };
+                    // HTTP receiver loss is caller abandonment; Wicket owns the receipt.
+                    let _ = call.claim.reply.send(ToolResult {
+                        output: packet.to_string(),
+                        exit_code,
+                        changes: None,
+                    });
+                }
+            }
+            screenshot::Effect::Close { socket } => {
+                if let Some(peer) = sockets.get_mut(&socket) {
+                    peer.closed = true;
+                    peer.reader.abort();
+                    peer.writer.abort();
+                }
+                let _ = main_tx.send(MainEvent::Disconnected { client_id: socket });
+            }
+            screenshot::Effect::Observe(record) => submit_log("easement", record),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     init_log().await;
@@ -1149,23 +1264,10 @@ async fn main() {
 
     let mut next_client_id: u64 = 0;
 
-    struct Socket {
-        tx: mpsc::UnboundedSender<String>,
-        who: Option<String>,
-        r#where: String,
-        tools: Option<ToolSet>,
-    }
     let mut sockets: HashMap<u64, Socket> = HashMap::new();
-
-    struct ToolClaim {
-        reply: oneshot::Sender<ToolResult>,
-        slug: String,
-        args: Value,
-    }
-    struct ToolCall {
-        claim: ToolClaim,
-        client_id: u64,
-    }
+    let mut screenshots = screenshot::Router::default();
+    let (ingress_tx, mut ingress_rx) = mpsc::channel::<MainEvent>(screenshot::INGRESS_CAPACITY);
+    let mut screenshot_tick = tokio::time::interval(std::time::Duration::from_millis(250));
     let shutdown = false;
     let mut tool_claims: HashMap<String, ToolClaim> = HashMap::new();
     let mut tool_calls: HashMap<String, ToolCall> = HashMap::new();
@@ -1218,7 +1320,13 @@ async fn main() {
                     }
                 });
             }
-            Some(event) = main_rx.recv() => {
+            _ = screenshot_tick.tick() => {
+                let effects = screenshots.expired(std::time::Instant::now());
+                screenshot_effects(effects, &mut sockets, &mut tool_calls, &main_tx);
+            }
+            Some(event) = async {
+                tokio::select! { event = main_rx.recv() => event, event = ingress_rx.recv() => event }
+            } => {
                 match event {
                     MainEvent::Listen { ws, peer } => {
                         let ws_stream = match ws.await {
@@ -1245,34 +1353,33 @@ async fn main() {
                         let (mut sink, mut stream) = ws_stream.split();
 
                         // Writer task: socket_rx -> WebSocket.
-                        let (socket_tx, mut socket_rx) = mpsc::unbounded_channel::<String>();
-                        sockets.insert(client_id, Socket { tx: socket_tx, who: None, r#where: "localhost".to_string(), tools: None });
-
-                        tokio::spawn(async move {
+                        let (socket_tx, mut socket_rx) = mpsc::channel::<String>(screenshot::SOCKET_QUEUE_CAPACITY);
+                        let writer_events = main_tx.clone();
+                        let writer = tokio::spawn(async move {
                             while let Some(msg) = socket_rx.recv().await {
                                 if sink.send(Message::text(msg)).await.is_err() {
                                     break;
                                 }
                             }
+                            let _ = sink.close().await;
+                            let _ = writer_events.send(MainEvent::Disconnected { client_id });
                         });
 
-                        // Reader task: WebSocket -> main_tx.
-                        let main_tx = main_tx.clone();
-                        tokio::spawn(async move {
+                        // Socket input has its own bounded queue. Lifecycle events keep
+                        // the existing internal owner path; the pump never awaits itself.
+                        let reader_events = main_tx.clone();
+                        let ingress_tx = ingress_tx.clone();
+                        let reader = tokio::spawn(async move {
                             while let Some(result) = stream.next().await {
                                 match result {
                                     Ok(Message::Text(text)) => {
-                                        match serde_json::from_str::<Value>(&text) {
+                                        match screenshot::ingress(&text) {
                                             Ok(data) => {
-                                                let _ = main_tx.send(MainEvent::Packet { client_id, data });
+                                                if ingress_tx.send(MainEvent::Packet { client_id, data }).await.is_err() { break; }
                                             }
-                                            Err(e) => {
-                                                error!("wire", "reject", e,
-                                                    whom: "client",
-                                                    where: peer,
-                                                    how: "json",
-                                                    client_id: client_id,
-                                                );
+                                            Err(reason) => {
+                                                trace!("wire", "reject", why: reason, how: "json", client_id: client_id);
+                                                break;
                                             }
                                         }
                                     }
@@ -1295,8 +1402,10 @@ async fn main() {
                                 how: "websocket",
                                 client_id: client_id,
                             );
-                            let _ = main_tx.send(MainEvent::Disconnected { client_id });
+                            let _ = reader_events.send(MainEvent::Disconnected { client_id });
                         });
+                        sockets.insert(client_id, Socket { tx: socket_tx, who: None, r#where: "localhost".to_string(), tools: None, closed: false,
+                            reader: reader.abort_handle(), writer: writer.abort_handle() });
                     }
                     MainEvent::ToolCheck { event } => {
                         if shutdown {
@@ -1496,11 +1605,17 @@ async fn main() {
                         let inner_args = claim.args.get("args").cloned().unwrap_or(json!({}));
 
                         let socket = sockets.iter()
-                            .find(|(_, s)| s.who.as_deref() == Some(who) && s.r#where == r#where)
+                            .find(|(_, s)| !s.closed && s.who.as_deref() == Some(who) && s.r#where == r#where)
                             .map(|(client_id, s)| (*client_id, &s.tx));
 
                         match socket {
                             Some((client_id, tx)) => {
+                                if who == "shotgun" && f == "screenshot_save"
+                                    && let Err(reason) = screenshots.register(&call_id, client_id, &claim.slug, &claim.args, std::time::Instant::now()) {
+                                        trace!("screenshot", "reject_route", why: reason, call_id: call_id);
+                                        let _ = claim.reply.send(ToolResult { output: reason.into(), exit_code: 1, changes: None });
+                                        continue;
+                                }
                                 trace!("tool", "dispatch",
                                     whom: who,
                                     where: r#where,
@@ -1512,13 +1627,18 @@ async fn main() {
                                 );
                                 let mut flat_args = inner_args.as_object().cloned().unwrap_or_default();
                                 flat_args.insert("f".to_string(), json!(f));
-                                dispatch(tx, Dispatch::Tool {
+                                let sent = dispatch(tx, Dispatch::Tool {
                                     slug: claim.slug.clone(),
                                     event: ToolDispatch::Run {
                                         call_id: call_id.clone(),
                                         args: Value::Object(flat_args),
                                     },
                                 });
+                                if !sent {
+                                    screenshots.remove(&call_id);
+                                    let _ = claim.reply.send(ToolResult { output: "tool dispatch queue unavailable; call was not sent".into(), exit_code: 1, changes: None });
+                                    continue;
+                                }
                                 tool_calls.insert(call_id.clone(), ToolCall { claim, client_id });
                                 let _ = timer_tx.send(Delayed {
                                     ms: 86_400_000,
@@ -1544,6 +1664,14 @@ async fn main() {
                     // answer with a response for that call_id; the old broadcast-and-claim
                     // lifecycle is retired.
                     MainEvent::Packet { client_id, data } => {
+                        // Ignore packets already queued when a socket was closed.
+                        if sockets.get(&client_id).is_none_or(|s| s.closed) { continue; }
+                        if data["what"] == "screenshot_save" {
+                            let writers: Vec<_> = sockets.iter().filter(|(_, s)| !s.closed && s.who.as_deref() == Some("wicket") && s.r#where == "localhost").map(|(id, _)| *id).collect();
+                            let effects = screenshots.packet(client_id, data, &writers, std::time::Instant::now());
+                            screenshot_effects(effects, &mut sockets, &mut tool_calls, &main_tx);
+                            continue;
+                        }
                         match serde_json::from_value::<Packet>(data) {
                             Ok(Packet::Log(LogPacket::Write { whom, record })) => {
                                 if let Err(reason) = validate_log_record(&record) {
@@ -1572,7 +1700,24 @@ async fn main() {
                                 }
                             }
                             Ok(Packet::Tool(ToolPacket::Response { call_id, output, exit_code, changes })) => {
-                                if let Some(call) = tool_calls.remove(&call_id) {
+                                if tool_calls.get(&call_id).is_some_and(|call| call.client_id != client_id) {
+                                    trace!("tool", "reject_response", why: "response socket does not own the dispatched call", call_id: call_id, client_id: client_id);
+                                    continue;
+                                }
+                                let mut output = output;
+                                let mut exit_code = exit_code;
+                                let mut changes = changes;
+                                if screenshots.contains(&call_id) {
+                                    match screenshots.tool_result(&call_id, &output) {
+                                        Ok(packet) => { output = packet.to_string(); exit_code = if packet["why"] == "stored" { 0 } else { 1 }; changes = None; screenshots.remove(&call_id); }
+                                        Err(reason) => {
+                                            let effects = screenshots.end(&call_id, reason, true);
+                                            screenshot_effects(effects, &mut sockets, &mut tool_calls, &main_tx);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if let Some(call) = take_owned_call(&mut tool_calls, &call_id, client_id) {
                                     let claim = call.claim;
                                     trace!("tool", "respond",
                                         client_id: client_id,
@@ -1660,8 +1805,8 @@ async fn main() {
                                 }
                             }
                             Ok(Packet::Socket(SocketPacket::Heartbeat)) => {}
-                            Err(e) => {
-                                error!("wire", "unrecognized", e,
+                            Err(_) => {
+                                trace!("wire", "unrecognized", why: "invalid wire envelope",
                                     whom: "client",
                                     how: "json",
                                     client_id: client_id,
@@ -1670,9 +1815,11 @@ async fn main() {
                         }
                     }
                     MainEvent::Disconnected { client_id } => {
+                        let effects = screenshots.disconnected(client_id);
+                        screenshot_effects(effects, &mut sockets, &mut tool_calls, &main_tx);
                         let disconnected_where = sockets
                             .remove(&client_id)
-                            .map(|socket| socket.r#where)
+                            .map(|socket| { socket.reader.abort(); socket.writer.abort(); socket.r#where })
                             .unwrap_or_else(|| "unknown".to_string());
                         for wicket in wickets.values_mut() {
                             if matches!(wicket.state, WicketState::Connected { client_id: cid } if cid == client_id) {
@@ -1753,6 +1900,8 @@ async fn main() {
                         }
                     }
                     MainEvent::ToolCallTimeout { call_id } => {
+                        let effects = screenshots.end(&call_id, "tool call deadline elapsed", true);
+                        screenshot_effects(effects, &mut sockets, &mut tool_calls, &main_tx);
                         if let Some(call) = tool_calls.remove(&call_id) {
                             let claim = call.claim;
                             trace!("tool", "timeout",
